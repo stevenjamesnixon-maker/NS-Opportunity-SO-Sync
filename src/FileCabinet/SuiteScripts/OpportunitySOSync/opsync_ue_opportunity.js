@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.0.1
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.0.1';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -108,11 +108,16 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * feedback loop described in docs/context.md section 5.
      *
      * Both sides are therefore rendered as a string in the current user's date format, which is
-     * the representation lookupFields already returns and the representation submitFields
-     * expects back.
+     * the representation lookupFields already returns.
+     *
+     * THE RESULT IS A COMPARISON KEY AND MUST NEVER BE WRITTEN TO A RECORD. It is a localised
+     * string — this is a UK account on dd/mm/yyyy — and anything in the chain that parses it as
+     * mm/dd turns 5 September into 9 May. The mis-parse is silent, and only possible for days
+     * below 13, so it survives a test run on the 14th and fails on the 5th. Use
+     * asDateForWrite() for the value that goes to submitFields. See docs/context.md section 5.
      *
      * @param {*} value - a Date, a formatted string, or empty
-     * @returns {string} '' when unset
+     * @returns {string} a comparison key; '' when unset
      */
     function asDateKey(value) {
         if (isEmpty(value)) {
@@ -124,6 +129,34 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         }
 
         return String(value).replace(/^\s+|\s+$/g, '');
+    }
+
+    /**
+     * Prepares a date for writing to a record.
+     *
+     * Returns the ORIGINAL Date object that record.getValue() handed back, untouched. NetSuite
+     * accepts a Date natively on submitFields, so no formatting, no locale and no parsing are
+     * involved in the write — and therefore nothing that can read 05/09 as 9 May.
+     *
+     * The split from asDateKey() is deliberate and is not tidiness waiting to happen:
+     *
+     *   the STRING is a comparison key only, and must never be written;
+     *   the DATE is written, and must never be compared.
+     *
+     * Do not collapse the two back into one variable. See docs/context.md section 5.
+     *
+     * Anything that is not a Date is treated as unset and returns '', which is how submitFields
+     * clears a date field. The value only ever arrives here from a date field's getValue(), so
+     * in practice that is the empty case and nothing else.
+     *
+     * @param {*} value - the raw value from the opportunity
+     * @returns {Date|string} the Date to write, or '' to clear
+     */
+    function asDateForWrite(value) {
+        if (Object.prototype.toString.call(value) === '[object Date]') {
+            return value;
+        }
+        return '';
     }
 
     /**
@@ -222,13 +255,18 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * indexing. The predecessor read .custbody_finance_status[0].value unguarded and threw on
      * any order whose status was blank; that is the specific bug that made it fragile.
      *
+     * The opportunity's delivery date arrives as BOTH a comparison key and a writable value.
+     * They are not interchangeable — see asDateKey and asDateForWrite.
+     *
      * @param {string} orderId
      * @param {string} mappedStatusId
-     * @param {string} deliveryDateKey - the opportunity's delivery date, already normalised
+     * @param {string} deliveryDateKey - comparison key. Compared, never written
+     * @param {Date|string} deliveryDateValue - the original Date. Written, never compared
      * @param {string[]} excludedStatuses
      * @param {string} opportunityId - for the log only
      */
-    function syncSalesOrder(orderId, mappedStatusId, deliveryDateKey, excludedStatuses, opportunityId) {
+    function syncSalesOrder(orderId, mappedStatusId, deliveryDateKey, deliveryDateValue,
+        excludedStatuses, opportunityId) {
         var lookup;
         var currentStatus;
         var currentShipDateKey;
@@ -266,10 +304,13 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             changes.push('Record Status ' + (currentStatus || '(empty)') + ' -> ' + mappedStatusId);
         }
 
-        // Both sides are date KEYS — see asDateKey. Comparing a Date against a lookup string
-        // here would make every order look changed on every save.
+        // Both sides of the COMPARISON are date keys — see asDateKey. Comparing a Date against
+        // a lookup string here would make every order look changed on every save.
+        //
+        // What is WRITTEN is the original Date, never the key. The key is a localised dd/mm
+        // string and a mis-parse downstream would silently move the date. See asDateForWrite.
         if (currentShipDateKey !== deliveryDateKey) {
-            values[opsyncConfig.SALES_ORDER_FIELDS.SHIP_DATE] = deliveryDateKey;
+            values[opsyncConfig.SALES_ORDER_FIELDS.SHIP_DATE] = deliveryDateValue;
             changes.push('ship date ' + (currentShipDateKey || '(empty)') + ' -> ' +
                 (deliveryDateKey || '(empty)'));
         }
@@ -311,6 +352,8 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         var excludedStatuses;
         var subStatus;
         var deliveryDateKey;
+        var deliveryDateValue;
+        var deliveryDateRaw;
         var mappedStatusId;
         var orderIds;
         var processed = 0;
@@ -345,8 +388,13 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
 
             subStatus = asId(effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.SUB_STATUS, sparse));
-            deliveryDateKey = asDateKey(effectiveValue(
-                newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.DELIVERY_DATE, sparse));
+            // Read the delivery date ONCE, then derive both forms from it: a key for comparing
+            // and the original Date for writing. See asDateKey and asDateForWrite — they are
+            // deliberately not the same value and must not be merged.
+            deliveryDateRaw = effectiveValue(
+                newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.DELIVERY_DATE, sparse);
+            deliveryDateKey = asDateKey(deliveryDateRaw);
+            deliveryDateValue = asDateForWrite(deliveryDateRaw);
 
             // 4. Something relevant must have changed. On CREATE there is no oldRecord and
             //    everything is new, so proceed. On XEDIT the effectiveValue fallback above means
@@ -405,7 +453,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
 
                 try {
                     syncSalesOrder(orderIds[i], mappedStatusId, deliveryDateKey,
-                        excludedStatuses, opportunityId);
+                        deliveryDateValue, excludedStatuses, opportunityId);
                     processed += 1;
                 } catch (orderError) {
                     log.error({

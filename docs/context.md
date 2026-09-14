@@ -85,7 +85,7 @@ so it is where the sync belongs.
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
 | Shared config library | 1.0.0 | `lib/opsync_lib_config.js` | Every script ID in the project, the script parameters, and the only reads of `customrecord_fin_stat` | Not deployed |
-| Opportunity user event | 1.0.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status and ship date to the sales orders | Not deployed |
+| Opportunity user event | 1.0.1 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status and ship date to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -268,7 +268,29 @@ Agreed mapping, seven rows, **by name**:
   always unequal, so "only write when something changed" silently becomes "write every time" —
   which fills the orders with system notes and re-fires their own user events on every
   opportunity save. Both sides are rendered to a string in the user's date format by
-  `asDateKey()` before any comparison, and that string is what `submitFields` receives back.
+  `asDateKey()` before any comparison.
+
+- **The comparison key is never written. The Date is never compared.** This is the other half of
+  the trap, and it bites in the opposite direction.
+
+  `asDateKey()` produces a **localised** string. This is a UK account on `dd/mm/yyyy`, so the key
+  for 5 September is `05/09/2026`. Hand that to `submitFields` and anything in the chain that
+  reads it as `mm/dd` stores **9 May** instead. The failure is silent — no error, no log, just a
+  ship date that moved four months — and it is only possible when the **day of the month is
+  below 13**, because `13/09` and above cannot be read as a month. So it survives a test run on
+  the 14th and fails on the 5th.
+
+  The value written is therefore the **original `Date` object** that `record.getValue()`
+  returned, via `asDateForWrite()`. NetSuite takes a `Date` natively: no formatting, no locale,
+  nothing to parse, nothing to mis-parse.
+
+  The two forms are deliberately separate variables:
+
+  > **The string is a comparison key only and must never be written.
+  > The Date is written and must never be compared.**
+
+  They look redundant side by side and they are not. **Do not tidy them back into one
+  variable** — the merged version passes every test run after the 13th of the month.
 
 - **Design Cancelled is a one-way door.** See section 6.
 
@@ -432,6 +454,8 @@ screen and a failure in the notes.
 | 16 | Clear the **Qualifying Opportunity Statuses** parameter and save | `OPPSYNC_PARAMETER_MISSING` at error and **nothing runs** — the gate fails shut. **Revert afterwards** |
 | 17 | Move an opportunity to **Design Cancelled**, then to another mapped sub-status | The order goes to *Cancelled* and then **stays there** — skipped from that point on. This is the one-way door in section 6, not a bug |
 | 18 | **Delete** an opportunity | Nothing runs |
+| 19 | Set the delivery date to a day of the month **below 13** — e.g. **5 September** — and sync | The order's expected ship date reads **5 September**, not 9 May. This is the only case where a `dd/mm` vs `mm/dd` mis-parse is visible; a date of the 14th or later cannot show it. **Run this one deliberately** — see section 5 |
+| 20 | The same date again on a second save | `OPPSYNC_ORDER_UNCHANGED` at debug, no write. Confirms the comparison key still matches after a round trip through the record |
 
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
