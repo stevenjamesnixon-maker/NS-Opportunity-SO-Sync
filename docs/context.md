@@ -42,10 +42,11 @@ Five traps that will catch a new session before it touches anything.
    and silently fail for others. Do not compare against the text a user sees in the UI.
 
    > **This project compares IDs, not text, and that is correct here.**
-   > `custbody_opportunity_sub_status` on the Opportunity and
-   > `custrecord_fin_stat_opp_sub_status` on the Record Status record **both source
-   > `customlist_opp_sub_status_list`**, so both store the same option internal IDs. The
-   > comparison between them is ID-to-ID and needs no text normalisation at all.
+   > `custbody_opportunity_sub_status` on the Opportunity stores an option internal ID from
+   > `customlist_opp_sub_status_list`, and the keys of the `custscript_opsync_status_map`
+   > parameter are those same IDs. The comparison is ID-to-ID and needs no text normalisation
+   > at all — the parameter is parsed as text, but what it *holds* is IDs on both sides of
+   > every pair, and the parser rejects anything that is not a whole number.
    >
    > The sibling repo, NS-Work-Instructions-Setter, reads its priority field as **text** for the
    > opposite reason: nobody established whether that field was a native or a hand-built list, so
@@ -84,8 +85,8 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.0.0 | `lib/opsync_lib_config.js` | Every script ID in the project, the script parameters, and the only reads of `customrecord_fin_stat` | Not deployed |
-| Opportunity user event | 1.0.1 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status and ship date to the sales orders | Not deployed |
+| Shared config library | 1.1.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
+| Opportunity user event | 1.0.2 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status and ship date to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -131,11 +132,11 @@ this document.** If you need a number, read it off the record in the account you
 |---|---|
 | The qualifying `entitystatus` values | Script parameter `custscript_opsync_qualifying_statuses`, on the deployment |
 | The excluded Record Statuses | Script parameter `custscript_opsync_excluded_statuses`, on the deployment |
-| The sub-status → Record Status mapping | `custrecord_fin_stat_opp_sub_status`, a Multiple Select on each Record Status record |
+| The sub-status → Record Status mapping | Script parameter `custscript_opsync_status_map`, on the deployment |
 
-Both parameters are set **on the deployment**, so Sandbox and Production carry their own values
-and neither set of ids appears in code. Widening the gate, excluding another status, or adding a
-mapping row is a field edit in NetSuite — not a code change and not a deployment.
+All three parameters are set **on the deployment**, so Sandbox and Production carry their own
+values and no internal id appears in code. Widening the gate, excluding another status, or
+adding a mapping row is a field edit in NetSuite — not a code change and not a deployment.
 
 Numeric internal IDs will legitimately appear in values built at runtime, because they were read
 from a record or a parameter a moment earlier. That is fine. What must never happen is a numeric
@@ -189,26 +190,42 @@ once rather than once per line.
 
 ### The mapping
 
-The mapping lives as **`custrecord_fin_stat_opp_sub_status`** on `customrecord_fin_stat` — a
-Multiple Select sourcing `customlist_opp_sub_status_list`, labelled *"opportunity sub-statuses
-that map here"*. Each Record Status declares which sub-statuses feed it.
+The mapping is a **script parameter**, `custscript_opsync_status_map`, set on the deployment.
+**It is not held on a record** — a custom record field was specified first and deliberately
+abandoned. See section 5 for why, so that nobody re-adds the field later believing its absence
+was an oversight.
 
-This direction was chosen deliberately:
+**Format:** comma-separated `subStatusId:recordStatusId` pairs.
 
-- Several sub-statuses can map to one Record Status without any duplication.
-- The rule is visible by opening the Record Status record, rather than by reading code.
-- Adding or repointing a mapping is data entry, not a deployment.
+```
+<subStatusId>:<recordStatusId>,<subStatusId>:<recordStatusId>, …
+```
 
-Because both the multi-select and the opportunity's sub-status field source the same list, the
-lookup is a plain `anyof` filter on option IDs. See section 0, trap 4.
+Both sides are internal IDs, so **the real value differs by environment** and is read off the
+records in whichever account is being deployed to. It is not written down here — see section 3.
 
-**Two active Record Status records matching one sub-status is a configuration error.**
-`getMappedStatus()` returns `null` and logs `OPPSYNC_MAPPING_AMBIGUOUS` at error naming every
-match. It does not pick one. A wrong status written silently is worse than no status written
-loudly — the whole point of trap 1 in section 0.
+The parser is deliberately forgiving about shape and unforgiving about meaning:
+
+| Input | Behaviour |
+|---|---|
+| Whitespace around any element | Trimmed. Someone will paste with spaces |
+| An empty entry | Ignored, so a trailing comma is harmless |
+| A pair that will not parse — no colon, or either side not a whole number | Logged as `OPPSYNC_MAP_INVALID_ENTRY` at error and **skipped**. The remaining pairs still apply: one typo must not disable the whole feature |
+| The **same sub-status twice** | Logged as `OPPSYNC_MAP_AMBIGUOUS` at error and **that key is dropped entirely** — not the first, not the last. Other keys are unaffected |
+| Empty, or nothing usable after parsing | A configuration error. Logged and **fails closed**, exactly like the other two parameters |
+
+**The dropped-duplicate rule carries over unchanged from the record-based design**, and so does
+its reasoning: there is no way to tell which of two conflicting rows was meant, writing a wrong
+status onto a sales order is the failure this design exists to prevent, and writing nothing is
+recoverable. A wrong status written silently is worse than no status written loudly — the whole
+point of trap 1 in section 0.
 
 **No match is not an error.** Most sub-statuses are deliberately unmapped; `getMappedStatus()`
 returns `null` quietly and the caller stops.
+
+**The parsed mapping is logged once per save** as `OPPSYNC_MAP_PARSED` at debug, one line of
+`key -> value` pairs. With the deployment's Log Level on Debug, a typo can then be spotted by eye
+in the execution log rather than inferred from an order that did not sync.
 
 Agreed mapping, seven rows, **by name**:
 
@@ -222,8 +239,9 @@ Agreed mapping, seven rows, **by name**:
 | Project on hold | On Hold |
 | Redraw Required | Redraw Required |
 
-> This mapping is **data, entered in NetSuite** on the Record Status records. The table records
-> what was agreed; the account is authoritative. No internal IDs — see section 3.
+> This mapping is **data, held in the `custscript_opsync_status_map` parameter** on the
+> deployment. The table records what was agreed, by name; the parameter holds the equivalent
+> pairs of internal IDs and is set **per environment**. No internal IDs here — see section 3.
 
 ---
 
@@ -256,6 +274,22 @@ Agreed mapping, seven rows, **by name**:
   **This is intentional. Do not "complete" the mapping.**
 
 - **An ambiguous mapping writes nothing.** See section 4.
+
+- **The mapping is a script parameter, not a custom record field — and that was a reversal.**
+  The original design put the mapping on `customrecord_fin_stat` as a Multiple Select called
+  `custrecord_fin_stat_opp_sub_status`. Sandbox testing reached `getMappedStatus()` and failed
+  with `SSS_INVALID_SRCH_FILTER`: the field did not exist. **It is not going to.**
+
+  The record approach was carried across from the sibling repo's Work Instruction configurator,
+  where each row holds four attributes — a form, an assignee, a priority and an offset — and a
+  record plainly earns its place. Here a row is **a single pair of IDs**. That does not justify a
+  custom record field, seven rows to populate in every environment, and a search on every save.
+
+  The parameter keeps environment-specific values out of the repository just as well, needs no
+  new NetSuite object at all, and costs a string split instead of a query.
+
+  **This was reconsidered after the record approach had been specified and written.** It is not
+  an oversight and the field is not missing — do not add it, and do not "restore" the search.
 
 - **Only write when the value would actually change.** Three reasons, all load-bearing: it is
   cheaper on governance; it removes system-note churn on records people read; and it breaks any
@@ -360,11 +394,13 @@ drift between scripts.
 | `OPPSYNC_ORDER_UPDATED` | audit | A sales order's Record Status, ship date, or both were written. Names the order, the opportunity and the before/after of each value. Normal operation. | Nothing. Use it to confirm the sync reached the orders you expected. |
 | `OPPSYNC_ORDER_SKIPPED` | audit | The order was left alone because its **current** Record Status is in the excluded list. Names the status. Normal operation. | Nothing, normally. If an order should have been updated, check the excluded statuses parameter on the deployment. |
 | `OPPSYNC_ORDER_UNCHANGED` | debug | The order already matched the opportunity, so nothing was written — no `submitFields` and no system note. Normal, and the common case on a re-save. | Nothing. Its **absence** on a repeat save is the signal that the change-detection guard has broken — see the date trap in section 5. |
-| `OPPSYNC_NO_MAPPING` | audit | The opportunity's sub-status resolves to no single active Record Status. **No order was touched.** Expected for every sub-status outside the design phase. | Normally nothing — most sub-statuses are deliberately unmapped (section 5). Investigate only if the sub-status *should* be mapped: check `custrecord_fin_stat_opp_sub_status` on the intended Record Status record, and look for `OPPSYNC_MAPPING_AMBIGUOUS` just above it. |
-| `OPPSYNC_MAPPING_AMBIGUOUS` | error | Two or more **active** Record Status records claim the same opportunity sub-status. Names the sub-status and every match. Nothing was written and no guess was made. | Open the named records and remove the sub-status from all but one. Until then, every opportunity at that sub-status leaves its orders untouched. |
+| `OPPSYNC_NO_MAPPING` | audit | The opportunity's sub-status resolves to no Record Status. **No order was touched.** Expected for every sub-status outside the design phase. | Normally nothing — most sub-statuses are deliberately unmapped (section 5). Investigate only if the sub-status *should* be mapped: read `OPPSYNC_MAP_PARSED` to see what the parameter actually resolved to, and look for `OPPSYNC_MAP_AMBIGUOUS` or `OPPSYNC_MAP_INVALID_ENTRY` just above it. |
+| `OPPSYNC_MAP_AMBIGUOUS` | error | The **same sub-status appears more than once** in `custscript_opsync_status_map`. That key was dropped **entirely** — not resolved to the first or the last — so it now maps to nothing and its orders are left alone. Other keys are unaffected. | Remove the duplicate on the deployment. Until then, every opportunity at that sub-status leaves its orders untouched. |
+| `OPPSYNC_MAP_INVALID_ENTRY` | error | One entry in `custscript_opsync_status_map` is not a `subStatusId:recordStatusId` pair of whole numbers. Names the offending text. **That entry was skipped and the rest of the mapping still applies** — one typo does not disable the feature. | Correct the named entry on the deployment. Any sub-status it was meant to carry currently resolves to nothing. |
+| `OPPSYNC_MAP_PARSED` | debug | The mapping as actually parsed, one line of `key -> value` pairs. Normal operation. | Nothing. With Log Level on Debug this is how a typo is spotted by eye rather than inferred from an order that did not sync. |
 | `OPPSYNC_ORDER_FAILED` | error | One sales order threw while being read or written. **The remaining orders were still processed.** | Read the logged error against the named order. Usually a locked or deleted order, or a permission problem on the executing role. |
 | `OPPSYNC_GOVERNANCE_STOP` | error | The loop stopped with governance running low, naming how many orders were done and which were not reached. | Re-save the opportunity to pick up the rest. If it recurs, the opportunity has more orders than this design anticipated — see section 6. |
-| `OPPSYNC_PARAMETER_MISSING` | error | A script parameter is unset, unreadable, or held no usable ids. Names the parameter. An empty qualifying list means **the gate never opens** — the feature is inert. | Populate the parameter on the deployment **in this account**; the values differ by environment. See section 8. |
+| `OPPSYNC_PARAMETER_MISSING` | error | A script parameter is unset, unreadable, or held nothing usable. Names the parameter. An empty **qualifying** list means the gate never opens; an empty **mapping** means nothing resolves. Either way the feature is inert. | Populate the parameter on the deployment **in this account**; the values differ by environment. See section 8. |
 | `OPPSYNC_FAILED` | error | The entry point threw outside the per-order loop. **The opportunity still saved**; its orders may be out of step. | Read the logged error. Nothing in this feature may ever block an opportunity save, so a failure here is always silent to the user. |
 
 > **Reserved — no script raises these.** Kept so a future session grepping for them finds this
@@ -397,24 +433,26 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    | `opsync_ue_opportunity.js` | `customscript_opsync_ue_opportunity` | `customdeploy_opsync_ue_opportunity` | Opportunity. `afterSubmit` only |
    | `lib/opsync_lib_config.js` | — | **None.** Shared AMD module — File Cabinet upload only. Creating a script record for it is wrong | — |
 
-4. **Define the two script parameters on the script record, and set their values on the
+4. **Define the three script parameters on the script record, and set their values on the
    deployment:**
 
    | Label | ID | Type | What goes in it |
    |---|---|---|---|
    | Qualifying Opportunity Statuses | `custscript_opsync_qualifying_statuses` | Free-Form Text | A comma-separated list of the `entitystatus` internal IDs that open the gate, **as they are in this account**. Currently *Won* alone. |
    | Excluded Record Statuses | `custscript_opsync_excluded_statuses` | Free-Form Text | A comma-separated list of the Record Status internal IDs that must never be overwritten — the statuses whose orders belong to the warehouse and finance processes, **plus Cancelled**. |
+   | Status Map | `custscript_opsync_status_map` | Free-Form Text | The mapping from section 4, as comma-separated `subStatusId:recordStatusId` pairs — seven of them, **using the internal IDs as they are in this account**. Read `OPPSYNC_MAP_PARSED` in the execution log after the first save to confirm it parsed as intended. |
 
-   **Both must be populated at deployment time, in each environment separately.** Their values
+   **All three must be populated at deployment time, in each environment separately.** Their values
    are internal IDs and therefore **differ between Sandbox and Production** — read them off the
    records in the account you are deploying to. They are not in this repository and must not be
    put in it (section 3). An unset parameter logs `OPPSYNC_PARAMETER_MISSING` at error; an unset
-   qualifying list closes the gate completely and the feature does nothing at all.
+   qualifying list closes the gate completely, and an unset mapping means nothing resolves —
+   either way the feature does nothing at all.
 
-5. Confirm `custrecord_fin_stat_opp_sub_status` exists on `customrecord_fin_stat` and is
-   populated on the Record Status records **in the target account**, per the mapping in section
-   4. It is data, so it does not travel with the code. Check no sub-status appears on two active
-   records — that is the `OPPSYNC_MAPPING_AMBIGUOUS` case.
+5. Confirm the mapping parameter's seven pairs are right **for this account** — no sub-status
+   appearing twice (that is the `OPPSYNC_MAP_AMBIGUOUS` case) and no typos (that is
+   `OPPSYNC_MAP_INVALID_ENTRY`). There is **no field to create on `customrecord_fin_stat`** and
+   no data to populate on the Record Status records; see section 5.
 6. **Disable the old `acs_ue_update_so.js` deployment.** The two must not both run. Two writers
    of `custbody_finance_status` means an ordering question nobody can answer from the logs.
 
@@ -449,13 +487,18 @@ screen and a failure in the notes.
 | 11 | A qualifying opportunity with **no sales orders** | Clean exit, no error, no log noise |
 | 12 | Change **only the delivery date** | Ship date updated on every order, Record Status write **suppressed as unchanged** |
 | 13 | **Create** a qualifying opportunity with a mapped sub-status and an existing order | Proceeds without an `oldRecord`; order updated |
-| 14 | Temporarily put one sub-status on **two active** Record Status records, then save | **Nothing written.** `OPPSYNC_MAPPING_AMBIGUOUS` at error naming both. **Revert the configuration afterwards** |
+| 14 | Put the **same sub-status twice** in the mapping parameter, then save an opportunity at that sub-status | **Nothing written for that sub-status.** `OPPSYNC_MAP_AMBIGUOUS` at error. Confirm in `OPPSYNC_MAP_PARSED` that the key is absent entirely — not resolved to the first or last. **Revert afterwards** |
 | 15 | Clear the **Excluded Record Statuses** parameter and save | `OPPSYNC_PARAMETER_MISSING` at error. **Revert afterwards** |
 | 16 | Clear the **Qualifying Opportunity Statuses** parameter and save | `OPPSYNC_PARAMETER_MISSING` at error and **nothing runs** — the gate fails shut. **Revert afterwards** |
 | 17 | Move an opportunity to **Design Cancelled**, then to another mapped sub-status | The order goes to *Cancelled* and then **stays there** — skipped from that point on. This is the one-way door in section 6, not a bug |
 | 18 | **Delete** an opportunity | Nothing runs |
 | 19 | Set the delivery date to a day of the month **below 13** — e.g. **5 September** — and sync | The order's expected ship date reads **5 September**, not 9 May. This is the only case where a `dd/mm` vs `mm/dd` mis-parse is visible; a date of the 14th or later cannot show it. **Run this one deliberately** — see section 5 |
 | 20 | The same date again on a second save | `OPPSYNC_ORDER_UNCHANGED` at debug, no write. Confirms the comparison key still matches after a round trip through the record |
+| 21 | Put a **malformed pair** in the mapping parameter — e.g. `banana` or a missing colon — alongside the good ones, then sync a **mapped** sub-status | `OPPSYNC_MAP_INVALID_ENTRY` at error naming the offending text, **and the order still updates**. One typo must not disable the feature. **Revert afterwards** |
+| 22 | The same, but sync the sub-status the **malformed** entry was meant to carry | That sub-status resolves to nothing: `OPPSYNC_NO_MAPPING`, no order touched |
+| 23 | Paste the mapping **with spaces around the pairs** and a **trailing comma** | Parses normally. `OPPSYNC_MAP_PARSED` shows the full mapping, no error lines |
+| 24 | Clear the **mapping** parameter entirely and save | `OPPSYNC_PARAMETER_MISSING` at error, **nothing resolves, no order touched** — fails closed like the other two. **Revert afterwards** |
+| 25 | Read `OPPSYNC_MAP_PARSED` after the first save in a fresh environment | The line matches the seven rows in section 4, translated to that account's IDs. **Do this once per environment at deployment** — it is the cheapest possible check on a hand-typed parameter |
 
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
@@ -470,7 +513,6 @@ Script IDs only — **no internal IDs**, here or anywhere else in this document.
 | Item | Script ID | Type | Confirmed by | Date |
 |---|---|---|---|---|
 | Record Status custom record | `customrecord_fin_stat` | Custom record | Steve | 2026-09-14 |
-| Record Status: mapped sub-statuses | `custrecord_fin_stat_opp_sub_status` | Multiple Select → `customlist_opp_sub_status_list` | Steve | 2026-09-14 |
 | Opportunity: design sub-status | `custbody_opportunity_sub_status` | List → `customlist_opp_sub_status_list` | Steve | 2026-09-14 |
 | Opportunity: delivery date | `custbody_opp_del_date` | Date | Steve | 2026-09-14 |
 | Sales Order: Record Status | `custbody_finance_status` | List/Record → `customrecord_fin_stat` | Steve | 2026-09-14 |
@@ -484,8 +526,9 @@ Script IDs only — **no internal IDs**, here or anywhere else in this document.
 | 1 | Is *Redraw Required* in or out of the excluded list? | **Out.** An order sitting at Redraw Required should be moved on when the opportunity says so. | 2026-09-14 |
 | 2 | Is the excluded list a list of **current** statuses, not of targets? | **Current statuses.** Which makes *Design Cancelled → Cancelled* a one-way door — deliberately. See section 6. | 2026-09-14 |
 | 3 | Which field links a Sales Order to its Opportunity? | The **native `opportunity`** field. **Not `createdfrom`.** | 2026-09-14 |
-| 4 | Where does the mapping live, and is comparison by ID or by text? | `custrecord_fin_stat_opp_sub_status`, a Multiple Select on `customrecord_fin_stat`. Comparison is **ID-to-ID** — both fields source the same list. See section 0, trap 4. | 2026-09-14 |
+| 4 | Where does the mapping live, and is comparison by ID or by text? | **Superseded — see question 6.** Comparison is **ID-to-ID** either way. See section 0, trap 4. | 2026-09-14 |
 | 5 | How should XEDIT's sparse `newRecord` be handled? | Read `newRecord` first, fall back to `oldRecord`. See section 5. | 2026-09-14 |
+| 6 | Should the mapping be a field on `customrecord_fin_stat`? | **No, and the field will not be created.** It is the script parameter `custscript_opsync_status_map`. The record approach was specified, written, and abandoned after Sandbox testing — a single pair of IDs does not justify a custom record. See section 5. | 2026-09-14 |
 | — | Should the status internal IDs stay in this document as human reference? | **No.** Every one removed, and the rule now has no exceptions. See section 3. | 2026-09-14 |
 
 ### Open questions
@@ -501,7 +544,6 @@ Not code. These are account changes the scripts assume have been made.
 
 | # | Task | Why it matters |
 |---|---|---|
-| 1 | Create `custrecord_fin_stat_opp_sub_status` on `customrecord_fin_stat` and populate the seven mapping rows | Without it the sync resolves nothing and stops at `OPPSYNC_NO_MAPPING` on every opportunity. Section 4. |
-| 2 | Define both script parameters on the script record and set their values on the deployment, **in each environment** | Section 8, step 4. An unset qualifying list makes the feature completely inert, and the only sign is one error line in the log. |
-| 3 | Disable the `acs_ue_update_so.js` deployment when this one goes live | Section 8, step 6. Two writers of `custbody_finance_status`. |
-| 4 | Confirm no sub-status appears on two active Record Status records | Section 4 — it is the `OPPSYNC_MAPPING_AMBIGUOUS` case, and it leaves orders untouched. |
+| 1 | Define **three** script parameters on the script record and set their values on the deployment, **in each environment** | Section 8, step 4. This now includes the mapping itself. An unset qualifying list or an unset mapping makes the feature completely inert, and the only sign is one error line in the log. |
+| 2 | Disable the `acs_ue_update_so.js` deployment when this one goes live | Section 8, step 6. Two writers of `custbody_finance_status`. |
+| 3 | Check `OPPSYNC_MAP_PARSED` in the log after the first save in each environment | Section 9, scenario 25. A hand-typed parameter of seven ID pairs is the most likely thing to be wrong, and this is the only place it becomes visible. |

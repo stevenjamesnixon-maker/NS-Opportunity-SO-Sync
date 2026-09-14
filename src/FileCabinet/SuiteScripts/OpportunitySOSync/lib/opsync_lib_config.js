@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
-define(['N/search', 'N/runtime', 'N/log'], function (search, runtime, log) {
+define(['N/runtime', 'N/log'], function (runtime, log) {
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -38,18 +38,15 @@ define(['N/search', 'N/runtime', 'N/log'], function (search, runtime, log) {
      *
      *   Purpose                            Script ID                              Type
      *   ---------------------------------- -------------------------------------- ------------------
-     *   Record Status custom record        customrecord_fin_stat                  Custom record
-     *   Record Status: mapped sub-statuses custrecord_fin_stat_opp_sub_status     Multiple Select
      *   Opportunity: design sub-status     custbody_opportunity_sub_status        List
      *   Opportunity: delivery date         custbody_opp_del_date                  Date
      *   Sales Order: Record Status         custbody_finance_status                List/Record
      *   Sales Order: expected ship date    custbody_defaultshipdate               Date
      *   Sales Order -> Opportunity link    opportunity                            Native field
      *
-     * Both the sub-status field on the Opportunity and the mapping multi-select on the Record
-     * Status record source the same list, customlist_opp_sub_status_list, so both store the same
-     * option internal IDs. Comparison between them is therefore ID-to-ID and needs no text
-     * normalisation. See docs/context.md section 0, trap 4.
+     * The sub-status -> Record Status mapping is NOT held on a record. It is a script
+     * parameter — see PARAMETERS.STATUS_MAP and getMappedStatus(). A custom record was
+     * specified first and deliberately abandoned: see docs/context.md section 5.
      * ------------------------------------------------------------------------------------------ */
 
     /**
@@ -60,39 +57,20 @@ define(['N/search', 'N/runtime', 'N/log'], function (search, runtime, log) {
     var LOG_PREFIX = 'OPPSYNC_';
 
     /**
-     * Upper bound on the Record Status records read when resolving one sub-status.
-     *
-     * NOT a NetSuite internal id — this is a result-set bound. A correct configuration returns
-     * exactly one record and a broken one returns two; the bound exists so that a search which
-     * somehow matches far more cannot run away, not because a real mapping approaches it.
-     *
-     * @type {number}
-     */
-    var MAX_MAPPING_MATCHES = 1000;
-
-    /**
      * Record type script IDs.
      * @type {Object}
      */
     var RECORD_TYPES = {
-        /** The Record Status custom record. Holds the mapping — see MAPPING_FIELDS. */
-        RECORD_STATUS: 'customrecord_fin_stat',
-        /** Native sales order record type, as used in a search. */
-        SALES_ORDER: 'salesorder'
-    };
-
-    /**
-     * Field script IDs on customrecord_fin_stat.
-     * @type {Object}
-     */
-    var MAPPING_FIELDS = {
         /**
-         * Multiple Select sourcing customlist_opp_sub_status_list: "opportunity sub-statuses
-         * that map here". Each Record Status declares which sub-statuses feed it, so several
-         * sub-statuses may map to one status without duplication and the rule is visible on the
-         * record rather than in code.
+         * Native sales order record type, as used in a search.
+         *
+         * customrecord_fin_stat is deliberately NOT here. Nothing in this project reads that
+         * record any more — the mapping moved to a script parameter — and an unused constant
+         * naming it would invite someone to search it again. The Record Status custom record
+         * still exists in NetSuite and is still what custbody_finance_status points at; this
+         * code simply never loads it.
          */
-        OPP_SUB_STATUS: 'custrecord_fin_stat_opp_sub_status'
+        SALES_ORDER: 'salesorder'
     };
 
     /**
@@ -127,25 +105,33 @@ define(['N/search', 'N/runtime', 'N/log'], function (search, runtime, log) {
     };
 
     /**
-     * Script parameter IDs. Both are set on the DEPLOYMENT, so Sandbox and Production carry
-     * their own values and neither set of ids appears in code. See docs/context.md section 8.
+     * Script parameter IDs. All three are set on the DEPLOYMENT, so Sandbox and Production
+     * carry their own values and no internal id appears in code. See docs/context.md section 8.
      * @type {Object}
      */
     var PARAMETERS = {
         /** Free-Form Text. Comma-separated entitystatus ids that open the gate. */
         QUALIFYING_STATUSES: 'custscript_opsync_qualifying_statuses',
         /** Free-Form Text. Comma-separated Record Status ids that must not be overwritten. */
-        EXCLUDED_STATUSES: 'custscript_opsync_excluded_statuses'
+        EXCLUDED_STATUSES: 'custscript_opsync_excluded_statuses',
+        /**
+         * Free-Form Text. The sub-status -> Record Status mapping, as comma-separated
+         * subStatusId:recordStatusId pairs. See parseStatusMap() for the format and the
+         * handling of malformed and duplicate entries.
+         */
+        STATUS_MAP: 'custscript_opsync_status_map'
     };
 
     /* ------------------------------------------------------------------------------------------
      * NO CACHING
      *
-     * getMappedStatus() runs a search on every call and nothing here is memoised. That is
-     * deliberate, not an oversight. The mapping is configuration that people edit in the UI, and
-     * a cache would risk resolving a sub-status against a mapping that was correct a moment ago
-     * — writing a stale Record Status onto a sales order. One search per qualifying save is
-     * trivial governance next to that risk.
+     * getMappedStatus() re-reads and re-parses the mapping parameter on every call and nothing
+     * here is memoised. That is deliberate, not an oversight. The mapping is configuration that
+     * people edit, and a cache would risk resolving a sub-status against a mapping that was
+     * correct a moment ago — writing a stale Record Status onto a sales order.
+     *
+     * Since the mapping moved from a saved search to a script parameter the cost is a string
+     * split rather than a query, so there is even less to weigh against that risk than before.
      * ------------------------------------------------------------------------------------------ */
 
     /**
@@ -281,69 +267,173 @@ define(['N/search', 'N/runtime', 'N/log'], function (search, runtime, log) {
     }
 
     /**
-     * Resolves an opportunity sub-status to the Record Status that declares it.
+     * True when the text is a plain non-negative integer — the shape every NetSuite internal id
+     * takes. Guards the map parser against text that would otherwise be written to a record.
      *
-     * Searches customrecord_fin_stat for the ACTIVE record whose mapping multi-select contains
-     * the given sub-status. The comparison is ID-to-ID: both fields source
-     * customlist_opp_sub_status_list, so both hold the same option internal ids and no text
-     * normalisation is involved.
+     * @param {string} text
+     * @returns {boolean}
+     */
+    function isIdText(text) {
+        return /^[0-9]+$/.test(text);
+    }
+
+    /**
+     * Parses the mapping parameter into a plain object keyed by sub-status id.
      *
-     * Two active records claiming one sub-status is a configuration error. This returns null and
-     * logs OPPSYNC_MAPPING_AMBIGUOUS at error naming every match, rather than picking one.
-     * Writing a wrong status onto a sales order is the failure this whole design exists to
-     * prevent; leaving the order alone is recoverable, and the log names what to fix.
+     * Format: comma-separated subStatusId:recordStatusId pairs, e.g.
+     * "<subStatusId>:<recordStatusId>,<subStatusId>:<recordStatusId>". Both sides are internal
+     * ids, so the real value differs by environment and lives on the deployment — never here,
+     * and never in the repository. See docs/context.md section 3.
+     *
+     * The parser is deliberately forgiving about SHAPE and unforgiving about MEANING:
+     *
+     *   - whitespace around any element is trimmed, because someone will paste with spaces;
+     *   - empty entries are ignored, so a trailing comma is harmless;
+     *   - a pair that will not parse is logged and SKIPPED, and the remaining pairs still
+     *     apply. One typo must not disable the whole feature;
+     *   - a DUPLICATE key is logged and the key is DROPPED ENTIRELY. Not the first, not the
+     *     last. Writing a wrong status onto a sales order is the failure this design exists to
+     *     prevent, and there is no way to tell which of two conflicting rows was meant. Writing
+     *     nothing is recoverable and the log names what to fix.
+     *
+     * @returns {Object|null} sub-status id -> Record Status id, or null when unusable
+     */
+    function parseStatusMap() {
+        var raw;
+        var entries;
+        var map = {};
+        var duplicates = {};
+        var summary = [];
+        var i;
+        var entry;
+        var halves;
+        var key;
+        var value;
+        var usable = 0;
+
+        try {
+            raw = runtime.getCurrentScript().getParameter({ name: PARAMETERS.STATUS_MAP });
+        } catch (e) {
+            log.error({
+                title: logKey('PARAMETER_MISSING'),
+                details: 'Could not read script parameter ' + PARAMETERS.STATUS_MAP +
+                    '. Is it defined on the script record and set on the deployment? ' + e
+            });
+            return null;
+        }
+
+        if (raw === null || raw === undefined || String(raw) === '') {
+            log.error({
+                title: logKey('PARAMETER_MISSING'),
+                details: 'Script parameter ' + PARAMETERS.STATUS_MAP + ' is empty. No ' +
+                    'sub-status can be resolved, so no sales order will be updated at all. ' +
+                    'Populate it on the deployment in this account — its value differs by ' +
+                    'environment. See docs/context.md section 8.'
+            });
+            return null;
+        }
+
+        entries = String(raw).split(',');
+
+        for (i = 0; i < entries.length; i += 1) {
+            entry = entries[i].replace(/^\s+|\s+$/g, '');
+
+            // A trailing or doubled comma is not worth an error line.
+            if (entry === '') {
+                continue;
+            }
+
+            halves = entry.split(':');
+            key = halves.length === 2 ? halves[0].replace(/^\s+|\s+$/g, '') : '';
+            value = halves.length === 2 ? halves[1].replace(/^\s+|\s+$/g, '') : '';
+
+            if (halves.length !== 2 || !isIdText(key) || !isIdText(value)) {
+                log.error({
+                    title: logKey('MAP_INVALID_ENTRY'),
+                    details: 'Entry "' + entry + '" in ' + PARAMETERS.STATUS_MAP + ' is not a ' +
+                        'subStatusId:recordStatusId pair of whole numbers. It was skipped; the ' +
+                        'rest of the mapping still applies. Correct it on the deployment.'
+                });
+                continue;
+            }
+
+            if (map.hasOwnProperty(key)) {
+                duplicates[key] = true;
+                continue;
+            }
+
+            map[key] = value;
+            usable += 1;
+        }
+
+        // Drop every duplicated key outright, AFTER the pass — so a key duplicated three times
+        // is dropped once and the first occurrence does not survive by being first.
+        Object.keys(duplicates).forEach(function (duplicateKey) {
+            log.error({
+                title: logKey('MAP_AMBIGUOUS'),
+                details: 'Sub-status ' + duplicateKey + ' appears more than once in ' +
+                    PARAMETERS.STATUS_MAP + '. The whole entry was dropped rather than guessing ' +
+                    'which mapping was meant, so that sub-status now resolves to nothing and ' +
+                    'its sales orders are left alone. Remove the duplicate on the deployment.'
+            });
+            delete map[duplicateKey];
+            usable -= 1;
+        });
+
+        if (usable <= 0) {
+            log.error({
+                title: logKey('PARAMETER_MISSING'),
+                details: 'Script parameter ' + PARAMETERS.STATUS_MAP + ' held no usable pairs ' +
+                    'after parsing. Nothing can be resolved. Raw value: ' + raw
+            });
+            return null;
+        }
+
+        // One line, so a typo can be spotted by eye in the execution log rather than inferred
+        // from an order that did not sync. Requires the deployment's Log Level to be Debug.
+        Object.keys(map).forEach(function (mapKey) {
+            summary.push(mapKey + ' -> ' + map[mapKey]);
+        });
+        log.debug({
+            title: logKey('MAP_PARSED'),
+            details: summary.join(', ')
+        });
+
+        return map;
+    }
+
+    /**
+     * Resolves an opportunity sub-status to its Record Status through the mapping parameter.
      *
      * No match is NOT an error — most sub-statuses are deliberately unmapped. It returns null
-     * quietly and the caller stops.
+     * quietly and the caller stops. A sub-status dropped for being duplicated resolves to null
+     * for the same reason, having already been logged at error by parseStatusMap().
      *
      * @param {string} subStatusId - a customlist_opp_sub_status_list option internal id
      * @returns {string|null} the Record Status internal id, or null
      */
     function getMappedStatus(subStatusId) {
-        var matches = [];
-        var results;
+        var map;
+        var key;
 
         if (subStatusId === null || subStatusId === undefined || String(subStatusId) === '') {
             return null;
         }
 
-        results = search.create({
-            type: RECORD_TYPES.RECORD_STATUS,
-            filters: [
-                [MAPPING_FIELDS.OPP_SUB_STATUS, 'anyof', String(subStatusId)],
-                'AND',
-                ['isinactive', 'is', 'F']
-            ],
-            columns: ['internalid']
-        }).run().getRange({ start: 0, end: MAX_MAPPING_MATCHES });
-
-        results.forEach(function (result) {
-            matches.push(String(result.id));
-        });
-
-        if (matches.length === 0) {
+        map = parseStatusMap();
+        if (map === null) {
             return null;
         }
 
-        if (matches.length > 1) {
-            log.error({
-                title: logKey('MAPPING_AMBIGUOUS'),
-                details: 'Opportunity sub-status ' + subStatusId + ' is claimed by ' +
-                    matches.length + ' active ' + RECORD_TYPES.RECORD_STATUS +
-                    ' records: ' + matches.join(', ') + '. Nothing was written. ' +
-                    'Remove the sub-status from all but one of those records.'
-            });
-            return null;
-        }
+        key = String(subStatusId);
 
-        return matches[0];
+        return map.hasOwnProperty(key) ? map[key] : null;
     }
 
     return {
         VERSION: VERSION,
         LOG_PREFIX: LOG_PREFIX,
         RECORD_TYPES: RECORD_TYPES,
-        MAPPING_FIELDS: MAPPING_FIELDS,
         OPPORTUNITY_FIELDS: OPPORTUNITY_FIELDS,
         SALES_ORDER_FIELDS: SALES_ORDER_FIELDS,
         PARAMETERS: PARAMETERS,

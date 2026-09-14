@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.0.1
+ * @version 1.0.2
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.0.1';
+    var VERSION = '1.0.2';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -418,10 +418,12 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 log.audit({
                     title: opsyncConfig.logKey('NO_MAPPING'),
                     details: 'Opportunity ' + opportunityId + ' sub-status ' +
-                        (subStatus || '(empty)') + ' resolves to no single active Record Status. ' +
+                        (subStatus || '(empty)') + ' resolves to no Record Status. ' +
                         'No sales order was touched. Most sub-statuses are deliberately unmapped ' +
-                        '— see docs/context.md section 5. If an ambiguity was the cause, ' +
-                        opsyncConfig.logKey('MAPPING_AMBIGUOUS') + ' names the records.'
+                        '— see docs/context.md section 5. If a duplicate or a malformed entry ' +
+                        'in the mapping parameter was the cause, ' +
+                        opsyncConfig.logKey('MAP_AMBIGUOUS') + ' and ' +
+                        opsyncConfig.logKey('MAP_INVALID_ENTRY') + ' name it.'
                 });
                 return;
             }
