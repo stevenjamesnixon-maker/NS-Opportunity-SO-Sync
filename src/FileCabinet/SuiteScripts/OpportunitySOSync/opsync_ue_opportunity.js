@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.4.0
+ * @version 1.6.1
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.4.0';
+    var VERSION = '1.6.1';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -74,25 +74,44 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
     }
 
     /**
-     * Presence test for a legacy evidence field. NOT isEmpty() — see below.
+     * THE PROJECT'S PRESENCE TEST for any field where "is this filled in" decides whether an
+     * order ships. NOT isEmpty() — see below.
      *
-     * The three legacy fields' types are NOT confirmed: they may be checkbox, date or text. This
-     * has to be correct for all three, and the checkbox case is the dangerous one.
+     * It was called isLegacyPresent() until 1.5.3, having been written for the three legacy
+     * evidence fields, whose types are NOT confirmed and may be checkbox, date or text. It was
+     * never legacy-only, and by then it also served a CONFIRMED Date and a lookupFields value —
+     * so a reader meeting isLegacyPresent(voucherDate) had to go and check whether they were
+     * looking at a bug. A helper whose name has to be explained away in a comment is the same
+     * defect as custbody_ meaning only "transaction body field", in a cheaper place.
      *
-     * An UNTICKED checkbox arrives as boolean FALSE. isEmpty(false) is false, because
-     * String(false) is the five-character string "false" — so a presence test written as
-     * !isEmpty(value), or as value !== '', reads an unticked box as PRESENT and hands every
-     * legacy opportunity a free pass on its certificates. Silently, and in the direction that
-     * ships goods rather than holding them.
+     * It is correct for a checkbox, a date and a text field alike, because the cost of being
+     * wrong is always in the same direction.
+     *
+     * THAT DIRECTION IS WHY THIS IS THE DEFAULT. An UNTICKED checkbox arrives as boolean FALSE.
+     * isEmpty(false) is false, because String(false) is the five-character string "false" — so a
+     * presence test written as !isEmpty(value), or as value !== '', reads an unticked box as
+     * PRESENT and hands the order a free pass on the condition. Silently, and in the direction
+     * that ships goods rather than holding them. A field whose type is confirmed today can be
+     * changed in the UI tomorrow by someone who will never read this file, and nothing in the
+     * script would notice. This test survives that change; isEmpty() does not.
+     *
+     * So use this for EVERY presence-gates-shipping test, whether or not the type is confirmed.
+     * There is no longer an exception: custbody_installer_subcontract_receive was the last one
+     * on !isEmpty() and moved across in 1.5.2. A new presence test written as !isEmpty() is the
+     * defect, not the field it happens to be reading.
+     *
+     * It is correct on a lookupFields result as well as on a record, and the subcontract field
+     * is the proof: lookupValue() stringifies, so an unticked checkbox arrives as the STRING
+     * "false" rather than as boolean false. Both shapes are rejected below, by name.
      *
      * So false, '' , null and undefined are all absent. The string forms 'F' and 'false' are
      * treated as absent too, in case a checkbox reaches this by a path that stringifies it —
-     * neither is a plausible value for a genuine text or date flag.
+     * neither is a plausible value for a genuine text or date field.
      *
      * @param {*} value
-     * @returns {boolean} true when the legacy evidence is present
+     * @returns {boolean} true when the value is present
      */
-    function isLegacyPresent(value) {
+    function isPresent(value) {
         var text;
 
         if (value === null || value === undefined || value === false) {
@@ -342,7 +361,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * @returns {Object} { reason: string, path: string } — reason '' when satisfied
      */
     function resolveCertificate(legacyValue, installerId, rawExpiry, today, label) {
-        if (isLegacyPresent(legacyValue)) {
+        if (isPresent(legacyValue)) {
             return { reason: '', path: 'legacy' };
         }
 
@@ -522,9 +541,16 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * order had on entry — the design gate is asking "will this order be far enough along once
      * this save lands", not "was it before".
      *
-     * Each certificate condition has a LEGACY path — see resolveCertificate and the note on
-     * the legacy constants in opsync_lib_config.js. Legacy evidence satisfies its condition
-     * outright, so an order verified under the old process is ready even with a blank installer.
+     * The first three certificate conditions have a LEGACY path — see resolveCertificate and the
+     * note on the legacy constants in opsync_lib_config.js. Legacy evidence satisfies its
+     * condition outright, so an order verified under the old process is ready even with a blank
+     * installer. DNO and the BUS voucher have no legacy path and must never be given one.
+     *
+     * THE CERTIFICATE GATE IS THE DEFINITION OF A HEAT PUMP PROJECT for this script. The BUS
+     * voucher condition sits inside it for exactly that reason and needs no field of its own to
+     * decide what a heat pump is. custbody_value_proposition is deliberately NOT consulted: the
+     * physical product decides these rules, not the commercial package, and a second definition
+     * of "heat pump" in the same rule would be free to disagree with the first.
      *
      * The legacy values come off the CONTEXT, not the order: they live on the opportunity and
      * are read once per save. The evaluation rule is unchanged by that — only the source is.
@@ -551,9 +577,24 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         if (gates.requiresCerts) {
 
             // 1. Subcontract. Either field satisfies it.
-            if (!isEmpty(order.subcontractReceived)) {
+            //
+            //    BOTH sides go through the presence test. The modern field's type is still
+            //    unconfirmed, and it was the last !isEmpty() presence test in this script — the
+            //    one place a type change in the UI could still flip a condition to fail OPEN,
+            //    in the ship-the-goods direction, with nothing logged.
+            //
+            //    IT ARRIVES FROM A lookupFields RESULT, NOT FROM THE RECORD, AND THAT IS WHY
+            //    THE TEST WORKS. lookupValue() stringifies, so an unticked checkbox reaches
+            //    here as the five-character string "false" rather than as boolean false — which
+            //    is exactly the shape !isEmpty() reads as PRESENT. The presence test rejects
+            //    'false' and 'F' by name for that case, so the lookup shape is covered as well
+            //    as the record shape.
+            //
+            //    It is a date today, so this changes no behaviour. The point is that the class
+            //    is closed rather than documented.
+            if (isPresent(order.subcontractReceived)) {
                 paths.subcontract = 'modern';
-            } else if (isLegacyPresent(ctx.subcontractLegacy)) {
+            } else if (isPresent(ctx.subcontractLegacy)) {
                 paths.subcontract = 'legacy';
             } else {
                 paths.subcontract = 'fail';
@@ -587,6 +628,62 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             } else {
                 paths.dno = 'fail';
                 reasons.push('Awaiting DNO');
+            }
+
+            // 5. BUS voucher. NO legacy path either, and for a firmer reason than DNO's: the BUS
+            //    scheme postdates the old process entirely, so no legacy BUS field exists and
+            //    the three legacy flags say nothing about a voucher. Do not wire them in.
+            //
+            //    THE BLANK CASE IS THE POINT. A blank intention is treated as INTENDED and holds
+            //    the order, because a project that should have claimed a voucher and shipped
+            //    without one cannot claim it retrospectively. The safe direction is to hold and
+            //    ask.
+            //
+            //    THE THREE FAILURE REASONS ARE DELIBERATELY DIFFERENT and must not be merged.
+            //    Each is actioned by a different person:
+            //
+            //      'BUS intention not confirmed'      a missing answer — somebody must decide
+            //      'Awaiting BUS voucher application' nobody has applied yet — somebody's job
+            //      'Awaiting BUS voucher approval'    applied and waiting on the scheme — a
+            //                                         genuine wait, and nothing to chase here
+            //
+            //    AT MOST ONE OF THEM EVER APPEARS, because this is one if/else chain and not
+            //    four independent tests. Do not refactor it into separate ifs: two BUS reasons
+            //    in one hold string would read as two problems where there is one.
+            //
+            //    THE INTENTION QUESTION TAKES PRECEDENCE over the application question. A blank
+            //    intention reports 'BUS intention not confirmed' whether or not an application
+            //    date exists, because an application against an unrecorded intention is still
+            //    an unanswered question — and answering it may make the whole condition moot.
+            //
+            //    ctx.busNoValue IS CHECKED FOR EMPTY FIRST, and that guard is load-bearing. An
+            //    unset parameter leaves it '', a blank intention normalises to '' too, and a
+            //    bare equality test would then match the two and switch the condition OFF for
+            //    every order — turning a parameter that is supposed to fail closed into one that
+            //    ships goods. See getBusNoValue() in opsync_lib_config.js.
+            if (ctx.busNoValue !== '' && ctx.busRhiIntended === ctx.busNoValue) {
+                paths.busVoucher = 'not intended';
+            } else if (isPresent(ctx.voucherApprovalDate)) {
+                // Presence only, never an expiry comparison: an approved voucher does not lapse
+                // for this purpose.
+                //
+                // isPresent(), not isEmpty(), although the field is a CONFIRMED Date and
+                // isEmpty() would be correct for one. The tolerant test is correct for a date
+                // too, and a type change in the UI would flip an isEmpty() test to fail OPEN,
+                // in the ship-the-goods direction. The class is closed, not the instance.
+                paths.busVoucher = 'approved';
+            } else if (isEmpty(ctx.busRhiIntended)) {
+                paths.busVoucher = 'fail unconfirmed';
+                reasons.push('BUS intention not confirmed');
+            } else if (!isPresent(ctx.applicationDate)) {
+                // Reached ONLY when the intention is recorded and not "No", and the voucher is
+                // not yet approved. So the question is genuinely "has anyone applied", and a
+                // blank application date is the answer.
+                paths.busVoucher = 'fail not applied';
+                reasons.push('Awaiting BUS voucher application');
+            } else {
+                paths.busVoucher = 'fail awaiting';
+                reasons.push('Awaiting BUS voucher approval');
             }
         }
 
@@ -759,7 +856,12 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                     ', paths=' + describePaths(verdict.paths) +
                     ', dnoRaw=' + JSON.stringify(ctx.dnoStatusRaw) +
                     ' -> ' + (ctx.dnoStatus || '(blank)') +
-                    ', dnoOk=' + ctx.dnoOkValues.join('/')
+                    ', dnoOk=' + ctx.dnoOkValues.join('/') +
+                    ', rhiRaw=' + JSON.stringify(ctx.busRhiIntendedRaw) +
+                    ' -> ' + (ctx.busRhiIntended || '(blank)') +
+                    ', busNo=' + (ctx.busNoValue || '(unset — condition applies to all)') +
+                    ', voucherDate=' + (asDateKey(ctx.voucherApprovalDate) || '(blank)') +
+                    ', applicationDate=' + (asDateKey(ctx.applicationDate) || '(blank)')
             });
 
             // Both fields are written together or not at all: a reason without its checkbox, or
@@ -803,13 +905,14 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      *
      * Two things are resolved here and nowhere else:
      *
-     * 1. The four required parameters. They are read UP FRONT precisely so that a missing one
+     * 1. The four throwing parameters, plus getBusNoValue() which does not throw. They are read
+     *    UP FRONT precisely so that a missing one
      *    throws before a single order has been written — a throw from inside the loop would
      *    leave some orders updated and the rest not, which is the "no partial writes" the brief
      *    asks for. See the note on requiredParameter() in opsync_lib_config.js.
      *
-     * 2. The DNO status and the three LEGACY evidence flags, straight off the opportunity —
-     *    no lookup at all.
+     * 2. The DNO status, the BUS voucher pair and the three LEGACY evidence flags, straight off
+     *    the opportunity — no lookup at all.
      *    Because they are opportunity-level, they satisfy the certificate gate for EVERY linked
      *    sales order, including any order added later. That is intended: the flags record that
      *    the work was verified under the old process, and the opportunity is the unit that
@@ -851,6 +954,38 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.QUAL_LOGGED_LEGACY, sparse),
             plLegacy: effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.PL_LOGGED_LEGACY, sparse),
+
+            // The BUS voucher pair is on the OPPORTUNITY too, and is read here ONCE for the same
+            // reason — not per order. Both go through effectiveValue so a sparse XEDIT newRecord
+            // falls back to oldRecord: reading a populated voucher date as blank would hold every
+            // linked order on an inline edit of something else entirely.
+            //
+            // The raw intention is kept alongside the normalised id because it goes in the log,
+            // exactly as dnoStatusRaw is. A select read off a record is a plain id string, but the
+            // same field read through a search is an array of {value,text} — so it is normalised
+            // through asSelectId() below and never through String().
+            busRhiIntendedRaw: effectiveValue(
+                newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.BUS_RHI_INTENDED, sparse),
+            // A Date object from record.getValue(). Tested for PRESENCE only, through
+            // isPresent() rather than isEmpty() — never parsed, never compared to today.
+            // An approved voucher does not expire.
+            voucherApprovalDate: effectiveValue(
+                newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.VOUCHER_APPROVAL_DATE,
+                sparse),
+            // The APPLICATION date, which is not the approval date and must never be read as
+            // one. Same source, same helper, same presence test — and consulted only after the
+            // approval date has been found blank, so it cannot contradict an approval.
+            //
+            // ON THE OPPORTUNITY, Date — confirmed from the field definition's Applies To, so
+            // this read is the right one. Were it ever moved, this would return blank rather
+            // than erroring and every 'Awaiting BUS voucher approval' would silently become
+            // 'Awaiting BUS voucher application'. Section 9 scenario 70 is what would catch it.
+            applicationDate: effectiveValue(
+                newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.APPLICATION_DATE, sparse),
+            // '' when the parameter is unset, which applies the BUS condition to everything
+            // rather than to nothing. It does not throw — see getBusNoValue().
+            busNoValue: opsyncConfig.getBusNoValue(),
+
             today: todayDayNumber(),
             quoteTypeCache: {}
         };
@@ -862,6 +997,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         // id string, but the same field read through a search returns an array of {value,text},
         // and String() on that is '[object Object]'.
         ctx.dnoStatus = asSelectId(ctx.dnoStatusRaw);
+        ctx.busRhiIntended = asSelectId(ctx.busRhiIntendedRaw);
 
         ctx.installerId = asSelectId(effectiveValue(
             newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.INSTALLER, sparse));
@@ -1014,9 +1150,9 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
 
             excludedStatuses = opsyncConfig.getExcludedStatuses();
 
-            // Readiness context BEFORE the loop: the four required parameters (so a missing one
-            // throws before anything is written) and the installer's certificates (one lookup,
-            // cached for every order). See buildReadinessContext.
+            // Readiness context BEFORE the loop: the readiness parameters (so a missing throwing
+            // one throws before anything is written) and the installer's certificates (one
+            // lookup, cached for every order). See buildReadinessContext.
             readinessContext = buildReadinessContext(newRecord, oldRecord, sparse);
 
             // 6. One opportunity may have several sales orders.
