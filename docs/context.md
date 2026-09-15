@@ -86,7 +86,7 @@ so it is where the sync belongs.
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
 | Shared config library | 1.3.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.2.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Opportunity user event | 1.3.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -160,8 +160,8 @@ opportunity is actually saved.
 2. Read entitystatus from newRecord if present, otherwise from oldRecord.
 3. entitystatus is a qualifying status. Else exit.
 4. NO "has the sub-status changed" exit. Every save of a qualifying opportunity proceeds.
-5. Resolve the sub-status to a Record Status through the mapping.
-   No mapping -> log OPPSYNC_NO_MAPPING and stop. Never write an unmapped value.
+5. Resolve the sub-status through the mapping. No mapping -> log OPPSYNC_NO_MAPPING and
+   carry on; the Record Status is simply not written. Never write an unmapped value.
 6. Find the sales orders: salesorder, filtered on the native opportunity field, mainline is T.
 7. For each, in its own try/catch:
      - read its current Record Status and ship date in one lookupFields
@@ -257,6 +257,31 @@ hence the per-order try/catch at step 7 rather than one try/catch around the loo
 | `custbody_opp_del_date` | `custbody_defaultshipdate` | Direct — both dates |
 | *(derived — see below)* | `custbody_ready_for_delivery` | Two gates on the Quote Type record |
 | *(derived — see below)* | `custbody_delivery_hold_reason` | The failed gates, joined with `; ` |
+
+### The decided status
+
+One definition, used by the exclusion test, the design gate and the status write alike:
+
+> **decided status** = the mapped status when `getMappedStatus()` returns one,
+> otherwise **the sales order's own current status**.
+
+When the sub-status maps to nothing:
+
+- `custbody_finance_status` is **not written** — the order keeps the status it has.
+- The **ship date is still written** on its own comparison. It is a direct copy from the
+  opportunity and the status map has never governed it.
+- The orders **are** searched and readiness **is** evaluated, each against its own current
+  status.
+- Every exclusion rule applies first and unchanged. An order at an excluded **entry** status is
+  skipped entirely; and because the decided status equals the current status on an unmapped
+  save, the second exclusion test cannot fire independently — the entry check has already
+  caught it.
+
+**Why readiness must not depend on the mapping:** the map governs status *propagation*, not
+whether an order is fit to ship. A won opportunity at *Partially Delivered* or *Delivery
+Complete* is unmapped by design, and can still carry a linked order that has not shipped —
+one opportunity may have several orders. Gating readiness on whether a sub-status happens to
+appear in `custscript_opsync_status_map` would leave those orders stale forever.
 
 **The link between them** is the **native `opportunity`** field on the Sales Order. **Not
 `createdfrom`.** The search filters on it together with `mainline is T`, so each order comes back
@@ -467,6 +492,20 @@ Agreed mapping, seven rows, **by name**:
 
 - **Legacy evidence is an OR, not an AND**, and carries no expiry. See section 4.
 
+- **An unmapped sub-status no longer stops the save, and must not again.**
+  Until 1.3.0 `getMappedStatus()` returning `null` returned before the orders were even
+  searched. It was the second of two short-circuits with the same symptom as the Phase 3a
+  defect: a won opportunity at an unmapped sub-status never had its readiness refreshed, and
+  nothing in the log said so.
+
+  The fix is the single **decided status** definition in section 4 rather than a special case:
+  where there is no mapping, each order's own current status is what the design gate tests,
+  because nothing is going to change it on this save.
+
+  Two short-circuits, one lesson: **a guard that asks "did the thing Phase 2 cared about
+  change?" is wrong the moment a new input arrives.** Filter at the value level, where the
+  comparison is against what the record actually holds.
+
 - **Guard every array access on a lookup result.** The predecessor script read
   `lookupFields(...).custbody_finance_status[0].value` with no guard. `lookupFields` returns an
   empty array for an empty list field, so `[0]` is `undefined` and `.value` throws. Every sales
@@ -535,7 +574,7 @@ drift between scripts.
 | `OPPSYNC_ORDER_UPDATED` | audit | A sales order's Record Status, ship date, or both were written. Names the order, the opportunity and the before/after of each value. Normal operation. | Nothing. Use it to confirm the sync reached the orders you expected. |
 | `OPPSYNC_ORDER_SKIPPED` | audit | The order was left alone because its **current** Record Status is in the excluded list. Names the status. Normal operation. | Nothing, normally. If an order should have been updated, check the excluded statuses parameter on the deployment. |
 | `OPPSYNC_ORDER_UNCHANGED` | debug | The order already matched the opportunity, so nothing was written — no `submitFields` and no system note. Normal, and the common case on a re-save. | Nothing. Its **absence** on a repeat save is the signal that the change-detection guard has broken — see the date trap in section 5. |
-| `OPPSYNC_NO_MAPPING` | audit | The opportunity's sub-status resolves to no Record Status. **No order was touched.** Expected for every sub-status outside the design phase. | Normally nothing — most sub-statuses are deliberately unmapped (section 5). Investigate only if the sub-status *should* be mapped: read `OPPSYNC_MAP_PARSED` to see what the parameter actually resolved to, and look for `OPPSYNC_MAP_AMBIGUOUS` or `OPPSYNC_MAP_INVALID_ENTRY` just above it. |
+| `OPPSYNC_NO_MAPPING` | audit | The opportunity's sub-status resolves to no Record Status, so **no Record Status is written**. The orders are still searched and **readiness is still evaluated** against each order's own current status. Expected for every sub-status outside the design phase. | Normally nothing — most sub-statuses are deliberately unmapped (section 5). Investigate only if the sub-status *should* be mapped: read `OPPSYNC_MAP_PARSED` to see what the parameter actually resolved to, and look for `OPPSYNC_MAP_AMBIGUOUS` or `OPPSYNC_MAP_INVALID_ENTRY` just above it. |
 | `OPPSYNC_MAP_AMBIGUOUS` | error | The **same sub-status appears more than once** in `custscript_opsync_status_map`. That key was dropped **entirely** — not resolved to the first or the last — so it now maps to nothing and its orders are left alone. Other keys are unaffected. | Remove the duplicate on the deployment. Until then, every opportunity at that sub-status leaves its orders untouched. |
 | `OPPSYNC_MAP_INVALID_ENTRY` | error | One entry in `custscript_opsync_status_map` is not a `subStatusId:recordStatusId` pair of whole numbers. Names the offending text. **That entry was skipped and the rest of the mapping still applies** — one typo does not disable the feature. | Correct the named entry on the deployment. Any sub-status it was meant to carry currently resolves to nothing. |
 | `OPPSYNC_MAP_PARSED` | debug | The mapping as actually parsed, one line of `key -> value` pairs. Normal operation. | Nothing. With Log Level on Debug this is how a typo is spotted by eye rather than inferred from an order that did not sync. |
@@ -687,6 +726,11 @@ screen and a failure in the notes.
 | 52 | Installer set, qualification **expired**, qual legacy field populated | **Ready** — legacy wins. It is an OR, not an AND |
 | 53 | Legacy subcontract populated, modern subcontract blank, all else ok | **Ready** |
 | 54 | All legacy fields populated but `custbody38` blank | Not ready, `Awaiting DNO`. **There is no legacy path for DNO** |
+| 55 | Won opportunity at an **unmapped** sub-status, installer added, order at a non-excluded, non-design-ok status | Readiness **evaluated and written**. `custbody_finance_status` **not written** |
+| 56 | Won opportunity at an unmapped sub-status, order at an **excluded** status | **Skipped entirely**, nothing written — the entry exclusion catches it |
+| 57 | Unmapped sub-status, order at a **design-ok** status, all certificate conditions pass | **Ready written, status untouched** |
+| 58 | Unmapped sub-status, nothing materially changed | Evaluated, **zero writes** |
+| 59 | Unmapped sub-status, **delivery date changed** | **Ship date written**, status not. The ship date is independent of the map — see section 4 |
 
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 

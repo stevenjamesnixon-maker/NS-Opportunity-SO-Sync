@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.2.0
+ * @version 1.3.0
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.2.0';
+    var VERSION = '1.3.0';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -554,7 +554,8 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * They are not interchangeable — see asDateKey and asDateForWrite.
      *
      * @param {string} orderId
-     * @param {string} mappedStatusId
+     * @param {string|null} mappedStatusId - null when the sub-status maps to nothing, in which
+     *        case the order keeps its own status and that becomes the decided status
      * @param {string} deliveryDateKey - comparison key. Compared, never written
      * @param {Date|string} deliveryDateValue - the original Date. Written, never compared
      * @param {string[]} excludedStatuses
@@ -570,6 +571,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         var currentReady;
         var currentReason;
         var quoteTypeId;
+        var decidedStatus;
         var verdict = null;
         var targetExcluded;
         var values = {};
@@ -614,11 +616,26 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             return 'skipped';
         }
 
-        if (asId(currentStatus) !== asId(mappedStatusId)) {
+        // THE DECIDED STATUS — one definition, used by the exclusion test, the design gate and
+        // the status write alike. The mapped status when there is one; otherwise the order's own
+        // current status, because nothing is going to change it on this save.
+        decidedStatus = (mappedStatusId === null) ? currentStatus : mappedStatusId;
+
+        // The Record Status is written ONLY when the mapping produced one. An unmapped
+        // sub-status means the order keeps the status it has — writing currentStatus back over
+        // itself would be a no-op anyway, but the guard says so explicitly rather than relying
+        // on that.
+        if (mappedStatusId !== null && asId(currentStatus) !== asId(mappedStatusId)) {
             values[opsyncConfig.SALES_ORDER_FIELDS.RECORD_STATUS] = mappedStatusId;
             changes.push('Record Status ' + (currentStatus || '(empty)') + ' -> ' + mappedStatusId);
         }
 
+        // The ship date is INDEPENDENT of the mapping and always has been — it is a direct copy
+        // from the opportunity, not something the status map governs. It is therefore written on
+        // an unmapped save too, on its own comparison. (Before 1.3.0 an unmapped sub-status
+        // returned before the loop, so in practice it was never written; that was a side effect
+        // of the early exit, not a rule.)
+        //
         // Both sides of the COMPARISON are date keys — see asDateKey. Comparing a Date against
         // a lookup string here would make every order look changed on every save.
         //
@@ -639,12 +656,15 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         // at all. An excluded status means the order is past the delivery gate or is dead, so
         // readiness is not applicable — and "not ready" on a delivered order is worse than
         // stale, it is wrong. See docs/context.md section 6.
-        targetExcluded = contains(mappedStatusId, excludedStatuses);
+        // On an unmapped save decidedStatus IS currentStatus, which already passed the entry
+        // exclusion test above — so this can only fire when the mapping actually moved the order
+        // onto an excluded status.
+        targetExcluded = contains(decidedStatus, excludedStatuses);
 
         if (targetExcluded) {
             log.debug({
                 title: opsyncConfig.logKey('READINESS_NOT_APPLICABLE'),
-                details: 'Sales order ' + orderId + ': status ' + mappedStatusId + ' is in the ' +
+                details: 'Sales order ' + orderId + ': status ' + decidedStatus + ' is in the ' +
                     'excluded list, so readiness was not evaluated and both readiness fields ' +
                     'were left as they were (ready=' + currentReady + ').'
             });
@@ -661,7 +681,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                     lookup, opsyncConfig.SALES_ORDER_FIELDS.QUAL_LOGGED_LEGACY),
                 plLegacy: opsyncConfig.lookupValue(
                     lookup, opsyncConfig.SALES_ORDER_FIELDS.PL_LOGGED_LEGACY)
-            }, mappedStatusId, ctx);
+            }, decidedStatus, ctx);
 
             // The paths matter as much as the verdict. When a legacy order comes up in a year
             // and nobody remembers these fields exist, this line is the only thing that explains
@@ -669,7 +689,9 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             log.debug({
                 title: opsyncConfig.logKey('READINESS'),
                 details: 'Sales order ' + orderId + ', quote type ' +
-                    (quoteTypeId || '(none)') + ', status ' + mappedStatusId + ', ready=' +
+                    (quoteTypeId || '(none)') + ', status ' + decidedStatus +
+                    (mappedStatusId === null ? ' (unmapped — order\'s own)' : ' (mapped)') +
+                    ', ready=' +
                     verdict.ready + ', reason=' + (verdict.reason || '(none)') +
                     ', paths=' + describePaths(verdict.paths)
             });
@@ -863,23 +885,36 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             //    feedback loop in docs/context.md section 0, trap 3 broken — the guard is the
             //    value comparison, never the early exit.
 
-            // 5. Resolve through the mapping. NEVER copy the raw sub-status across: the two lists
-            //    share no ids and no values, and a raw copy writes a warehouse instruction. See
-            //    docs/context.md section 0, trap 1. No mapping means stop — there is no default
-            //    and there must never be one.
+            // 5. Resolve through the mapping. NEVER copy the raw sub-status across: the two
+            //    lists share no ids and no values, and a raw copy writes a warehouse
+            //    instruction. See docs/context.md section 0, trap 1. There is no default and
+            //    there must never be one.
+            //
+            //    NO MAPPING NO LONGER STOPS THE SAVE — removed in 1.3.0, and it must not come
+            //    back. It used to return here, before the orders were even searched, so a won
+            //    opportunity at an unmapped sub-status never had its readiness refreshed.
+            //
+            //    The map governs STATUS PROPAGATION. It does not govern whether an order is fit
+            //    to ship, and whether readiness refreshes must not depend on whether a
+            //    sub-status happens to appear in it. A won opportunity at Partially Delivered or
+            //    Delivery Complete can still carry a linked order that has not shipped — one
+            //    opportunity may have several orders.
+            //
+            //    So mappedStatusId stays null and each order falls back to its OWN current
+            //    status as its decided status. See syncSalesOrder.
             mappedStatusId = opsyncConfig.getMappedStatus(subStatus);
             if (mappedStatusId === null) {
                 log.audit({
                     title: opsyncConfig.logKey('NO_MAPPING'),
                     details: 'Opportunity ' + opportunityId + ' sub-status ' +
-                        (subStatus || '(empty)') + ' resolves to no Record Status. ' +
-                        'No sales order was touched. Most sub-statuses are deliberately unmapped ' +
-                        '— see docs/context.md section 5. If a duplicate or a malformed entry ' +
-                        'in the mapping parameter was the cause, ' +
+                        (subStatus || '(empty)') + ' resolves to no Record Status, so no ' +
+                        'Record Status will be written. Readiness is still evaluated against ' +
+                        'each order\'s own current status. Most sub-statuses are deliberately ' +
+                        'unmapped — see docs/context.md section 5. If a duplicate or a ' +
+                        'malformed entry in the mapping parameter was the cause, ' +
                         opsyncConfig.logKey('MAP_AMBIGUOUS') + ' and ' +
                         opsyncConfig.logKey('MAP_INVALID_ENTRY') + ' name it.'
                 });
-                return;
             }
 
             excludedStatuses = opsyncConfig.getExcludedStatuses();
@@ -939,7 +974,8 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 title: opsyncConfig.logKey('SYNC_SUMMARY'),
                 details: 'Opportunity ' + opportunityId + ': ' + orderIds.length +
                     ' sales order(s) — ' + updated + ' updated, ' + unchanged + ' unchanged, ' +
-                    skipped + ' skipped as excluded. Status ' + mappedStatusId + '.'
+                    skipped + ' skipped as excluded. Status ' +
+                    (mappedStatusId === null ? '(unmapped — not written)' : mappedStatusId) + '.'
             });
 
         } catch (e) {
