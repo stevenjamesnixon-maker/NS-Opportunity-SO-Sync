@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.3.0
+ * @version 1.4.0
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.3.0';
+    var VERSION = '1.4.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -100,7 +100,50 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          * unstored sourced fields and cannot be searched. The script goes to the customer record
          * this points at. See getCustomerQualField() and getCustomerPlField().
          */
-        INSTALLER: 'custbody_installer_ns'
+        INSTALLER: 'custbody_installer_ns',
+
+        /* --------------------------------------------------------------------------------------
+         * LEGACY EVIDENCE FIELDS — ON THE OPPORTUNITY
+         *
+         * Three fields carrying evidence recorded under the OLD process, before installers were
+         * logged as customer records. On those opportunities custbody_installer_ns may be blank
+         * while the evidence itself is present, so the modern path has nothing to read and every
+         * linked order would be held for an installer that was verified years ago.
+         *
+         * They live on the OPPORTUNITY, so they are read ONCE per save from the record being
+         * saved — no lookupFields, no per-order read. One consequence follows and is intended:
+         * legacy evidence satisfies the certificate gate for EVERY sales order linked to that
+         * opportunity, including any order added later. The flags record that the work was
+         * verified under the old process, and the opportunity is the unit that process operated
+         * on. See docs/context.md section 4.
+         *
+         * A legacy field is a PRESENCE test and nothing more. Present means satisfied — a ticked
+         * checkbox, any date, any text. There is NO expiry comparison on a legacy field: the flag
+         * records that the evidence was verified, not when it runs out. An absent legacy field
+         * means nothing at all and fails nothing on its own; it simply leaves the modern path to
+         * answer.
+         *
+         * THE FIELD TYPES ARE NOT CONFIRMED — they may be checkbox, date or text. The presence
+         * test therefore has to be correct for all three: see isLegacyPresent() in
+         * opsync_ue_opportunity.js, and note in particular that an UNTICKED checkbox arrives as
+         * boolean false, which a naive "not empty string" test would read as present and hand
+         * every legacy opportunity a free pass on its certificates.
+         *
+         * Do not "improve" these by parsing them as dates and checking expiry. The values are
+         * whatever the old process happened to record, and a failed parse would turn a satisfied
+         * legacy opportunity into a held one.
+         * -------------------------------------------------------------------------------------- */
+
+        /**
+         * NOTE THE ID: custbody + subcontract, with NO underscore between them. That is the ID
+         * as it exists in the account. Never "correct" it — see docs/context.md section 0,
+         * trap 5. The corrected version does not exist and the failure is silent.
+         */
+        SUBCONTRACT_LEGACY: 'custbodysubcontract_received_legacy',
+        /** Presence satisfies the installer qualification condition outright. */
+        QUAL_LOGGED_LEGACY: 'custbody_installer_qual_logged_legacy',
+        /** Presence satisfies the public liability condition outright. */
+        PL_LOGGED_LEGACY: 'custbody_installer_pl_logged_legacy'
     };
 
     /**
@@ -138,37 +181,13 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          * NetSuite names a body field custbodyN when no id is chosen. See the note on
          * RECORD_TYPES.QUOTE_TYPE and docs/context.md section 6.
          */
-        DNO_STATUS: 'custbody38',
+        DNO_STATUS: 'custbody38'
 
-        /* --------------------------------------------------------------------------------------
-         * LEGACY EVIDENCE FIELDS
-         *
-         * Three fields carrying evidence recorded under the OLD process, before installers were
-         * logged as customer records. On those orders custbody_installer_ns may be blank while
-         * the evidence itself is present, so the modern path has nothing to read and the order
-         * would be held for an installer that was verified years ago.
-         *
-         * A legacy field is a PRESENCE test and nothing more. Non-blank means satisfied — a
-         * ticked checkbox, any date, any text. There is NO expiry comparison on a legacy field:
-         * the flag records that the evidence was verified under the old process, not when it
-         * runs out. A blank legacy field means nothing at all and fails nothing on its own; it
-         * simply leaves the modern path to answer.
-         *
-         * Do not "improve" these by parsing them as dates and checking expiry. The values are
-         * whatever the old process happened to record, and a failed parse would turn a satisfied
-         * legacy order into a held one.
-         * -------------------------------------------------------------------------------------- */
-
-        /**
-         * NOTE THE ID: custbody + subcontract, with NO underscore between them. That is the ID
-         * as it exists in the account. Never "correct" it — see docs/context.md section 0,
-         * trap 5. The corrected version does not exist and the failure is silent.
+        /*
+         * The three legacy evidence fields are NOT here. They are on the OPPORTUNITY — see
+         * OPPORTUNITY_FIELDS. Phase 3a assumed the sales order and was wrong; this note exists
+         * so the next person does not go looking for them on the order again.
          */
-        SUBCONTRACT_LEGACY: 'custbodysubcontract_received_legacy',
-        /** Presence satisfies the installer qualification condition outright. */
-        QUAL_LOGGED_LEGACY: 'custbody_installer_qual_logged_legacy',
-        /** Presence satisfies the public liability condition outright. */
-        PL_LOGGED_LEGACY: 'custbody_installer_pl_logged_legacy'
     };
 
     /**

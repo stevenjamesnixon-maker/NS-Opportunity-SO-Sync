@@ -85,8 +85,8 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.3.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.3.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Shared config library | 1.4.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
+| Opportunity user event | 1.3.1 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -208,15 +208,37 @@ needed: an order satisfied entirely by legacy evidence does not need an installe
 ### Legacy evidence fields
 
 Three fields carry evidence recorded under the **old process**, before installers were logged as
-customer records. On those orders `custbody_installer_ns` may be blank while the evidence itself
-is present — so without these the modern path has nothing to read and the order is held for an
-installer that was verified years ago.
+customer records. On those opportunities `custbody_installer_ns` may be blank while the evidence
+itself is present — so without these the modern path has nothing to read and every linked order
+is held for an installer that was verified years ago.
+
+**They are on the OPPORTUNITY, not the sales order.** Phase 3a assumed the sales order and was
+wrong; the reads moved in 3c. They are read **once per save** from the record being saved — no
+`lookupFields`, and not per order.
 
 | Field | Satisfies |
 |---|---|
 | `custbodysubcontract_received_legacy` — **note: no underscore after `custbody`** | Subcontract |
 | `custbody_installer_qual_logged_legacy` | Installer qualification |
 | `custbody_installer_pl_logged_legacy` | Public Liability |
+
+**Because they are opportunity-level, legacy evidence satisfies the certificate gate for EVERY
+sales order linked to that opportunity — including any order added later.** That is intended, not
+a leak: the flags record that the work was verified under the old process, and the opportunity is
+the unit that process operated on. Do not later read it as a bug and scope it per order.
+
+#### The presence test
+
+**The field types are not confirmed** — they may be checkbox, date or text — so the test has to
+be correct for all three. `isLegacyPresent()` treats **boolean `false`, `''`, `null` and
+`undefined`** as absent, plus the strings `'F'` and `'false'` in case a checkbox reaches it by a
+path that stringifies it.
+
+> **An unticked checkbox arrives as boolean `false`, and `String(false)` is the five-character
+> string `"false"`.** A presence test written as `!isEmpty(value)` or `value !== ''` therefore
+> reads an unticked box as **present** — silently handing every legacy opportunity a free pass on
+> its certificates, in the direction that ships goods rather than holding them. This is why the
+> legacy fields do not use `isEmpty()`.
 
 **Legacy is a PRESENCE test and nothing more.** Non-blank means satisfied — a ticked checkbox,
 any date, any text. **There is no expiry comparison on a legacy field**: the flag records that
@@ -490,7 +512,9 @@ Agreed mapping, seven rows, **by name**:
   The cost is real and accepted: every save of a won opportunity now runs the order search and
   one `lookupFields` per order, where before an unchanged sub-status cost nothing.
 
-- **Legacy evidence is an OR, not an AND**, and carries no expiry. See section 4.
+- **Legacy evidence is an OR, not an AND**, carries no expiry, and lives on the **opportunity**.
+  See section 4 — including why its presence test is not `isEmpty()`, and why satisfying every
+  linked order is intended rather than a leak.
 
 - **An unmapped sub-status no longer stops the save, and must not again.**
   Until 1.3.0 `getMappedStatus()` returning `null` returned before the orders were even
@@ -642,7 +666,7 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    appearing twice (that is the `OPPSYNC_MAP_AMBIGUOUS` case) and no typos (that is
    `OPPSYNC_MAP_INVALID_ENTRY`). There is **no field to create on `customrecord_fin_stat`** and
    no data to populate on the Record Status records; see section 5.
-6. Confirm the three **legacy evidence fields** exist on the sales order with exactly these
+6. Confirm the three **legacy evidence fields** exist on the **opportunity** with exactly these
    IDs — `custbodysubcontract_received_legacy` (**no underscore after `custbody`**),
    `custbody_installer_qual_logged_legacy`, `custbody_installer_pl_logged_legacy`. A wrong ID
    reads as blank, which silently removes the legacy path and holds every legacy order.
@@ -731,6 +755,10 @@ screen and a failure in the notes.
 | 57 | Unmapped sub-status, order at a **design-ok** status, all certificate conditions pass | **Ready written, status untouched** |
 | 58 | Unmapped sub-status, nothing materially changed | Evaluated, **zero writes** |
 | 59 | Unmapped sub-status, **delivery date changed** | **Ship date written**, status not. The ship date is independent of the map — see section 4 |
+| 60 | Opportunity with **two** linked orders, qualification and PL legacy flags set **on the opportunity**, both orders design-ok and DNO ok | **Both orders ready**, and **zero customer lookups**. One opportunity-level flag satisfies every linked order — see section 4 |
+| 61 | A legacy flag present as an **unticked checkbox** (boolean `false`) | Treated as **NOT present**; falls through to the modern path. Check `paths=…modern` in `OPPSYNC_READINESS`, not `legacy`. **This is the test that catches the `String(false)` trap** |
+| 62 | The same, with the installer also blank | Falls through to `Installer not set on opportunity` — proving the fall-through is real rather than a silent pass |
+| 63 | A legacy flag present as a **ticked checkbox** (boolean `true`) | Treated as present. `paths=…legacy` |
 
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
@@ -755,9 +783,9 @@ Script IDs only — **no internal IDs**, here or anywhere else in this document.
 | Sales Order: quote type | `custbody_quote_type` | List/Record → Quote Type record | Steve | 2026-09-15 |
 | Sales Order: subcontract received | `custbody_installer_subcontract_receive` | — | Steve | 2026-09-15 |
 | Sales Order: DNO status | `custbody38` | **Auto-assigned** script ID — see section 6 | Steve | 2026-09-15 |
-| Sales Order: legacy subcontract | `custbodysubcontract_received_legacy` | **No underscore after `custbody`** — see §0 trap 5 | Steve | 2026-09-15 |
-| Sales Order: legacy qualification logged | `custbody_installer_qual_logged_legacy` | Presence test only | Steve | 2026-09-15 |
-| Sales Order: legacy PL logged | `custbody_installer_pl_logged_legacy` | Presence test only | Steve | 2026-09-15 |
+| **Opportunity**: legacy subcontract | `custbodysubcontract_received_legacy` | **No underscore after `custbody`** — see §0 trap 5. Type unconfirmed | Steve | 2026-09-15 |
+| **Opportunity**: legacy qualification logged | `custbody_installer_qual_logged_legacy` | Presence test only. Type unconfirmed | Steve | 2026-09-15 |
+| **Opportunity**: legacy PL logged | `custbody_installer_pl_logged_legacy` | Presence test only. Type unconfirmed | Steve | 2026-09-15 |
 | Opportunity: installer | `custbody_installer_ns` | List/Record → Customer | Steve | 2026-09-15 |
 | Quote Type record | `customrecord16` | **Auto-assigned** script ID — see section 6 | Steve | 2026-09-15 |
 | Quote Type: can ship without design | `custrecord_qt_no_design_required` | Checkbox | Steve | 2026-09-15 |
@@ -779,6 +807,7 @@ Script IDs only — **no internal IDs**, here or anywhere else in this document.
 
 | # | Question | Status |
 |---|---|---|
+| 0 | What TYPE are the three legacy evidence fields — checkbox, date or text? | **Open, and the code does not need the answer.** `isLegacyPresent()` is correct for all three. Worth confirming anyway: if any is a checkbox, §9 scenario 61 is the one that must pass. |
 | 1 | Should `custbody_cad_worklist` on existing sales orders be **cleared** when the worklist record retires, or left as history? | **Open.** Clearing is a one-off data job, not something this feature does. Leaving it means a field pointing at a retired record. Nothing in this repo reads or writes it. |
 | 2 | Is the *Won* gate early enough to be useful? | **Open, and knowingly accepted.** See section 6. It is a parameter, so widening it needs no code. |
 

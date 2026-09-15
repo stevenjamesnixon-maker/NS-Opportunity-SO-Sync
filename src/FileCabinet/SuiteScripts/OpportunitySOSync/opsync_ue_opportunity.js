@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.3.0
+ * @version 1.3.1
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.3.0';
+    var VERSION = '1.3.1';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -71,6 +71,41 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      */
     function isEmpty(value) {
         return value === null || value === undefined || String(value) === '';
+    }
+
+    /**
+     * Presence test for a legacy evidence field. NOT isEmpty() — see below.
+     *
+     * The three legacy fields' types are NOT confirmed: they may be checkbox, date or text. This
+     * has to be correct for all three, and the checkbox case is the dangerous one.
+     *
+     * An UNTICKED checkbox arrives as boolean FALSE. isEmpty(false) is false, because
+     * String(false) is the five-character string "false" — so a presence test written as
+     * !isEmpty(value), or as value !== '', reads an unticked box as PRESENT and hands every
+     * legacy opportunity a free pass on its certificates. Silently, and in the direction that
+     * ships goods rather than holding them.
+     *
+     * So false, '' , null and undefined are all absent. The string forms 'F' and 'false' are
+     * treated as absent too, in case a checkbox reaches this by a path that stringifies it —
+     * neither is a plausible value for a genuine text or date flag.
+     *
+     * @param {*} value
+     * @returns {boolean} true when the legacy evidence is present
+     */
+    function isLegacyPresent(value) {
+        var text;
+
+        if (value === null || value === undefined || value === false) {
+            return false;
+        }
+
+        if (value === true) {
+            return true;
+        }
+
+        text = String(value).replace(/^\s+|\s+$/g, '');
+
+        return text !== '' && text !== 'F' && text !== 'false';
     }
 
     /**
@@ -269,7 +304,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * @returns {Object} { reason: string, path: string } — reason '' when satisfied
      */
     function resolveCertificate(legacyValue, installerId, rawExpiry, today, label) {
-        if (!isEmpty(legacyValue)) {
+        if (isLegacyPresent(legacyValue)) {
             return { reason: '', path: 'legacy' };
         }
 
@@ -453,8 +488,10 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * the legacy constants in opsync_lib_config.js. Legacy evidence satisfies its condition
      * outright, so an order verified under the old process is ready even with a blank installer.
      *
-     * @param {Object} order - { quoteTypeId, subcontractReceived, dnoStatus, subcontractLegacy,
-     *                           qualLegacy, plLegacy }
+     * The legacy values come off the CONTEXT, not the order: they live on the opportunity and
+     * are read once per save. The evaluation rule is unchanged by that — only the source is.
+     *
+     * @param {Object} order - { quoteTypeId, subcontractReceived, dnoStatus }
      * @param {string} decidedStatus - the Record Status this save will write
      * @param {Object} ctx - the per-opportunity readiness context
      * @returns {Object} { ready: boolean, reason: string, paths: Object }
@@ -478,7 +515,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             // 1. Subcontract. Either field satisfies it.
             if (!isEmpty(order.subcontractReceived)) {
                 paths.subcontract = 'modern';
-            } else if (!isEmpty(order.subcontractLegacy)) {
+            } else if (isLegacyPresent(ctx.subcontractLegacy)) {
                 paths.subcontract = 'legacy';
             } else {
                 paths.subcontract = 'fail';
@@ -486,7 +523,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             }
 
             // 2. Installer qualification.
-            qual = resolveCertificate(order.qualLegacy, ctx.installerId, ctx.qualExpiry,
+            qual = resolveCertificate(ctx.qualLegacy, ctx.installerId, ctx.qualExpiry,
                 ctx.today, 'Installer qualification certificate');
             paths.qualification = qual.path;
             if (qual.reason !== '') {
@@ -494,7 +531,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             }
 
             // 3. Public liability.
-            pl = resolveCertificate(order.plLegacy, ctx.installerId, ctx.plExpiry,
+            pl = resolveCertificate(ctx.plLegacy, ctx.installerId, ctx.plExpiry,
                 ctx.today, 'Public Liability certificate');
             paths.publicLiability = pl.path;
             if (pl.reason !== '') {
@@ -587,10 +624,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 opsyncConfig.SALES_ORDER_FIELDS.DELIVERY_HOLD_REASON,
                 opsyncConfig.SALES_ORDER_FIELDS.QUOTE_TYPE,
                 opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED,
-                opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS,
-                opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_LEGACY,
-                opsyncConfig.SALES_ORDER_FIELDS.QUAL_LOGGED_LEGACY,
-                opsyncConfig.SALES_ORDER_FIELDS.PL_LOGGED_LEGACY
+                opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS
             ]
         });
 
@@ -674,13 +708,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 subcontractReceived: opsyncConfig.lookupValue(
                     lookup, opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED),
                 dnoStatus: opsyncConfig.lookupValue(
-                    lookup, opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS),
-                subcontractLegacy: opsyncConfig.lookupValue(
-                    lookup, opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_LEGACY),
-                qualLegacy: opsyncConfig.lookupValue(
-                    lookup, opsyncConfig.SALES_ORDER_FIELDS.QUAL_LOGGED_LEGACY),
-                plLegacy: opsyncConfig.lookupValue(
-                    lookup, opsyncConfig.SALES_ORDER_FIELDS.PL_LOGGED_LEGACY)
+                    lookup, opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS)
             }, decidedStatus, ctx);
 
             // The paths matter as much as the verdict. When a legacy order comes up in a year
@@ -742,7 +770,13 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      *    leave some orders updated and the rest not, which is the "no partial writes" the brief
      *    asks for. See the note on requiredParameter() in opsync_lib_config.js.
      *
-     * 2. The installer's two certificate expiry dates, in ONE lookupFields, cached for the whole
+     * 2. The three LEGACY evidence flags, straight off the opportunity — no lookup at all.
+     *    Because they are opportunity-level, they satisfy the certificate gate for EVERY linked
+     *    sales order, including any order added later. That is intended: the flags record that
+     *    the work was verified under the old process, and the opportunity is the unit that
+     *    process operated on.
+     *
+     * 3. The installer's two certificate expiry dates, in ONE lookupFields, cached for the whole
      *    loop. The equivalent fields on the opportunity are unstored sourced fields and cannot
      *    be read by a search, so the script goes to the customer record custbody_installer_ns
      *    points at. When the installer is blank the lookup is skipped entirely — there is
@@ -761,6 +795,16 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             installerId: '',
             qualExpiry: '',
             plExpiry: '',
+            // Legacy evidence lives on the OPPORTUNITY, so it is read once here from the record
+            // being saved — no lookupFields, and not per order. Through effectiveValue like the
+            // installer, so a sparse XEDIT newRecord falls back to oldRecord rather than reading
+            // a populated legacy flag as blank and holding every linked order.
+            subcontractLegacy: effectiveValue(
+                newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.SUBCONTRACT_LEGACY, sparse),
+            qualLegacy: effectiveValue(
+                newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.QUAL_LOGGED_LEGACY, sparse),
+            plLegacy: effectiveValue(
+                newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.PL_LOGGED_LEGACY, sparse),
             today: todayDayNumber(),
             quoteTypeCache: {}
         };
