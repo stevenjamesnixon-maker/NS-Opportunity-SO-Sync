@@ -102,8 +102,8 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.6.1 | `lib/opsync_lib_config.js` | Every script ID in the project, and the eight script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.5.2 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Shared config library | 1.6.2 | `lib/opsync_lib_config.js` | Every script ID in the project, and the eight script parameters — including the status mapping | Not deployed |
+| Opportunity user event | 1.5.3 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -266,7 +266,7 @@ order.
 
 | Field | Script ID | Type |
 |---|---|---|
-| Voucher approval date | `custbody_voucher_approval_date` | **Date — confirmed.** Tested with `isLegacyPresent()`, not `isEmpty()` |
+| Voucher approval date | `custbody_voucher_approval_date` | **Date — confirmed.** Tested with `isPresent()`, not `isEmpty()` |
 | Intended for BUS | `custbody_bus_project_rhi_intended` | List → `customlist92` (*YesNo*) |
 
 The rule, evaluated inside the certificate gate and **only** there:
@@ -295,12 +295,18 @@ that ships goods. The comparison therefore requires a non-empty parameter first.
 
 #### The presence test
 
-**`isLegacyPresent()` is the project's presence test, not a legacy-only one.** The name is
-historical. It is used wherever "is this field filled in" decides whether an order ships —
-the three legacy flags, and `custbody_voucher_approval_date`, which is a **confirmed Date**.
+**`isPresent()` is the project's presence test.** It is used wherever "is this field filled in"
+decides whether an order ships — the three legacy flags, `custbody_voucher_approval_date` and
+`custbody_installer_subcontract_receive`.
+
+> It was called `isLegacyPresent()` until 1.5.3, and the rename is not cosmetic. By then it
+> served a confirmed Date and a `lookupFields` value as well as the legacy flags, so a reader
+> meeting `isLegacyPresent(voucherDate)` had to go and check whether they were looking at a bug.
+> **A helper whose name has to be explained away in a comment is the same defect as `custbody_`
+> meaning only "transaction body field"** — see section 0, trap 6 — in a cheaper place.
 
 **The legacy field types are not confirmed** — they may be checkbox, date or text — so the test
-has to be correct for all three. `isLegacyPresent()` treats **boolean `false`, `''`, `null` and
+has to be correct for all three. `isPresent()` treats **boolean `false`, `''`, `null` and
 `undefined`** as absent, plus the strings `'F'` and `'false'` in case a checkbox reaches it by a
 path that stringifies it. It is also correct for a date, which is why a confirmed Date uses it.
 
@@ -937,10 +943,10 @@ back to `oldRecord` instead of reading a populated field as blank.
 | Delivery date | `custbody_opp_del_date` | Date | `asDateKey()` / `asDateForWrite()` |
 | Installer | `custbody_installer_ns` | List/Record → Customer | `asSelectId()` |
 | **DNO status** | `custbody38` | List → `customlist_dnonotreclist`. **Auto-assigned script ID** | `asSelectId()` |
-| Legacy subcontract | `custbodysubcontract_received_legacy` | **Unconfirmed** — no underscore after `custbody` | `isLegacyPresent()` |
-| Legacy qualification | `custbody_installer_qual_logged_legacy` | **Unconfirmed** | `isLegacyPresent()` |
-| Legacy PL | `custbody_installer_pl_logged_legacy` | **Unconfirmed** | `isLegacyPresent()` |
-| **Voucher approval date** | `custbody_voucher_approval_date` | **Date — confirmed** | `isLegacyPresent()` — presence only, never parsed |
+| Legacy subcontract | `custbodysubcontract_received_legacy` | **Unconfirmed** — no underscore after `custbody` | `isPresent()` |
+| Legacy qualification | `custbody_installer_qual_logged_legacy` | **Unconfirmed** | `isPresent()` |
+| Legacy PL | `custbody_installer_pl_logged_legacy` | **Unconfirmed** | `isPresent()` |
+| **Voucher approval date** | `custbody_voucher_approval_date` | **Date — confirmed** | `isPresent()` — presence only, never parsed |
 | **Intended for BUS** | `custbody_bus_project_rhi_intended` | **List → `customlist92` (*YesNo*) — confirmed** | `asSelectId()` |
 
 #### Read from the SALES ORDER — one `search.lookupFields` per order
@@ -952,7 +958,7 @@ back to `oldRecord` instead of reading a populated field as blank.
 | Ready for delivery | `custbody_ready_for_delivery` | Checkbox | boolean | `isTicked()` |
 | Delivery hold reason | `custbody_delivery_hold_reason` | Long text | string | `lookupValue()` |
 | Quote type | `custbody_quote_type` | List/Record → Quote Type | **array** | `lookupValue()` |
-| Subcontract received | `custbody_installer_subcontract_receive` | **Unconfirmed**, and no longer load-bearing — see below | string | `lookupValue()` + `isLegacyPresent()` |
+| Subcontract received | `custbody_installer_subcontract_receive` | **Unconfirmed**, and no longer load-bearing — see below | string | `lookupValue()` + `isPresent()` |
 
 > ✅ **`custbody_installer_subcontract_receive`'s type is still not confirmed, and it no longer
 > matters.** It was tested with `!isEmpty()`, which would have read an **unticked checkbox as
@@ -1010,7 +1016,7 @@ because the equivalent opportunity fields are unstored sourced fields and cannot
 
 | # | Question | Status |
 |---|---|---|
-| 0 | What TYPE are the three legacy evidence fields — checkbox, date or text? | **Open, and the code does not need the answer.** `isLegacyPresent()` is correct for all three. Worth confirming anyway: if any is a checkbox, §9 scenario 61 is the one that must pass. |
+| 0 | What TYPE are the three legacy evidence fields — checkbox, date or text? | **Open, and the code does not need the answer.** `isPresent()` is correct for all three. Worth confirming anyway: if any is a checkbox, §9 scenario 61 is the one that must pass. |
 | 1 | Should `custbody_cad_worklist` on existing sales orders be **cleared** when the worklist record retires, or left as history? | **Open.** Clearing is a one-off data job, not something this feature does. Leaving it means a field pointing at a retired record. Nothing in this repo reads or writes it. |
 | 2 | Is the *Won* gate early enough to be useful? | **Open, and knowingly accepted.** See section 6. It is a parameter, so widening it needs no code. |
 

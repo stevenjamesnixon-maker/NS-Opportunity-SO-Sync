@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.5.2
+ * @version 1.5.3
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.5.2';
+    var VERSION = '1.5.3';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -77,11 +77,15 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * THE PROJECT'S PRESENCE TEST for any field where "is this filled in" decides whether an
      * order ships. NOT isEmpty() — see below.
      *
-     * The name is historical: it was written for the three legacy evidence fields, whose types
-     * are NOT confirmed and may be checkbox, date or text. It is not legacy-only and must not be
-     * read as such. custbody_voucher_approval_date is a CONFIRMED Date and goes through it too,
-     * because the test is correct for a date as well and because the cost of being wrong is
-     * always in the same direction.
+     * It was called isLegacyPresent() until 1.5.3, having been written for the three legacy
+     * evidence fields, whose types are NOT confirmed and may be checkbox, date or text. It was
+     * never legacy-only, and by then it also served a CONFIRMED Date and a lookupFields value —
+     * so a reader meeting isLegacyPresent(voucherDate) had to go and check whether they were
+     * looking at a bug. A helper whose name has to be explained away in a comment is the same
+     * defect as custbody_ meaning only "transaction body field", in a cheaper place.
+     *
+     * It is correct for a checkbox, a date and a text field alike, because the cost of being
+     * wrong is always in the same direction.
      *
      * THAT DIRECTION IS WHY THIS IS THE DEFAULT. An UNTICKED checkbox arrives as boolean FALSE.
      * isEmpty(false) is false, because String(false) is the five-character string "false" — so a
@@ -107,7 +111,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * @param {*} value
      * @returns {boolean} true when the value is present
      */
-    function isLegacyPresent(value) {
+    function isPresent(value) {
         var text;
 
         if (value === null || value === undefined || value === false) {
@@ -357,7 +361,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * @returns {Object} { reason: string, path: string } — reason '' when satisfied
      */
     function resolveCertificate(legacyValue, installerId, rawExpiry, today, label) {
-        if (isLegacyPresent(legacyValue)) {
+        if (isPresent(legacyValue)) {
             return { reason: '', path: 'legacy' };
         }
 
@@ -588,9 +592,9 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             //
             //    It is a date today, so this changes no behaviour. The point is that the class
             //    is closed rather than documented.
-            if (isLegacyPresent(order.subcontractReceived)) {
+            if (isPresent(order.subcontractReceived)) {
                 paths.subcontract = 'modern';
-            } else if (isLegacyPresent(ctx.subcontractLegacy)) {
+            } else if (isPresent(ctx.subcontractLegacy)) {
                 paths.subcontract = 'legacy';
             } else {
                 paths.subcontract = 'fail';
@@ -646,15 +650,15 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             //    ships goods. See getBusNoValue() in opsync_lib_config.js.
             if (ctx.busNoValue !== '' && ctx.busRhiIntended === ctx.busNoValue) {
                 paths.busVoucher = 'not intended';
-            } else if (isLegacyPresent(ctx.voucherApprovalDate)) {
+            } else if (isPresent(ctx.voucherApprovalDate)) {
                 // Presence only, never an expiry comparison: an approved voucher does not lapse
                 // for this purpose.
                 //
-                // isLegacyPresent(), not isEmpty(), although the field is a CONFIRMED Date and
+                // isPresent(), not isEmpty(), although the field is a CONFIRMED Date and
                 // isEmpty() would be correct for one. The tolerant test is correct for a date
                 // too, and this is the third field in this codebase where a type change in the
                 // UI would flip an isEmpty() test to fail OPEN, in the ship-the-goods direction.
-                // The class is closed here rather than the instance — see isLegacyPresent(),
+                // The class is closed here rather than the instance — see isPresent(),
                 // whose name is historical and does not mean legacy-only.
                 paths.busVoucher = 'approved';
             } else if (isEmpty(ctx.busRhiIntended)) {
@@ -945,7 +949,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             busRhiIntendedRaw: effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.BUS_RHI_INTENDED, sparse),
             // A Date object from record.getValue(). Tested for PRESENCE only, through
-            // isLegacyPresent() rather than isEmpty() — never parsed, never compared to today.
+            // isPresent() rather than isEmpty() — never parsed, never compared to today.
             // An approved voucher does not expire.
             voucherApprovalDate: effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.VOUCHER_APPROVAL_DATE,

@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.6.1
+ * @version 1.6.2
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.6.1';
+    var VERSION = '1.6.2';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -135,7 +135,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          * answer.
          *
          * THE FIELD TYPES ARE NOT CONFIRMED — they may be checkbox, date or text. The presence
-         * test therefore has to be correct for all three: see isLegacyPresent() in
+         * test therefore has to be correct for all three: see isPresent() in
          * opsync_ue_opportunity.js, and note in particular that an UNTICKED checkbox arrives as
          * boolean false, which a naive "not empty string" test would read as present and hand
          * every legacy opportunity a free pass on its certificates.
