@@ -102,8 +102,8 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.6.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the eight script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.5.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Shared config library | 1.6.1 | `lib/opsync_lib_config.js` | Every script ID in the project, and the eight script parameters — including the status mapping | Not deployed |
+| Opportunity user event | 1.5.1 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -266,7 +266,7 @@ order.
 
 | Field | Script ID | Type |
 |---|---|---|
-| Voucher approval date | `custbody_voucher_approval_date` | Date |
+| Voucher approval date | `custbody_voucher_approval_date` | **Date — confirmed.** Tested with `isLegacyPresent()`, not `isEmpty()` |
 | Intended for BUS | `custbody_bus_project_rhi_intended` | List → `customlist92` (*YesNo*) |
 
 The rule, evaluated inside the certificate gate and **only** there:
@@ -295,10 +295,21 @@ that ships goods. The comparison therefore requires a non-empty parameter first.
 
 #### The presence test
 
-**The field types are not confirmed** — they may be checkbox, date or text — so the test has to
-be correct for all three. `isLegacyPresent()` treats **boolean `false`, `''`, `null` and
+**`isLegacyPresent()` is the project's presence test, not a legacy-only one.** The name is
+historical. It is used wherever "is this field filled in" decides whether an order ships —
+the three legacy flags, and `custbody_voucher_approval_date`, which is a **confirmed Date**.
+
+**The legacy field types are not confirmed** — they may be checkbox, date or text — so the test
+has to be correct for all three. `isLegacyPresent()` treats **boolean `false`, `''`, `null` and
 `undefined`** as absent, plus the strings `'F'` and `'false'` in case a checkbox reaches it by a
-path that stringifies it.
+path that stringifies it. It is also correct for a date, which is why a confirmed Date uses it.
+
+> **Use it even when the type is confirmed.** `isEmpty()` would be correct for
+> `custbody_voucher_approval_date` today. It would stop being correct the moment somebody
+> changes that field to a checkbox in the UI, and nothing in the script would notice — the
+> failure is silent and in the ship-the-goods direction. **Close the class, not the instance.**
+> The one field still on `!isEmpty()` is `custbody_installer_subcontract_receive`, whose type is
+> still open — see section 10.
 
 > **An unticked checkbox arrives as boolean `false`, and `String(false)` is the five-character
 > string `"false"`.** A presence test written as `!isEmpty(value)` or `value !== ''` therefore
@@ -515,21 +526,33 @@ Agreed mapping, seven rows, **by name**:
 
 - **Design Cancelled is a one-way door**, and readiness freezes with it. See section 6.
 
-- **Six of the eight parameters throw when unset. Two do not. The rule is not importance —
+- **Five of the eight parameters throw when unset. Three do not. The rule is not importance —
   it is what EMPTY MEANS.**
 
   Ask of each parameter: if it is empty, does the script do *less*, or does it do *more*?
+
+  > **Count the table against the code before trusting this sentence.** It read *"six of the
+  > seven throw, one does not"* from the day it was written and was wrong then too — the status
+  > map has never thrown. Corrected in 1.6.1. This table is the authoritative record of which
+  > parameter fails which way, and it is consulted precisely when somebody is deciding how a
+  > **new** parameter should behave, so a wrong count here propagates into the next one added.
 
   | Parameter | Empty means | Behaviour |
   |---|---|---|
   | `custscript_opsync_qualifying_statuses` | No opportunity qualifies. The gate never opens, nothing is written | **Fails closed** — logs at error, returns `[]` |
   | `custscript_opsync_excluded_statuses` | **Nothing is excluded** — the script writes over orders at Release to Warehouse, Cancelled and Design Cancelled | **Fails open → throws** |
-  | `custscript_opsync_status_map` | Nothing resolves, so no order is touched | Fails closed — logs at error, returns `null` |
+  | `custscript_opsync_status_map` | Nothing resolves, so **no Record Status is written to any order** | **Fails closed** — logs at error, returns `null` |
   | `custscript_opsync_design_ok_statuses` | **No status satisfies the design gate** — every order stamped *"not ready, Design not complete"*, including ready ones | **Fails open → throws** |
   | `custscript_opsync_dno_ok_values` | **Every certificate-gated order reports *Awaiting DNO*** | **Fails open → throws** |
   | `custscript_opsync_cust_qual_field` | **Certificates cannot be read at all**, so they read as missing and every gated order is held | **Fails open → throws** |
   | `custscript_opsync_cust_pl_field` | As above | **Fails open → throws** |
   | `custscript_opsync_bus_no_value` | **No** value is recognised as *not intended for BUS*, so the BUS condition applies to everything — orders are held, never shipped | **Fails closed** — logs at error, returns `''` |
+
+  Three fail closed — `custscript_opsync_qualifying_statuses`, `custscript_opsync_status_map`
+  and `custscript_opsync_bus_no_value`. Five throw. The status map is the one most often
+  miscounted, because *"nothing resolves"* sounds like a failure rather than a safe one: an
+  unmapped save still evaluates readiness against each order's **own** current status — see
+  *the decided status* in section 4 — but it writes no status anywhere, which is the test.
 
   The excluded list is the one that matters most and the one most easily got wrong, because it
   reads like a safety mechanism and an empty safety mechanism looks harmless. It is not: an empty
@@ -909,8 +932,8 @@ back to `oldRecord` instead of reading a populated field as blank.
 | Legacy subcontract | `custbodysubcontract_received_legacy` | **Unconfirmed** — no underscore after `custbody` | `isLegacyPresent()` |
 | Legacy qualification | `custbody_installer_qual_logged_legacy` | **Unconfirmed** | `isLegacyPresent()` |
 | Legacy PL | `custbody_installer_pl_logged_legacy` | **Unconfirmed** | `isLegacyPresent()` |
-| **Voucher approval date** | `custbody_voucher_approval_date` | Date | `isEmpty()` — presence only, never parsed |
-| **Intended for BUS** | `custbody_bus_project_rhi_intended` | List → `customlist92` (*YesNo*) | `asSelectId()` |
+| **Voucher approval date** | `custbody_voucher_approval_date` | **Date — confirmed** | `isLegacyPresent()` — presence only, never parsed |
+| **Intended for BUS** | `custbody_bus_project_rhi_intended` | **List → `customlist92` (*YesNo*) — confirmed** | `asSelectId()` |
 
 #### Read from the SALES ORDER — one `search.lookupFields` per order
 
@@ -977,7 +1000,7 @@ because the equivalent opportunity fields are unstored sourced fields and cannot
 | # | Question | Status |
 |---|---|---|
 | 0 | What TYPE are the three legacy evidence fields — checkbox, date or text? | **Open, and the code does not need the answer.** `isLegacyPresent()` is correct for all three. Worth confirming anyway: if any is a checkbox, §9 scenario 61 is the one that must pass. |
-| 0b | What TYPE is `custbody_installer_subcontract_receive`? | **Open, and the code DOES need the answer.** It is tested with `!isEmpty()`, which reads an unticked checkbox as satisfied — see the warning in the field table above. If it is a checkbox this is a live fail-open defect. |
+| 0b | What TYPE is `custbody_installer_subcontract_receive`? | **Open, and the code DOES need the answer.** It is the **only** presence-gates-shipping test still on `!isEmpty()`, which reads an unticked checkbox as satisfied — see the warning in the field table above. If it is a checkbox this is a live fail-open defect. The voucher date closed the same class in 1.5.1 by moving to `isLegacyPresent()`; this one has not, because it is read from a `lookupFields` result rather than the record and the change was out of scope for that patch. |
 | 1 | Should `custbody_cad_worklist` on existing sales orders be **cleared** when the worklist record retires, or left as history? | **Open.** Clearing is a one-off data job, not something this feature does. Leaving it means a field pointing at a retired record. Nothing in this repo reads or writes it. |
 | 2 | Is the *Won* gate early enough to be useful? | **Open, and knowingly accepted.** See section 6. It is a parameter, so widening it needs no code. |
 

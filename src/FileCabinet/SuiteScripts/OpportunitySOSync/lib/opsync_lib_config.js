@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.6.0
+ * @version 1.6.1
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.6.0';
+    var VERSION = '1.6.1';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -443,21 +443,32 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
     }
 
     /* ------------------------------------------------------------------------------------------
-     * REQUIRED PARAMETERS — SIX THROW, TWO DO NOT
+     * REQUIRED PARAMETERS — FIVE OF THE EIGHT THROW, THREE DO NOT
+     *
+     * Count them against the code before trusting any prose, here or in docs/context.md section
+     * 5: this count was wrong in both places until 1.6.1, and it is consulted precisely when
+     * somebody is deciding how a NEW parameter should behave.
      *
      * The test is not "how important is this parameter". It is: WHAT DOES EMPTY MEAN?
      *
-     * For getQualifyingStatuses(), empty means no opportunity qualifies. The gate never opens,
-     * the script does nothing, and no sales order is touched. Empty fails CLOSED, so it logs at
-     * error and returns an empty array. That one stays as it is.
+     * THE THREE THAT DO NOT THROW all fail CLOSED — empty makes the script do LESS, not more:
      *
-     * getBusNoValue() is the second. Empty means no list value is recognised as "No", so the
-     * BUS condition applies to EVERYTHING — it adds a restriction rather than removing one, and
-     * the worst case is an order held until somebody looks at the log. It logs at error and
-     * returns ''. See the note on that function.
+     *   QUALIFYING_STATUSES  empty means no opportunity qualifies. The gate never opens, the
+     *                        script does nothing, and no sales order is touched.
+     *                        parseIdListParameter() logs at error and returns [].
+     *   STATUS_MAP           empty means no sub-status resolves, so no Record Status is written
+     *                        to any order. parseStatusMap() logs at error and returns null.
+     *                        (Readiness is still evaluated against each order's OWN status — see
+     *                        the decided status in docs/context.md section 4. That is a
+     *                        deliberate widening of what an unmapped save does, not a leak: it
+     *                        writes no status anywhere.)
+     *   BUS_NO_VALUE         empty means no list value is recognised as "No", so the BUS
+     *                        condition applies to EVERYTHING — it adds a restriction rather
+     *                        than removing one, and the worst case is an order held until
+     *                        somebody looks at the log. getBusNoValue() logs at error and
+     *                        returns ''. See the note on that function.
      *
-     * For every other parameter, empty fails OPEN — it removes a restriction rather than
-     * applying one:
+     * THE FIVE THAT THROW all fail OPEN — empty removes a restriction rather than applying one:
      *
      *   EXCLUDED_STATUSES   empty means nothing is excluded, so the script writes over orders at
      *                       Release to Warehouse, Cancelled and Design Cancelled — exactly the
@@ -469,10 +480,10 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      *   CUSTOMER_*_FIELD    empty means the certificate dates cannot be read at all, so they
      *                       read as missing and every gated order is held.
      *
-     * In each of those, returning an empty array produces confidently wrong data on every sales
-     * order of the opportunity — which is worse than doing nothing. So they THROW, and they are
-     * resolved BEFORE the sales order loop begins, so a missing one cannot leave some orders
-     * written and the rest not. The throw is caught by the entry point's outer handler and
+     * In each of those five, returning an empty array produces confidently wrong data on every
+     * sales order of the opportunity — which is worse than doing nothing. So they THROW, and
+     * they are resolved BEFORE the sales order loop begins, so a missing one cannot leave some
+     * orders written and the rest not. The throw is caught by the entry point's outer handler and
      * logged as OPPSYNC_FAILED; the opportunity still saves.
      * ------------------------------------------------------------------------------------------ */
 
@@ -599,8 +610,9 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * THIS ONE DOES NOT THROW, and that is the §5 test applied rather than an exception to it.
      * Ask what EMPTY means: with no id configured, no value of custbody_bus_project_rhi_intended
      * is recognised as "No", so the BUS condition applies to every certificate-gated order. That
-     * ADDS a restriction — orders are held, never shipped — so empty fails CLOSED, exactly like
-     * getQualifyingStatuses(). Throwing would abandon the whole sync, including the status and
+     * ADDS a restriction — orders are held, never shipped — so empty fails CLOSED, like
+     * getQualifyingStatuses() and parseStatusMap() before it. Throwing would abandon the whole
+     * sync, including the status and
      * ship date writes, over a parameter whose absence is already safe. It is logged at error so
      * the misconfiguration is still visible.
      *

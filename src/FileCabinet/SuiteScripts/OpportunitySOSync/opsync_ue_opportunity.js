@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.5.0
+ * @version 1.5.1
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.5.0';
+    var VERSION = '1.5.1';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -74,23 +74,33 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
     }
 
     /**
-     * Presence test for a legacy evidence field. NOT isEmpty() — see below.
+     * THE PROJECT'S PRESENCE TEST for any field where "is this filled in" decides whether an
+     * order ships. NOT isEmpty() — see below.
      *
-     * The three legacy fields' types are NOT confirmed: they may be checkbox, date or text. This
-     * has to be correct for all three, and the checkbox case is the dangerous one.
+     * The name is historical: it was written for the three legacy evidence fields, whose types
+     * are NOT confirmed and may be checkbox, date or text. It is not legacy-only and must not be
+     * read as such. custbody_voucher_approval_date is a CONFIRMED Date and goes through it too,
+     * because the test is correct for a date as well and because the cost of being wrong is
+     * always in the same direction.
      *
-     * An UNTICKED checkbox arrives as boolean FALSE. isEmpty(false) is false, because
-     * String(false) is the five-character string "false" — so a presence test written as
-     * !isEmpty(value), or as value !== '', reads an unticked box as PRESENT and hands every
-     * legacy opportunity a free pass on its certificates. Silently, and in the direction that
-     * ships goods rather than holding them.
+     * THAT DIRECTION IS WHY THIS IS THE DEFAULT. An UNTICKED checkbox arrives as boolean FALSE.
+     * isEmpty(false) is false, because String(false) is the five-character string "false" — so a
+     * presence test written as !isEmpty(value), or as value !== '', reads an unticked box as
+     * PRESENT and hands the order a free pass on the condition. Silently, and in the direction
+     * that ships goods rather than holding them. A field whose type is confirmed today can be
+     * changed in the UI tomorrow by someone who will never read this file, and nothing in the
+     * script would notice. This test survives that change; isEmpty() does not.
+     *
+     * So use this for every presence-gates-shipping test, whether or not the type is confirmed.
+     * The one field still on !isEmpty() is custbody_installer_subcontract_receive — see the open
+     * question in docs/context.md section 10.
      *
      * So false, '' , null and undefined are all absent. The string forms 'F' and 'false' are
      * treated as absent too, in case a checkbox reaches this by a path that stringifies it —
-     * neither is a plausible value for a genuine text or date flag.
+     * neither is a plausible value for a genuine text or date field.
      *
      * @param {*} value
-     * @returns {boolean} true when the legacy evidence is present
+     * @returns {boolean} true when the value is present
      */
     function isLegacyPresent(value) {
         var text;
@@ -616,9 +626,16 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             //    ships goods. See getBusNoValue() in opsync_lib_config.js.
             if (ctx.busNoValue !== '' && ctx.busRhiIntended === ctx.busNoValue) {
                 paths.busVoucher = 'not intended';
-            } else if (!isEmpty(ctx.voucherApprovalDate)) {
+            } else if (isLegacyPresent(ctx.voucherApprovalDate)) {
                 // Presence only, never an expiry comparison: an approved voucher does not lapse
-                // for this purpose, and a date field is never the empty string when it is set.
+                // for this purpose.
+                //
+                // isLegacyPresent(), not isEmpty(), although the field is a CONFIRMED Date and
+                // isEmpty() would be correct for one. The tolerant test is correct for a date
+                // too, and this is the third field in this codebase where a type change in the
+                // UI would flip an isEmpty() test to fail OPEN, in the ship-the-goods direction.
+                // The class is closed here rather than the instance — see isLegacyPresent(),
+                // whose name is historical and does not mean legacy-only.
                 paths.busVoucher = 'approved';
             } else if (isEmpty(ctx.busRhiIntended)) {
                 paths.busVoucher = 'fail unconfirmed';
@@ -907,8 +924,9 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             // through asSelectId() below and never through String().
             busRhiIntendedRaw: effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.BUS_RHI_INTENDED, sparse),
-            // A Date object from record.getValue(). Tested for PRESENCE only — never parsed,
-            // never compared to today. An approved voucher does not expire.
+            // A Date object from record.getValue(). Tested for PRESENCE only, through
+            // isLegacyPresent() rather than isEmpty() — never parsed, never compared to today.
+            // An approved voucher does not expire.
             voucherApprovalDate: effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.VOUCHER_APPROVAL_DATE,
                 sparse),
