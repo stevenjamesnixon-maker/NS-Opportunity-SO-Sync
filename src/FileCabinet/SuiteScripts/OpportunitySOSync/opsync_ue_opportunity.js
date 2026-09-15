@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.3.1
+ * @version 1.4.0
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.3.1';
+    var VERSION = '1.4.0';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -137,6 +137,44 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      */
     function asId(value) {
         return isEmpty(value) ? '' : String(value);
+    }
+
+    /**
+     * Normalises a select value to its internal ID string, whatever shape it arrives in.
+     *
+     * TWO APIS, TWO SHAPES. search.lookupFields returns a select as an ARRAY of {value, text};
+     * record.getValue returns the same field as a plain internal ID STRING. A value that moves
+     * between the two — as custbody38 did in 1.4.0, from a per-order lookupFields to a read off
+     * the opportunity record — changes shape without changing meaning.
+     *
+     * String([{value:'1'}]) is '[object Object]', which is in no parameter list, so a select
+     * compared in the wrong shape fails as a legitimate "not acceptable" rather than as an
+     * error. Nothing is logged and nothing throws. This is deliberately tolerant of BOTH shapes
+     * so the comparison stays correct wherever the value came from.
+     *
+     * It is not a substitute for knowing which record a field is on: a normaliser cannot fix a
+     * field that returns blank because it does not apply to the record being asked.
+     *
+     * @param {*} value - array of {value,text}, {value}, string, number, or empty
+     * @returns {string} the internal ID, or '' when blank
+     */
+    function asSelectId(value) {
+        if (value === null || value === undefined) {
+            return '';
+        }
+
+        if (Object.prototype.toString.call(value) === '[object Array]') {
+            if (value.length === 0) {
+                return '';
+            }
+            return asSelectId(value[0]);
+        }
+
+        if (typeof value === 'object') {
+            return (value.value === null || value.value === undefined) ? '' : String(value.value);
+        }
+
+        return String(value);
     }
 
     /**
@@ -491,7 +529,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * The legacy values come off the CONTEXT, not the order: they live on the opportunity and
      * are read once per save. The evaluation rule is unchanged by that — only the source is.
      *
-     * @param {Object} order - { quoteTypeId, subcontractReceived, dnoStatus }
+     * @param {Object} order - { quoteTypeId, subcontractReceived }
      * @param {string} decidedStatus - the Record Status this save will write
      * @param {Object} ctx - the per-opportunity readiness context
      * @returns {Object} { ready: boolean, reason: string, paths: Object }
@@ -544,7 +582,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
 
             // 4. DNO. NO legacy equivalent exists, so there is no legacy path here. Blank or
             //    absent always fails — there is no "no news is good news".
-            if (contains(order.dnoStatus, ctx.dnoOkValues)) {
+            if (contains(ctx.dnoStatus, ctx.dnoOkValues)) {
                 paths.dno = 'modern';
             } else {
                 paths.dno = 'fail';
@@ -623,8 +661,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 opsyncConfig.SALES_ORDER_FIELDS.READY_FOR_DELIVERY,
                 opsyncConfig.SALES_ORDER_FIELDS.DELIVERY_HOLD_REASON,
                 opsyncConfig.SALES_ORDER_FIELDS.QUOTE_TYPE,
-                opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED,
-                opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS
+                opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED
             ]
         });
 
@@ -706,9 +743,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             verdict = evaluateReadiness({
                 quoteTypeId: quoteTypeId,
                 subcontractReceived: opsyncConfig.lookupValue(
-                    lookup, opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED),
-                dnoStatus: opsyncConfig.lookupValue(
-                    lookup, opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS)
+                    lookup, opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED)
             }, decidedStatus, ctx);
 
             // The paths matter as much as the verdict. When a legacy order comes up in a year
@@ -721,7 +756,10 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                     (mappedStatusId === null ? ' (unmapped — order\'s own)' : ' (mapped)') +
                     ', ready=' +
                     verdict.ready + ', reason=' + (verdict.reason || '(none)') +
-                    ', paths=' + describePaths(verdict.paths)
+                    ', paths=' + describePaths(verdict.paths) +
+                    ', dnoRaw=' + JSON.stringify(ctx.dnoStatusRaw) +
+                    ' -> ' + (ctx.dnoStatus || '(blank)') +
+                    ', dnoOk=' + ctx.dnoOkValues.join('/')
             });
 
             // Both fields are written together or not at all: a reason without its checkbox, or
@@ -770,7 +808,8 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      *    leave some orders updated and the rest not, which is the "no partial writes" the brief
      *    asks for. See the note on requiredParameter() in opsync_lib_config.js.
      *
-     * 2. The three LEGACY evidence flags, straight off the opportunity — no lookup at all.
+     * 2. The DNO status and the three LEGACY evidence flags, straight off the opportunity —
+     *    no lookup at all.
      *    Because they are opportunity-level, they satisfy the certificate gate for EVERY linked
      *    sales order, including any order added later. That is intended: the flags record that
      *    the work was verified under the old process, and the opportunity is the unit that
@@ -795,10 +834,17 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             installerId: '',
             qualExpiry: '',
             plExpiry: '',
-            // Legacy evidence lives on the OPPORTUNITY, so it is read once here from the record
-            // being saved — no lookupFields, and not per order. Through effectiveValue like the
-            // installer, so a sparse XEDIT newRecord falls back to oldRecord rather than reading
-            // a populated legacy flag as blank and holding every linked order.
+            // The DNO status is on the OPPORTUNITY — the sales order has no DNO field at all.
+            // The RAW shape is kept alongside the normalised id because it goes in the log: this
+            // check once failed for a whole Sandbox cycle with no error and no clue as to why.
+            dnoStatusRaw: effectiveValue(
+                newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.DNO_STATUS, sparse),
+
+            // Legacy evidence also lives on the OPPORTUNITY, so it too is read once here from
+            // the record being saved — no lookupFields, and not per order. All of these go
+            // through effectiveValue like the installer, so a sparse XEDIT newRecord falls back
+            // to oldRecord rather than reading a populated flag as blank and holding every
+            // linked order.
             subcontractLegacy: effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.SUBCONTRACT_LEGACY, sparse),
             qualLegacy: effectiveValue(
@@ -812,7 +858,12 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         var plField = opsyncConfig.getCustomerPlField();
         var lookup;
 
-        ctx.installerId = asId(effectiveValue(
+        // Selects are normalised through asSelectId, not asId: record.getValue returns a plain
+        // id string, but the same field read through a search returns an array of {value,text},
+        // and String() on that is '[object Object]'.
+        ctx.dnoStatus = asSelectId(ctx.dnoStatusRaw);
+
+        ctx.installerId = asSelectId(effectiveValue(
             newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.INSTALLER, sparse));
 
         if (isEmpty(ctx.installerId)) {
@@ -887,7 +938,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             // 2. entitystatus from newRecord if it carries it, otherwise from oldRecord. See
             //    effectiveValue — on XEDIT newRecord holds only the edited fields, and a gate
             //    reading straight off it exits on every valid inline edit without logging.
-            entityStatus = asId(effectiveValue(
+            entityStatus = asSelectId(effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.ENTITY_STATUS, true));
 
             // 3. The gate. An empty qualifying list means the parameter is unset; the library has
@@ -897,7 +948,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 return;
             }
 
-            subStatus = asId(effectiveValue(
+            subStatus = asSelectId(effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.SUB_STATUS, sparse));
             // Read the delivery date ONCE, then derive both forms from it: a key for comparing
             // and the original Date for writing. See asDateKey and asDateForWrite — they are

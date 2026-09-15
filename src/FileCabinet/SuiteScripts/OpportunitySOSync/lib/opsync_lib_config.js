@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.4.0
+ * @version 1.5.0
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.4.0';
+    var VERSION = '1.5.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -102,6 +102,17 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          */
         INSTALLER: 'custbody_installer_ns',
 
+        /**
+         * The DNO status, on the OPPORTUNITY — the sales order has no DNO field at all.
+         *
+         * "custbody38" is an auto-assigned SCRIPT ID, not an internal id: NetSuite names a body
+         * field custbodyN when no id is chosen. See docs/context.md section 6.
+         *
+         * Opportunity-level, so it applies to every linked sales order. That is correct — the
+         * DNO notification is a property of the installation, not of an individual order.
+         */
+        DNO_STATUS: 'custbody38',
+
         /* --------------------------------------------------------------------------------------
          * LEGACY EVIDENCE FIELDS — ON THE OPPORTUNITY
          *
@@ -175,18 +186,20 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
         /** List/Record -> the Quote Type record. Decides which readiness gates apply. */
         QUOTE_TYPE: 'custbody_quote_type',
         /** Must not be blank before an order needing installer certificates is ready. */
-        SUBCONTRACT_RECEIVED: 'custbody_installer_subcontract_receive',
-        /**
-         * The DNO status. "custbody38" is an auto-assigned SCRIPT ID, not an internal id —
-         * NetSuite names a body field custbodyN when no id is chosen. See the note on
-         * RECORD_TYPES.QUOTE_TYPE and docs/context.md section 6.
-         */
-        DNO_STATUS: 'custbody38'
-
+        SUBCONTRACT_RECEIVED: 'custbody_installer_subcontract_receive'
         /*
-         * The three legacy evidence fields are NOT here. They are on the OPPORTUNITY — see
-         * OPPORTUNITY_FIELDS. Phase 3a assumed the sales order and was wrong; this note exists
-         * so the next person does not go looking for them on the order again.
+         * NOT HERE, and each was assumed to be here once:
+         *
+         *   custbody38                             the DNO status
+         *   custbodysubcontract_received_legacy    legacy subcontract evidence
+         *   custbody_installer_qual_logged_legacy  legacy qualification evidence
+         *   custbody_installer_pl_logged_legacy    legacy PL evidence
+         *
+         * All four are on the OPPORTUNITY — see OPPORTUNITY_FIELDS. The custbody_ prefix means
+         * "transaction body field" and says NOTHING about which transaction types the field
+         * applies to. Asking a sales order for a field that applies only to opportunities
+         * returns BLANK rather than erroring, so the mistake is silent. See docs/context.md
+         * section 0, trap 6.
          */
     };
 

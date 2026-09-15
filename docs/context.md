@@ -58,6 +58,23 @@ Five traps that will catch a new session before it touches anything.
    If an ID has a missing letter or a doubled prefix, that is the ID. Never "correct" one — the
    corrected version does not exist and the failure is silent.
 
+6. **`custbody_` tells you nothing about which record a field is on.**
+   It means "transaction body field" — nothing more. It does not say which transaction types the
+   field applies to, and **a field that does not apply to the record you ask returns BLANK
+   rather than erroring.**
+
+   Four fields in this project were assumed to be on the sales order from the prefix alone and
+   were all on the **opportunity**: `custbody38` and the three legacy evidence flags. Each one
+   failed the same way — a legitimate-looking "not satisfied" verdict, no error, nothing in the
+   log. `custbody38` cost a full Sandbox cycle and an investigation that first chased the wrong
+   cause entirely.
+
+   > **A field ID in a brief is not usable until its record has been confirmed from the field
+   > definition's *Applies To*. A brief that names a field without naming its record should be
+   > sent back.**
+
+   Confirmed records for every field this script touches are in section 10.
+
 ---
 
 ## 1. What this solves
@@ -85,8 +102,8 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.4.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.3.1 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Shared config library | 1.5.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
+| Opportunity user event | 1.4.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -197,7 +214,7 @@ Three conditions plus DNO, evaluated **independently**, each with a legacy path:
 | 1 | Subcontract | `custbody_installer_subcontract_receive` **or** `custbodysubcontract_received_legacy` | `Subcontract agreement not received` |
 | 2 | Installer qualification | `custbody_installer_qual_logged_legacy`, **else** the customer's qualification expiry | `Installer not set on opportunity` / `Installer qualification certificate missing` / `… expired` |
 | 3 | Public Liability | `custbody_installer_pl_logged_legacy`, **else** the customer's PL expiry | `Installer not set on opportunity` / `Public Liability certificate missing` / `… expired` |
-| 4 | DNO | `custbody38` in `getDnoOkValues()` — blank or absent fails. **No legacy path exists** | `Awaiting DNO` |
+| 4 | DNO | `custbody38` **on the opportunity** in `getDnoOkValues()` — blank or absent fails. **No legacy path exists** | `Awaiting DNO` |
 
 **`Installer not set on opportunity` is de-duplicated.** Conditions 2 and 3 raise it
 independently, and one missing installer is one problem to fix — saying so twice reads as two.
@@ -221,6 +238,11 @@ wrong; the reads moved in 3c. They are read **once per save** from the record be
 | `custbodysubcontract_received_legacy` — **note: no underscore after `custbody`** | Subcontract |
 | `custbody_installer_qual_logged_legacy` | Installer qualification |
 | `custbody_installer_pl_logged_legacy` | Public Liability |
+
+**The DNO status is opportunity-level too.** `custbody38` is on the opportunity — the sales
+order has no DNO field at all — so it is read once per save and applies to every linked order.
+That is correct: the DNO notification is a property of the installation, not of an individual
+order.
 
 **Because they are opportunity-level, legacy evidence satisfies the certificate gate for EVERY
 sales order linked to that opportunity — including any order added later.** That is intended, not
@@ -512,6 +534,17 @@ Agreed mapping, seven rows, **by name**:
   The cost is real and accepted: every save of a won opportunity now runs the order search and
   one `lookupFields` per order, where before an unchanged sub-status cost nothing.
 
+- **Selects are normalised with `asSelectId()`, never `String()`.**
+  `search.lookupFields` returns a select as an **array** of `{value, text}`; `record.getValue`
+  returns the same field as a plain **id string**. A value that moves between the two APIs —
+  as `custbody38` did — changes shape without changing meaning, and `String([{value:'1'}])` is
+  `'[object Object]'`, which is in no parameter list. The comparison then fails as a legitimate
+  "not acceptable" rather than as an error: nothing logged, nothing thrown.
+
+  `asSelectId()` accepts an array, a `{value}` object, a string, a number or empty. **It is not
+  a substitute for knowing which record a field is on** — no normaliser can fix a field that
+  returns blank because it does not apply to the record being asked. See trap 6.
+
 - **Legacy evidence is an OR, not an AND**, carries no expiry, and lives on the **opportunity**.
   See section 4 — including why its presence test is not `isEmpty()`, and why satisfying every
   linked order is intended rather than a leak.
@@ -604,7 +637,7 @@ drift between scripts.
 | `OPPSYNC_MAP_PARSED` | debug | The mapping as actually parsed, one line of `key -> value` pairs. Normal operation. | Nothing. With Log Level on Debug this is how a typo is spotted by eye rather than inferred from an order that did not sync. |
 | `OPPSYNC_ORDER_FAILED` | error | One sales order threw while being read or written. **The remaining orders were still processed.** | Read the logged error against the named order. Usually a locked or deleted order, or a permission problem on the executing role. |
 | `OPPSYNC_GOVERNANCE_STOP` | error | The loop stopped with governance running low, naming how many orders were done and which were not reached. | Re-save the opportunity to pick up the rest. If it recurs, the opportunity has more orders than this design anticipated — see section 6. |
-| `OPPSYNC_READINESS` | debug | One line per sales order: order, quote type, decided status, ready true/false, the reason, **and which path satisfied each certificate condition** — `modern`, `legacy`, `no installer` or `fail`. Normal operation. | Nothing. This is the first place to look when an order's readiness is not what was expected. **The paths are the only record of why an order with a blank installer is ready to ship** — when a legacy order surfaces in a year and nobody remembers these fields exist, this line is the explanation. |
+| `OPPSYNC_READINESS` | debug | One line per sales order: order, quote type, decided status, ready true/false, the reason, **which path satisfied each certificate condition** — `modern`, `legacy`, `no installer` or `fail` — **and the raw `custbody38` value, what it normalised to, and the acceptable set**. Normal operation. | Nothing. This is the first place to look when an order's readiness is not what was expected. **The paths are the only record of why an order with a blank installer is ready to ship** — when a legacy order surfaces in a year and nobody remembers these fields exist, this line is the explanation. The `dnoRaw=… -> … dnoOk=…` fragment exists because the DNO check once failed for a whole Sandbox cycle with no error and no clue; it shows the value, the normalised id and the parameter side by side. |
 | `OPPSYNC_READINESS_NOT_APPLICABLE` | debug | The status this save wrote is in the excluded list, so readiness was **not evaluated** and both fields were left as they were. Normal operation. | Nothing. Note the readiness values shown are now frozen — see section 6. |
 | `OPPSYNC_QUOTE_TYPE_UNREADABLE` | error | A quote type record could not be read. Treated as **design-required, certificates not required** — the strictest reading of the design gate. | Check the quote type record exists and the executing role can read it. Until then those orders are gated on design. |
 | `OPPSYNC_INSTALLER_UNREADABLE` | error | The installer customer record could not be read for the two certificate fields. **Both certificates read as missing**, so the order is held. | Check the customer record and the two field ids in the parameters. The held order is the safe outcome, not the bug. |
@@ -666,8 +699,9 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    appearing twice (that is the `OPPSYNC_MAP_AMBIGUOUS` case) and no typos (that is
    `OPPSYNC_MAP_INVALID_ENTRY`). There is **no field to create on `customrecord_fin_stat`** and
    no data to populate on the Record Status records; see section 5.
-6. Confirm the three **legacy evidence fields** exist on the **opportunity** with exactly these
-   IDs — `custbodysubcontract_received_legacy` (**no underscore after `custbody`**),
+6. Confirm `custbody38` and the three **legacy evidence fields** exist on the **OPPORTUNITY** —
+   not the sales order — and confirm each field's *Applies To* before trusting any ID in a brief
+   (section 0, trap 6). The legacy IDs are — `custbodysubcontract_received_legacy` (**no underscore after `custbody`**),
    `custbody_installer_qual_logged_legacy`, `custbody_installer_pl_logged_legacy`. A wrong ID
    reads as blank, which silently removes the legacy path and holds every legacy order.
 7. **Disable the old `acs_ue_update_so.js` deployment.** The two must not both run. Two writers
@@ -759,6 +793,11 @@ screen and a failure in the notes.
 | 61 | A legacy flag present as an **unticked checkbox** (boolean `false`) | Treated as **NOT present**; falls through to the modern path. Check `paths=…modern` in `OPPSYNC_READINESS`, not `legacy`. **This is the test that catches the `String(false)` trap** |
 | 62 | The same, with the installer also blank | Falls through to `Installer not set on opportunity` — proving the fall-through is real rather than a silent pass |
 | 63 | A legacy flag present as a **ticked checkbox** (boolean `true`) | Treated as present. `paths=…legacy` |
+| 64 | `custbody38` = an acceptable value **on the opportunity**, all else passing | **Ready**, blank reason. Check `dnoRaw=… -> …` in `OPPSYNC_READINESS` matches the parameter |
+| 65 | `custbody38` = a value outside the acceptable set | Not ready, `Awaiting DNO` |
+| 66 | `custbody38` blank | Not ready, `Awaiting DNO`. `dnoRaw` shows `(blank)` |
+| 67 | Multi-order opportunity, `custbody38` acceptable | The DNO condition passes for **every** linked order from **one** read |
+| 68 | A select value arriving as `[{value:'2'}]` rather than `'2'` | Both tolerated — `asSelectId()` normalises either. `[]` reads as blank |
 
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
@@ -766,30 +805,76 @@ Extend this table as scenarios are found. **Revert any configuration changed for
 
 ## 10. Open items
 
-### Confirmed NetSuite IDs
+### Confirmed NetSuite IDs — every field, its record, and how it is reached
 
 Script IDs only — **no internal IDs**, here or anywhere else in this document. See section 3.
 
-| Item | Script ID | Type | Confirmed by | Date |
+**The record column is the point of this table.** Four fields in this project were assumed onto
+the wrong record from the `custbody_` prefix alone. See section 0, trap 6.
+
+#### Read from the OPPORTUNITY — `record.getValue()` on the record being saved
+
+No lookup, no search. All go through `effectiveValue()`, so a sparse XEDIT `newRecord` falls
+back to `oldRecord` instead of reading a populated field as blank.
+
+| Field | Script ID | Type | Normalised by |
+|---|---|---|---|
+| Status | `entitystatus` | Select | `asSelectId()` |
+| Design sub-status | `custbody_opportunity_sub_status` | List → `customlist_opp_sub_status_list` | `asSelectId()` |
+| Delivery date | `custbody_opp_del_date` | Date | `asDateKey()` / `asDateForWrite()` |
+| Installer | `custbody_installer_ns` | List/Record → Customer | `asSelectId()` |
+| **DNO status** | `custbody38` | List → `customlist_dnonotreclist`. **Auto-assigned script ID** | `asSelectId()` |
+| Legacy subcontract | `custbodysubcontract_received_legacy` | **Unconfirmed** — no underscore after `custbody` | `isLegacyPresent()` |
+| Legacy qualification | `custbody_installer_qual_logged_legacy` | **Unconfirmed** | `isLegacyPresent()` |
+| Legacy PL | `custbody_installer_pl_logged_legacy` | **Unconfirmed** | `isLegacyPresent()` |
+
+#### Read from the SALES ORDER — one `search.lookupFields` per order
+
+| Field | Script ID | Type | Shape returned | Read by |
 |---|---|---|---|---|
-| Record Status custom record | `customrecord_fin_stat` | Custom record | Steve | 2026-09-14 |
-| Opportunity: design sub-status | `custbody_opportunity_sub_status` | List → `customlist_opp_sub_status_list` | Steve | 2026-09-14 |
-| Opportunity: delivery date | `custbody_opp_del_date` | Date | Steve | 2026-09-14 |
-| Sales Order: Record Status | `custbody_finance_status` | List/Record → `customrecord_fin_stat` | Steve | 2026-09-14 |
-| Sales Order: expected ship date | `custbody_defaultshipdate` | Date | Steve | 2026-09-14 |
-| Sales Order → Opportunity link | `opportunity` | **Native** field — not `createdfrom` | Steve | 2026-09-14 |
-| Sales Order: ready for delivery | `custbody_ready_for_delivery` | Checkbox, Inline Text on forms | Steve | 2026-09-15 |
-| Sales Order: delivery hold reason | `custbody_delivery_hold_reason` | Long text, Inline Text on forms | Steve | 2026-09-15 |
-| Sales Order: quote type | `custbody_quote_type` | List/Record → Quote Type record | Steve | 2026-09-15 |
-| Sales Order: subcontract received | `custbody_installer_subcontract_receive` | — | Steve | 2026-09-15 |
-| Sales Order: DNO status | `custbody38` | **Auto-assigned** script ID — see section 6 | Steve | 2026-09-15 |
-| **Opportunity**: legacy subcontract | `custbodysubcontract_received_legacy` | **No underscore after `custbody`** — see §0 trap 5. Type unconfirmed | Steve | 2026-09-15 |
-| **Opportunity**: legacy qualification logged | `custbody_installer_qual_logged_legacy` | Presence test only. Type unconfirmed | Steve | 2026-09-15 |
-| **Opportunity**: legacy PL logged | `custbody_installer_pl_logged_legacy` | Presence test only. Type unconfirmed | Steve | 2026-09-15 |
-| Opportunity: installer | `custbody_installer_ns` | List/Record → Customer | Steve | 2026-09-15 |
-| Quote Type record | `customrecord16` | **Auto-assigned** script ID — see section 6 | Steve | 2026-09-15 |
-| Quote Type: can ship without design | `custrecord_qt_no_design_required` | Checkbox | Steve | 2026-09-15 |
-| Quote Type: requires installer certificates | `custrecord_qt_requires_installer_certs` | Checkbox | Steve | 2026-09-15 |
+| Record Status | `custbody_finance_status` | List/Record → `customrecord_fin_stat` | **array** | `lookupValue()` |
+| Expected ship date | `custbody_defaultshipdate` | Date | string | `lookupValue()` → `asDateKey()` |
+| Ready for delivery | `custbody_ready_for_delivery` | Checkbox | boolean | `isTicked()` |
+| Delivery hold reason | `custbody_delivery_hold_reason` | Long text | string | `lookupValue()` |
+| Quote type | `custbody_quote_type` | List/Record → Quote Type | **array** | `lookupValue()` |
+| Subcontract received | `custbody_installer_subcontract_receive` | **Unconfirmed** — see the warning below | string | `lookupValue()` + `isEmpty()` |
+
+> ⚠️ **`custbody_installer_subcontract_receive`'s type is not confirmed, and it matters.** It is
+> tested with `!isEmpty()`. If it is a **checkbox**, `lookupFields` returns boolean `false` for
+> unticked, `String(false)` is `"false"`, and `isEmpty("false")` is `false` — so an **unticked
+> box would satisfy the subcontract condition**. It fails open, in the ship-the-goods direction,
+> and logs nothing. Confirm the type; if it is a checkbox, route it through `isLegacyPresent()`
+> as the legacy flags already are.
+
+#### Written to the SALES ORDER — one `record.submitFields` per order
+
+| Field | Script ID | Written as |
+|---|---|---|
+| Record Status | `custbody_finance_status` | The mapped id — only when the mapping produced one |
+| Expected ship date | `custbody_defaultshipdate` | The original `Date` object, never the comparison key |
+| Ready for delivery | `custbody_ready_for_delivery` | boolean |
+| Delivery hold reason | `custbody_delivery_hold_reason` | string, `''` when ready |
+
+#### Read from the QUOTE TYPE record — one `search.lookupFields`, cached per save
+
+| Field | Script ID | Type | Shape | Read by |
+|---|---|---|---|---|
+| Can ship without design | `custrecord_qt_no_design_required` | Checkbox | boolean | `isTicked()` |
+| Requires installer certificates | `custrecord_qt_requires_installer_certs` | Checkbox | boolean | `isTicked()` |
+
+Record type: `customrecord16` — **auto-assigned script ID**, see section 6.
+
+#### Read from the CUSTOMER record — one `search.lookupFields` per opportunity
+
+Skipped entirely when the installer is blank.
+
+| Field | Script ID | Type | Shape | Read by |
+|---|---|---|---|---|
+| Qualification expiry | from `custscript_opsync_cust_qual_field` | **Date** | string | `lookupValue()` → `parseLookupDate()` |
+| Public Liability expiry | from `custscript_opsync_cust_pl_field` | **Date** | string | `lookupValue()` → `parseLookupDate()` |
+
+**These two are dates and must never be treated as selects.** Their field IDs are parameters
+because the equivalent opportunity fields are unstored sourced fields and cannot be searched.
 
 ### Closed questions
 
@@ -808,6 +893,7 @@ Script IDs only — **no internal IDs**, here or anywhere else in this document.
 | # | Question | Status |
 |---|---|---|
 | 0 | What TYPE are the three legacy evidence fields — checkbox, date or text? | **Open, and the code does not need the answer.** `isLegacyPresent()` is correct for all three. Worth confirming anyway: if any is a checkbox, §9 scenario 61 is the one that must pass. |
+| 0b | What TYPE is `custbody_installer_subcontract_receive`? | **Open, and the code DOES need the answer.** It is tested with `!isEmpty()`, which reads an unticked checkbox as satisfied — see the warning in the field table above. If it is a checkbox this is a live fail-open defect. |
 | 1 | Should `custbody_cad_worklist` on existing sales orders be **cleared** when the worklist record retires, or left as history? | **Open.** Clearing is a one-off data job, not something this feature does. Leaving it means a field pointing at a retired record. Nothing in this repo reads or writes it. |
 | 2 | Is the *Won* gate early enough to be useful? | **Open, and knowingly accepted.** See section 6. It is a parameter, so widening it needs no code. |
 
