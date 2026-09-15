@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.5.0
+ * @version 1.6.0
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.5.0';
+    var VERSION = '1.6.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -154,7 +154,34 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
         /** Presence satisfies the installer qualification condition outright. */
         QUAL_LOGGED_LEGACY: 'custbody_installer_qual_logged_legacy',
         /** Presence satisfies the public liability condition outright. */
-        PL_LOGGED_LEGACY: 'custbody_installer_pl_logged_legacy'
+        PL_LOGGED_LEGACY: 'custbody_installer_pl_logged_legacy',
+
+        /* --------------------------------------------------------------------------------------
+         * BUS VOUCHER — BOTH ON THE OPPORTUNITY
+         *
+         * The Boiler Upgrade Scheme voucher. A heat pump order intended for BUS must not ship
+         * before the voucher is approved: a project that should have claimed a voucher and
+         * shipped without one cannot claim it retrospectively.
+         *
+         * Opportunity-level like the DNO status and the legacy flags, so both are read ONCE per
+         * save from the record being saved and apply to every linked sales order. That is
+         * correct — a voucher is claimed for the installation, not for an individual order.
+         *
+         * There is NO legacy path for this condition and there must not be one. The BUS scheme
+         * postdates the old process entirely, so no legacy BUS field exists and the three legacy
+         * flags say nothing about a voucher. Do not wire them in here.
+         * -------------------------------------------------------------------------------------- */
+
+        /** Date. Non-blank means the voucher has been approved. Presence test only, no expiry. */
+        VOUCHER_APPROVAL_DATE: 'custbody_voucher_approval_date',
+        /**
+         * List -> customlist92 ("YesNo"). Is the project intended for BUS.
+         *
+         * BLANK IS TREATED AS "INTENDED" and holds the order — see the rule in
+         * opsync_ue_opportunity.js. The internal id that means "No" differs by account, so it is
+         * read from a script parameter: see PARAMETERS.BUS_NO_VALUE and getBusNoValue().
+         */
+        BUS_RHI_INTENDED: 'custbody_bus_project_rhi_intended'
     };
 
     /**
@@ -218,7 +245,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
     };
 
     /**
-     * Script parameter IDs. All seven are set on the DEPLOYMENT, so Sandbox and Production
+     * Script parameter IDs. All eight are set on the DEPLOYMENT, so Sandbox and Production
      * carry their own values and no internal id appears in code. See docs/context.md section 8.
      * @type {Object}
      */
@@ -248,7 +275,16 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          */
         CUSTOMER_QUAL_FIELD: 'custscript_opsync_cust_qual_field',
         /** Free-Form Text. The SCRIPT ID of the Public Liability expiry date field. As above. */
-        CUSTOMER_PL_FIELD: 'custscript_opsync_cust_pl_field'
+        CUSTOMER_PL_FIELD: 'custscript_opsync_cust_pl_field',
+        /**
+         * Free-Form Text. The single customlist92 option internal id that means "NOT intended
+         * for BUS" — the one value of custbody_bus_project_rhi_intended that switches the BUS
+         * condition off. Every other value, blank included, leaves it on.
+         *
+         * A parameter rather than a constant for the usual reason: it is a list option internal
+         * id and differs by account. See getBusNoValue() for why it does NOT throw when unset.
+         */
+        BUS_NO_VALUE: 'custscript_opsync_bus_no_value'
     };
 
     /* ------------------------------------------------------------------------------------------
@@ -407,13 +443,18 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
     }
 
     /* ------------------------------------------------------------------------------------------
-     * REQUIRED PARAMETERS — SIX THROW, ONE DOES NOT
+     * REQUIRED PARAMETERS — SIX THROW, TWO DO NOT
      *
      * The test is not "how important is this parameter". It is: WHAT DOES EMPTY MEAN?
      *
      * For getQualifyingStatuses(), empty means no opportunity qualifies. The gate never opens,
      * the script does nothing, and no sales order is touched. Empty fails CLOSED, so it logs at
      * error and returns an empty array. That one stays as it is.
+     *
+     * getBusNoValue() is the second. Empty means no list value is recognised as "No", so the
+     * BUS condition applies to EVERYTHING — it adds a restriction rather than removing one, and
+     * the worst case is an order held until somebody looks at the log. It logs at error and
+     * returns ''. See the note on that function.
      *
      * For every other parameter, empty fails OPEN — it removes a restriction rather than
      * applying one:
@@ -550,6 +591,56 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      */
     function getCustomerPlField() {
         return requiredParameter(PARAMETERS.CUSTOMER_PL_FIELD);
+    }
+
+    /**
+     * The customlist92 option internal id that means "NOT intended for BUS".
+     *
+     * THIS ONE DOES NOT THROW, and that is the §5 test applied rather than an exception to it.
+     * Ask what EMPTY means: with no id configured, no value of custbody_bus_project_rhi_intended
+     * is recognised as "No", so the BUS condition applies to every certificate-gated order. That
+     * ADDS a restriction — orders are held, never shipped — so empty fails CLOSED, exactly like
+     * getQualifyingStatuses(). Throwing would abandon the whole sync, including the status and
+     * ship date writes, over a parameter whose absence is already safe. It is logged at error so
+     * the misconfiguration is still visible.
+     *
+     * The empty return also has to be handled at the comparison, and is: a blank intention must
+     * NOT match a blank parameter and switch the condition off. See evaluateReadiness().
+     *
+     * @returns {string} the internal id, or '' when unset — which applies the condition to all
+     */
+    function getBusNoValue() {
+        var raw;
+        var trimmed;
+
+        try {
+            raw = runtime.getCurrentScript().getParameter({ name: PARAMETERS.BUS_NO_VALUE });
+        } catch (e) {
+            log.error({
+                title: logKey('PARAMETER_MISSING'),
+                details: 'Could not read script parameter ' + PARAMETERS.BUS_NO_VALUE +
+                    '. Is it defined on the script record and set on the deployment? Every ' +
+                    'certificate-gated order will be held for a BUS voucher until it is. ' + e
+            });
+            return '';
+        }
+
+        trimmed = (raw === null || raw === undefined) ? '' : String(raw).replace(/^\s+|\s+$/g, '');
+
+        if (trimmed === '') {
+            log.error({
+                title: logKey('PARAMETER_MISSING'),
+                details: 'Script parameter ' + PARAMETERS.BUS_NO_VALUE + ' is empty, so no ' +
+                    'value of ' + OPPORTUNITY_FIELDS.BUS_RHI_INTENDED + ' is recognised as ' +
+                    '"not intended for BUS" and every certificate-gated order is held for a ' +
+                    'voucher. That is the safe direction, so nothing was thrown — but it is ' +
+                    'still a misconfiguration. Populate it on the deployment in this account: ' +
+                    'its value is a customlist92 option internal id and differs by ' +
+                    'environment. See docs/context.md section 8.'
+            });
+        }
+
+        return trimmed;
     }
 
     /**
@@ -732,6 +823,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
         getDnoOkValues: getDnoOkValues,
         getCustomerQualField: getCustomerQualField,
         getCustomerPlField: getCustomerPlField,
+        getBusNoValue: getBusNoValue,
         getMappedStatus: getMappedStatus
     };
 });

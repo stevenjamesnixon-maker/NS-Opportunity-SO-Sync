@@ -102,8 +102,8 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.5.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.4.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Shared config library | 1.6.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the eight script parameters — including the status mapping | Not deployed |
+| Opportunity user event | 1.5.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -205,9 +205,16 @@ checked, it simply skips the design check.
 | Design | `custrecord_qt_no_design_required` — *"Can ship without design"* | Passes with no check | The status this save decided must be in `getDesignOkStatuses()`, else **Design not complete** |
 | Certificates | `custrecord_qt_requires_installer_certs` — *"Requires installer certificates"* | All five checks below | Passes with no check |
 
+**The certificate gate is this script's definition of a heat pump project.** Every rule that
+applies only to heat pumps lives inside it and needs no field of its own to decide what a heat
+pump is. `custbody_value_proposition` is deliberately **not** consulted: the physical product
+decides these rules, not the commercial package, and a second definition of "heat pump" in the
+same rule would be free to disagree with the first.
+
 The certificate checks, in the order their reasons are joined:
 
-Three conditions plus DNO, evaluated **independently**, each with a legacy path:
+Three conditions with a legacy path, plus DNO and the BUS voucher which have none — all
+evaluated **independently**:
 
 | # | Condition | Satisfied by | Failure reason |
 |---|---|---|---|
@@ -215,6 +222,7 @@ Three conditions plus DNO, evaluated **independently**, each with a legacy path:
 | 2 | Installer qualification | `custbody_installer_qual_logged_legacy`, **else** the customer's qualification expiry | `Installer not set on opportunity` / `Installer qualification certificate missing` / `… expired` |
 | 3 | Public Liability | `custbody_installer_pl_logged_legacy`, **else** the customer's PL expiry | `Installer not set on opportunity` / `Public Liability certificate missing` / `… expired` |
 | 4 | DNO | `custbody38` **on the opportunity** in `getDnoOkValues()` — blank or absent fails. **No legacy path exists** | `Awaiting DNO` |
+| 5 | BUS voucher | `custbody_bus_project_rhi_intended` = `getBusNoValue()` (condition does not apply), **else** `custbody_voucher_approval_date` non-blank. **No legacy path exists** | `BUS intention not confirmed` / `Awaiting BUS voucher approval` |
 
 **`Installer not set on opportunity` is de-duplicated.** Conditions 2 and 3 raise it
 independently, and one missing installer is one problem to fix — saying so twice reads as two.
@@ -248,6 +256,42 @@ order.
 sales order linked to that opportunity — including any order added later.** That is intended, not
 a leak: the flags record that the work was verified under the old process, and the opportunity is
 the unit that process operated on. Do not later read it as a bug and scope it per order.
+
+### The BUS voucher condition
+
+Heat pump orders must not be shippable until the Boiler Upgrade Scheme voucher has been approved,
+where the project is intended for BUS. Both fields are **on the OPPORTUNITY** and are read once
+per save through `effectiveValue()`, alongside the DNO status and the legacy flags — never per
+order.
+
+| Field | Script ID | Type |
+|---|---|---|
+| Voucher approval date | `custbody_voucher_approval_date` | Date |
+| Intended for BUS | `custbody_bus_project_rhi_intended` | List → `customlist92` (*YesNo*) |
+
+The rule, evaluated inside the certificate gate and **only** there:
+
+1. `custbody_bus_project_rhi_intended` equals `getBusNoValue()` → **the condition does not
+   apply**, passes with no check.
+2. Otherwise `custbody_voucher_approval_date` is not blank → **passes**.
+3. Otherwise the intention is **blank** → not ready, `BUS intention not confirmed`.
+4. Otherwise → not ready, `Awaiting BUS voucher approval`.
+
+**Blank is deliberately treated as "intended" and holds the order.** A project that should have
+claimed a voucher and shipped without one cannot claim it retrospectively, so the safe direction
+is to hold and ask.
+
+**The two failure reasons are deliberately different and must not be merged.** One is a missing
+answer, the other is a genuine wait, and they are actioned by different people.
+
+**There is no legacy path, and there is no legacy field to build one from.** The BUS scheme
+postdates the old process entirely; the three legacy flags say nothing about a voucher and must
+not be wired in here.
+
+**The empty-parameter guard is load-bearing.** `getBusNoValue()` returns `''` when unset, and a
+blank intention normalises to `''` too. A bare equality test would match the two and switch the
+condition **off** for every order — turning a parameter that is supposed to fail closed into one
+that ships goods. The comparison therefore requires a non-empty parameter first. See section 5.
 
 #### The presence test
 
@@ -471,7 +515,7 @@ Agreed mapping, seven rows, **by name**:
 
 - **Design Cancelled is a one-way door**, and readiness freezes with it. See section 6.
 
-- **Six of the seven parameters throw when unset. One does not. The rule is not importance —
+- **Six of the eight parameters throw when unset. Two do not. The rule is not importance —
   it is what EMPTY MEANS.**
 
   Ask of each parameter: if it is empty, does the script do *less*, or does it do *more*?
@@ -485,6 +529,7 @@ Agreed mapping, seven rows, **by name**:
   | `custscript_opsync_dno_ok_values` | **Every certificate-gated order reports *Awaiting DNO*** | **Fails open → throws** |
   | `custscript_opsync_cust_qual_field` | **Certificates cannot be read at all**, so they read as missing and every gated order is held | **Fails open → throws** |
   | `custscript_opsync_cust_pl_field` | As above | **Fails open → throws** |
+  | `custscript_opsync_bus_no_value` | **No** value is recognised as *not intended for BUS*, so the BUS condition applies to everything — orders are held, never shipped | **Fails closed** — logs at error, returns `''` |
 
   The excluded list is the one that matters most and the one most easily got wrong, because it
   reads like a safety mechanism and an empty safety mechanism looks harmless. It is not: an empty
@@ -497,6 +542,16 @@ Agreed mapping, seven rows, **by name**:
   outer handler and logged as `OPPSYNC_FAILED`; the opportunity still saves.
 
   **When adding a parameter, apply the same test.** If empty removes a restriction, it throws.
+
+  `custscript_opsync_bus_no_value` is the worked example. It *sounds* required — without it the
+  BUS condition cannot tell a "No" from anything else — but empty makes the script do **more**,
+  not less: the condition applies to every certificate-gated order and the worst case is an order
+  held until somebody reads the log. Throwing would abandon the whole sync, status and ship date
+  included, over a parameter whose absence is already safe. So it logs at error and returns `''`.
+
+  **Its empty return has to be handled at the comparison, and is.** A blank intention normalises
+  to `''` as well, so `evaluateReadiness()` checks the parameter is non-empty *before* comparing.
+  Without that guard the fail-closed parameter would fail wide open on every order.
 
 - **Date ordering is numeric, not string.** `asDateKey()` is for equality only. Its output is a
   localised `dd/mm/yyyy` string, and comparing those with `<` or `>` orders them alphabetically —
@@ -544,6 +599,15 @@ Agreed mapping, seven rows, **by name**:
   `asSelectId()` accepts an array, a `{value}` object, a string, a number or empty. **It is not
   a substitute for knowing which record a field is on** — no normaliser can fix a field that
   returns blank because it does not apply to the record being asked. See trap 6.
+
+- **The certificate gate is the definition of a heat pump project, and there must be only one.**
+  `custrecord_qt_requires_installer_certs` already decides it, so the BUS voucher condition lives
+  inside that gate rather than testing a field of its own. Do not introduce
+  `custbody_value_proposition` to "confirm" it: the physical product decides these rules, not the
+  commercial package, and two definitions of "heat pump" in the same rule are free to disagree.
+
+- **The BUS voucher has no legacy path and cannot acquire one.** The scheme postdates the old
+  process, so no legacy BUS field exists. Setting all three legacy flags does not satisfy it.
 
 - **Legacy evidence is an OR, not an AND**, carries no expiry, and lives on the **opportunity**.
   See section 4 — including why its presence test is not `isEmpty()`, and why satisfying every
@@ -799,6 +863,24 @@ screen and a failure in the notes.
 | 67 | Multi-order opportunity, `custbody38` acceptable | The DNO condition passes for **every** linked order from **one** read |
 | 68 | A select value arriving as `[{value:'2'}]` rather than `'2'` | Both tolerated — `asSelectId()` normalises either. `[]` reads as blank |
 
+### BUS voucher
+
+"Heat pump" below means a quote type with `custrecord_qt_requires_installer_certs` ticked — the
+certificate gate is the definition. Check `busNo=`, `rhiRaw=… -> …` and `voucherDate=` in
+`OPPSYNC_READINESS` on every one of these.
+
+| # | Scenario | Expected |
+|---|---|---|
+| 69 | Heat pump, RHI = *Yes*, voucher date present, all else passing | **Ready**, blank reason |
+| 70 | Heat pump, RHI = *Yes*, voucher date **blank** | Not ready, `Awaiting BUS voucher approval` |
+| 71 | Heat pump, RHI = *No*, voucher date blank, all else passing | **Ready** — the condition does not apply |
+| 72 | Heat pump, RHI **blank**, voucher date blank | Not ready, `BUS intention not confirmed`. A different reason from 70 on purpose — a missing answer, not a wait |
+| 73 | Heat pump, RHI blank, voucher date **present** | **Ready** — an approved voucher answers the question regardless |
+| 74 | Heat emitter / UFH quote type (certificates **not** required), RHI blank, voucher blank | **Ready** — the certificate gate does not run, so BUS is never reached |
+| 75 | Heat pump, design incomplete **and** voucher missing | Not ready, `Design not complete; Awaiting BUS voucher approval` — BUS is appended after DNO, and the design reason still comes first |
+| 76 | All three legacy flags set, RHI = *Yes*, voucher blank | **Not ready.** Legacy does not satisfy BUS — there is no legacy path and no legacy BUS field |
+| 77 | Clear `custscript_opsync_bus_no_value` and save a heat pump order at RHI = *No* | `OPPSYNC_PARAMETER_MISSING` at **error**, **no `OPPSYNC_FAILED`**, and the order is **held** — `Awaiting BUS voucher approval`. Empty applies the condition to everything; it does not throw. **Revert afterwards** |
+
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
 ---
@@ -827,6 +909,8 @@ back to `oldRecord` instead of reading a populated field as blank.
 | Legacy subcontract | `custbodysubcontract_received_legacy` | **Unconfirmed** — no underscore after `custbody` | `isLegacyPresent()` |
 | Legacy qualification | `custbody_installer_qual_logged_legacy` | **Unconfirmed** | `isLegacyPresent()` |
 | Legacy PL | `custbody_installer_pl_logged_legacy` | **Unconfirmed** | `isLegacyPresent()` |
+| **Voucher approval date** | `custbody_voucher_approval_date` | Date | `isEmpty()` — presence only, never parsed |
+| **Intended for BUS** | `custbody_bus_project_rhi_intended` | List → `customlist92` (*YesNo*) | `asSelectId()` |
 
 #### Read from the SALES ORDER — one `search.lookupFields` per order
 
@@ -903,9 +987,10 @@ Not code. These are account changes the scripts assume have been made.
 
 | # | Task | Why it matters |
 |---|---|---|
-| 1 | Define **seven** script parameters on the script record and set their values on the deployment, **in each environment** | Section 8, step 4. This now includes the mapping itself. An unset qualifying list or an unset mapping makes the feature completely inert, and the only sign is one error line in the log. |
+| 1 | Define **eight** script parameters on the script record and set their values on the deployment, **in each environment** | Section 8, step 4. This now includes the mapping itself and `custscript_opsync_bus_no_value`. An unset qualifying list or an unset mapping makes the feature completely inert, and the only sign is one error line in the log. |
 | 2 | Disable the `acs_ue_update_so.js` deployment when this one goes live | Section 8, step 6. Two writers of `custbody_finance_status`. |
 | 3 | Create the two checkboxes on the Quote Type record and tick them per quote type | Section 4. Until they exist every quote type reads as "design required, certificates not required" — orders will be gated on design alone. |
 | 4 | Set `custbody_ready_for_delivery` and `custbody_delivery_hold_reason` to **Inline Text** on all sales order forms | The script owns both fields. If users can edit them, their edits are silently overwritten on the next opportunity save. |
-| 5 | Confirm `customrecord16` and `custbody38` are those exact script IDs in **both** environments | Section 6. Auto-assigned ids carry no cross-account guarantee, and a wrong `custbody38` reads as blank — every order then reports *Awaiting DNO*. |
+| 5 | Confirm `customrecord16`, `custbody38` and `customlist92` are those exact script IDs in **both** environments | Section 6. Auto-assigned ids carry no cross-account guarantee, and a wrong `custbody38` reads as blank — every order then reports *Awaiting DNO*. A wrong `customlist92` means the *No* option id in `custscript_opsync_bus_no_value` matches nothing and every heat pump order is held for a voucher. |
+| 7 | Set `custscript_opsync_bus_no_value` to the `customlist92` **No** option id in each environment | Section 4. It is a list option internal id and differs by account. Unset, the BUS condition applies to every heat pump order — safe, but everything is held. |
 | 6 | Check `OPPSYNC_MAP_PARSED` in the log after the first save in each environment | Section 9, scenario 25. A hand-typed parameter of seven ID pairs is the most likely thing to be wrong, and this is the only place it becomes visible. |
