@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.1.0
+ * @version 1.2.0
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.1.0';
+    var VERSION = '1.2.0';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -45,6 +45,14 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * @type {number}
      */
     var GOVERNANCE_FLOOR_UNITS = 100;
+
+    /**
+     * Raised by the qualification condition and by the public liability condition independently.
+     * It is de-duplicated before the reasons are joined: one missing installer is one problem to
+     * fix, and saying so twice reads as two.
+     * @type {string}
+     */
+    var INSTALLER_NOT_SET = 'Installer not set on opportunity';
 
     /**
      * Upper bound on the orders read for one opportunity. An opportunity legitimately has
@@ -218,29 +226,59 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
     }
 
     /**
-     * Appends a certificate expiry failure, if there is one.
+     * Tests a certificate expiry date from the CUSTOMER record.
      *
      * Blank and expired are different failures and are reported differently, because they need
-     * different actions: a blank field means nobody has recorded the certificate, an expired one
+     * different actions: a blank field means nobody recorded the certificate, an expired one
      * means it needs renewing.
      *
-     * @param {string[]} reasons - appended to in place
      * @param {string} rawDate - the value as lookupFields returned it
      * @param {number} today
      * @param {string} label - e.g. 'Installer qualification certificate'
+     * @returns {string} '' when the certificate is valid, else the failure reason
      */
-    function checkExpiry(reasons, rawDate, today, label) {
+    function expiryFailure(rawDate, today, label) {
         var day = asDayNumber(parseLookupDate(rawDate));
 
         if (day === null) {
-            reasons.push(label + ' missing');
-            return;
+            return label + ' missing';
         }
 
         // On or after today passes. A certificate expiring today is still valid.
-        if (day < today) {
-            reasons.push(label + ' expired');
+        return day < today ? (label + ' expired') : '';
+    }
+
+    /**
+     * Resolves one certificate condition — qualification or public liability.
+     *
+     * The legacy evidence field wins outright. It is an OR, not an AND: an order whose legacy
+     * flag is set is satisfied even if the modern certificate on the customer record has
+     * expired, because the legacy flag records that the evidence was verified under the old
+     * process and there is nothing to re-check.
+     *
+     * Only when there is no legacy evidence does the modern path matter, and only then does a
+     * missing installer become a problem — which is why "installer not set" is no longer a
+     * standalone check. An order satisfied entirely by legacy fields does not need an installer
+     * at all.
+     *
+     * @param {string} legacyValue - the legacy evidence field from the sales order
+     * @param {string} installerId
+     * @param {string} rawExpiry - the expiry from the customer record
+     * @param {number} today
+     * @param {string} label
+     * @returns {Object} { reason: string, path: string } — reason '' when satisfied
+     */
+    function resolveCertificate(legacyValue, installerId, rawExpiry, today, label) {
+        if (!isEmpty(legacyValue)) {
+            return { reason: '', path: 'legacy' };
         }
+
+        if (isEmpty(installerId)) {
+            return { reason: INSTALLER_NOT_SET, path: 'no installer' };
+        }
+
+        var failure = expiryFailure(rawExpiry, today, label);
+        return { reason: failure, path: failure === '' ? 'modern' : 'modern fail' };
     }
 
     /**
@@ -411,49 +449,97 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * order had on entry — the design gate is asking "will this order be far enough along once
      * this save lands", not "was it before".
      *
-     * @param {Object} order - { quoteTypeId, subcontractReceived, dnoStatus }
+     * Each certificate condition has a LEGACY path — see resolveCertificate and the note on
+     * the legacy constants in opsync_lib_config.js. Legacy evidence satisfies its condition
+     * outright, so an order verified under the old process is ready even with a blank installer.
+     *
+     * @param {Object} order - { quoteTypeId, subcontractReceived, dnoStatus, subcontractLegacy,
+     *                           qualLegacy, plLegacy }
      * @param {string} decidedStatus - the Record Status this save will write
      * @param {Object} ctx - the per-opportunity readiness context
-     * @returns {Object} { ready: boolean, reason: string }
+     * @returns {Object} { ready: boolean, reason: string, paths: Object }
      */
     function evaluateReadiness(order, decidedStatus, ctx) {
         var gates = getQuoteTypeGates(order.quoteTypeId, ctx.quoteTypeCache);
         var reasons = [];
+        var paths = {};
+        var qual;
+        var pl;
 
         // (b) Design gate.
         if (!gates.noDesignRequired && !contains(decidedStatus, ctx.designOkStatuses)) {
             reasons.push('Design not complete');
         }
 
-        // (c) Certificate gate.
+        // (c) Certificate gate. Three conditions evaluated INDEPENDENTLY, each with its own
+        //     legacy path, plus DNO which has none.
         if (gates.requiresCerts) {
-            if (isEmpty(ctx.installerId)) {
-                // The two expiry checks are deliberately SKIPPED here rather than reported as
-                // missing. With no installer there is no certificate to be missing, and three
-                // reasons for one root cause reads as three problems to fix.
-                reasons.push('Installer not set on opportunity');
-            }
 
-            if (isEmpty(order.subcontractReceived)) {
+            // 1. Subcontract. Either field satisfies it.
+            if (!isEmpty(order.subcontractReceived)) {
+                paths.subcontract = 'modern';
+            } else if (!isEmpty(order.subcontractLegacy)) {
+                paths.subcontract = 'legacy';
+            } else {
+                paths.subcontract = 'fail';
                 reasons.push('Subcontract agreement not received');
             }
 
-            if (!isEmpty(ctx.installerId)) {
-                checkExpiry(reasons, ctx.qualExpiry, ctx.today,
-                    'Installer qualification certificate');
-                checkExpiry(reasons, ctx.plExpiry, ctx.today, 'Public Liability certificate');
+            // 2. Installer qualification.
+            qual = resolveCertificate(order.qualLegacy, ctx.installerId, ctx.qualExpiry,
+                ctx.today, 'Installer qualification certificate');
+            paths.qualification = qual.path;
+            if (qual.reason !== '') {
+                reasons.push(qual.reason);
             }
 
-            // Blank or absent always fails — there is no "no news is good news" here.
-            if (!contains(order.dnoStatus, ctx.dnoOkValues)) {
+            // 3. Public liability.
+            pl = resolveCertificate(order.plLegacy, ctx.installerId, ctx.plExpiry,
+                ctx.today, 'Public Liability certificate');
+            paths.publicLiability = pl.path;
+            if (pl.reason !== '') {
+                // De-duplicate: both conditions raise the same reason when the installer is
+                // blank, and one missing installer is one problem to fix.
+                if (pl.reason !== INSTALLER_NOT_SET || qual.reason !== INSTALLER_NOT_SET) {
+                    reasons.push(pl.reason);
+                }
+            }
+
+            // 4. DNO. NO legacy equivalent exists, so there is no legacy path here. Blank or
+            //    absent always fails — there is no "no news is good news".
+            if (contains(order.dnoStatus, ctx.dnoOkValues)) {
+                paths.dno = 'modern';
+            } else {
+                paths.dno = 'fail';
                 reasons.push('Awaiting DNO');
             }
         }
 
         return {
             ready: reasons.length === 0,
-            reason: reasons.join('; ')
+            reason: reasons.join('; '),
+            paths: paths
         };
+    }
+
+    /**
+     * Renders the certificate paths for the log. Empty when the certificate gate did not apply.
+     *
+     * @param {Object} paths
+     * @returns {string}
+     */
+    function describePaths(paths) {
+        var parts = [];
+
+        if (!paths) {
+            return '(none)';
+        }
+
+        Object.keys(paths).forEach(function (key) {
+            parts.push(key + '=' + paths[key]);
+        });
+
+        return parts.length === 0 ? '(certificates not required)' : parts.join(' ');
     }
 
     /**
@@ -499,7 +585,10 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 opsyncConfig.SALES_ORDER_FIELDS.DELIVERY_HOLD_REASON,
                 opsyncConfig.SALES_ORDER_FIELDS.QUOTE_TYPE,
                 opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED,
-                opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS
+                opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS,
+                opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_LEGACY,
+                opsyncConfig.SALES_ORDER_FIELDS.QUAL_LOGGED_LEGACY,
+                opsyncConfig.SALES_ORDER_FIELDS.PL_LOGGED_LEGACY
             ]
         });
 
@@ -565,14 +654,24 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 subcontractReceived: opsyncConfig.lookupValue(
                     lookup, opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED),
                 dnoStatus: opsyncConfig.lookupValue(
-                    lookup, opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS)
+                    lookup, opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS),
+                subcontractLegacy: opsyncConfig.lookupValue(
+                    lookup, opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_LEGACY),
+                qualLegacy: opsyncConfig.lookupValue(
+                    lookup, opsyncConfig.SALES_ORDER_FIELDS.QUAL_LOGGED_LEGACY),
+                plLegacy: opsyncConfig.lookupValue(
+                    lookup, opsyncConfig.SALES_ORDER_FIELDS.PL_LOGGED_LEGACY)
             }, mappedStatusId, ctx);
 
+            // The paths matter as much as the verdict. When a legacy order comes up in a year
+            // and nobody remembers these fields exist, this line is the only thing that explains
+            // why an order with a blank installer is ready to ship.
             log.debug({
                 title: opsyncConfig.logKey('READINESS'),
                 details: 'Sales order ' + orderId + ', quote type ' +
                     (quoteTypeId || '(none)') + ', status ' + mappedStatusId + ', ready=' +
-                    verdict.ready + ', reason=' + (verdict.reason || '(none)')
+                    verdict.ready + ', reason=' + (verdict.reason || '(none)') +
+                    ', paths=' + describePaths(verdict.paths)
             });
 
             // Both fields are written together or not at all: a reason without its checkbox, or
@@ -742,18 +841,27 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             deliveryDateKey = asDateKey(deliveryDateRaw);
             deliveryDateValue = asDateForWrite(deliveryDateRaw);
 
-            // 4. Something relevant must have changed. On CREATE there is no oldRecord and
-            //    everything is new, so proceed. On XEDIT the effectiveValue fallback above means
-            //    a field absent from newRecord reads back as its old value and therefore
-            //    compares equal — absence of both fields is correctly read as "neither changed".
-            if (context.type !== context.UserEventType.CREATE) {
-                if (subStatus === asId(readField(
-                        oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.SUB_STATUS)) &&
-                    deliveryDateKey === asDateKey(readField(
-                        oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.DELIVERY_DATE))) {
-                    return;
-                }
-            }
+            // 4. NO "HAS THE SUB-STATUS CHANGED" SHORT-CIRCUIT. Deliberately removed in 1.2.0,
+            //    and it must not come back.
+            //
+            //    Phase 2 exited here when neither the sub-status nor the delivery date had moved
+            //    since oldRecord. That was correct while those two fields were the only inputs:
+            //    if neither changed, nothing downstream could have changed either.
+            //
+            //    Readiness broke that assumption. It depends on the installer, the two
+            //    certificate dates on the installer's CUSTOMER record, the subcontract date,
+            //    custbody38, the quote type and the legacy evidence fields — none of which the
+            //    sub-status knows anything about. Editing a won opportunity to populate the
+            //    installer left every linked order untouched, because the sub-status had not
+            //    moved.
+            //
+            //    So every save of a qualifying opportunity now evaluates readiness. The
+            //    "don't write when nothing changed" optimisation still holds, but it lives at
+            //    the VALUE level in syncSalesOrder(): each value is compared with what the order
+            //    already holds, unchanged ones are left out of the submitFields call, and an
+            //    order with nothing to change is not written at all. That is also what keeps the
+            //    feedback loop in docs/context.md section 0, trap 3 broken — the guard is the
+            //    value comparison, never the early exit.
 
             // 5. Resolve through the mapping. NEVER copy the raw sub-status across: the two lists
             //    share no ids and no values, and a raw copy writes a warehouse instruction. See

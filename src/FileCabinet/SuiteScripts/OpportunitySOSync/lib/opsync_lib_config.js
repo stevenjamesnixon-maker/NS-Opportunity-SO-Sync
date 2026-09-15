@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.2.1
+ * @version 1.3.0
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.2.1';
+    var VERSION = '1.3.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -138,7 +138,37 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          * NetSuite names a body field custbodyN when no id is chosen. See the note on
          * RECORD_TYPES.QUOTE_TYPE and docs/context.md section 6.
          */
-        DNO_STATUS: 'custbody38'
+        DNO_STATUS: 'custbody38',
+
+        /* --------------------------------------------------------------------------------------
+         * LEGACY EVIDENCE FIELDS
+         *
+         * Three fields carrying evidence recorded under the OLD process, before installers were
+         * logged as customer records. On those orders custbody_installer_ns may be blank while
+         * the evidence itself is present, so the modern path has nothing to read and the order
+         * would be held for an installer that was verified years ago.
+         *
+         * A legacy field is a PRESENCE test and nothing more. Non-blank means satisfied — a
+         * ticked checkbox, any date, any text. There is NO expiry comparison on a legacy field:
+         * the flag records that the evidence was verified under the old process, not when it
+         * runs out. A blank legacy field means nothing at all and fails nothing on its own; it
+         * simply leaves the modern path to answer.
+         *
+         * Do not "improve" these by parsing them as dates and checking expiry. The values are
+         * whatever the old process happened to record, and a failed parse would turn a satisfied
+         * legacy order into a held one.
+         * -------------------------------------------------------------------------------------- */
+
+        /**
+         * NOTE THE ID: custbody + subcontract, with NO underscore between them. That is the ID
+         * as it exists in the account. Never "correct" it — see docs/context.md section 0,
+         * trap 5. The corrected version does not exist and the failure is silent.
+         */
+        SUBCONTRACT_LEGACY: 'custbodysubcontract_received_legacy',
+        /** Presence satisfies the installer qualification condition outright. */
+        QUAL_LOGGED_LEGACY: 'custbody_installer_qual_logged_legacy',
+        /** Presence satisfies the public liability condition outright. */
+        PL_LOGGED_LEGACY: 'custbody_installer_pl_logged_legacy'
     };
 
     /**

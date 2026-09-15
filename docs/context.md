@@ -85,8 +85,8 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.2.1 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.1.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Shared config library | 1.3.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
+| Opportunity user event | 1.2.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -159,7 +159,7 @@ opportunity is actually saved.
 1. Type is CREATE, EDIT or XEDIT. Never DELETE.
 2. Read entitystatus from newRecord if present, otherwise from oldRecord.
 3. entitystatus is a qualifying status. Else exit.
-4. Sub-status or delivery date changed since oldRecord (CREATE: proceed). Else exit.
+4. NO "has the sub-status changed" exit. Every save of a qualifying opportunity proceeds.
 5. Resolve the sub-status to a Record Status through the mapping.
    No mapping -> log OPPSYNC_NO_MAPPING and stop. Never write an unmapped value.
 6. Find the sales orders: salesorder, filtered on the native opportunity field, mainline is T.
@@ -190,17 +190,49 @@ checked, it simply skips the design check.
 
 The certificate checks, in the order their reasons are joined:
 
-| Check | Failure reason |
-|---|---|
-| Installer set on the opportunity at all | `Installer not set on opportunity` |
-| `custbody_installer_subcontract_receive` not blank | `Subcontract agreement not received` |
-| Qualification expiry | `Installer qualification certificate missing` / `… expired` |
-| Public Liability expiry | `Public Liability certificate missing` / `… expired` |
-| `custbody38` in `getDnoOkValues()` — blank or absent fails | `Awaiting DNO` |
+Three conditions plus DNO, evaluated **independently**, each with a legacy path:
 
-**When the installer is not set, the two expiry checks are skipped rather than reported.** With
-no installer there is no certificate to be missing, and three reasons for one root cause reads as
-three separate problems to fix.
+| # | Condition | Satisfied by | Failure reason |
+|---|---|---|---|
+| 1 | Subcontract | `custbody_installer_subcontract_receive` **or** `custbodysubcontract_received_legacy` | `Subcontract agreement not received` |
+| 2 | Installer qualification | `custbody_installer_qual_logged_legacy`, **else** the customer's qualification expiry | `Installer not set on opportunity` / `Installer qualification certificate missing` / `… expired` |
+| 3 | Public Liability | `custbody_installer_pl_logged_legacy`, **else** the customer's PL expiry | `Installer not set on opportunity` / `Public Liability certificate missing` / `… expired` |
+| 4 | DNO | `custbody38` in `getDnoOkValues()` — blank or absent fails. **No legacy path exists** | `Awaiting DNO` |
+
+**`Installer not set on opportunity` is de-duplicated.** Conditions 2 and 3 raise it
+independently, and one missing installer is one problem to fix — saying so twice reads as two.
+
+**It is no longer a standalone check.** It is reached only when a modern path is actually
+needed: an order satisfied entirely by legacy evidence does not need an installer at all.
+
+### Legacy evidence fields
+
+Three fields carry evidence recorded under the **old process**, before installers were logged as
+customer records. On those orders `custbody_installer_ns` may be blank while the evidence itself
+is present — so without these the modern path has nothing to read and the order is held for an
+installer that was verified years ago.
+
+| Field | Satisfies |
+|---|---|
+| `custbodysubcontract_received_legacy` — **note: no underscore after `custbody`** | Subcontract |
+| `custbody_installer_qual_logged_legacy` | Installer qualification |
+| `custbody_installer_pl_logged_legacy` | Public Liability |
+
+**Legacy is a PRESENCE test and nothing more.** Non-blank means satisfied — a ticked checkbox,
+any date, any text. **There is no expiry comparison on a legacy field**: the flag records that
+the evidence was verified under the old process, not when it runs out. A blank legacy field means
+nothing at all and fails nothing on its own; it simply leaves the modern path to answer.
+
+**It is an OR, not an AND.** An order whose legacy flag is set is satisfied even when the modern
+certificate on the customer record has expired. That is deliberate — there is nothing to
+re-check.
+
+**Do not "improve" these by parsing them as dates and checking expiry.** The values are whatever
+the old process happened to record, and a failed parse would turn a satisfied legacy order into a
+held one.
+
+**An order satisfied entirely by legacy fields costs no customer lookup.** The per-opportunity
+lookup is skipped when the installer is blank, which is exactly the legacy case.
 
 **A blank quote type behaves as neither checkbox ticked** — the design gate applies, the
 certificate gate does not. That is the conservative reading: an order with no quote type still
@@ -413,6 +445,28 @@ Agreed mapping, seven rows, **by name**:
   on entry. The design gate asks "will this order be far enough along once this save lands", not
   "was it before".
 
+- **There is no "has the sub-status changed" short-circuit, and it must not come back.**
+  Phase 2 exited early when neither the sub-status nor the delivery date had moved since
+  `oldRecord`. That was correct while those two fields were the only inputs: if neither changed,
+  nothing downstream could have changed either.
+
+  Readiness broke that assumption. It depends on the installer, the two certificate dates on the
+  installer's **customer** record, the subcontract date, `custbody38`, the quote type and the
+  legacy evidence fields — **none of which the sub-status knows anything about**. The symptom was
+  precise: editing a won opportunity to populate the installer left every linked sales order
+  untouched, with nothing in the log to say why.
+
+  Every save of a qualifying opportunity now evaluates readiness. **The optimisation did not go
+  away, it moved down a level** — `syncSalesOrder()` compares each value against what the order
+  already holds, leaves the unchanged ones out of the `submitFields` call, and makes no call at
+  all for an order with nothing to change. That value comparison is also what keeps the feedback
+  loop in section 0 trap 3 broken; the early exit was never what protected it.
+
+  The cost is real and accepted: every save of a won opportunity now runs the order search and
+  one `lookupFields` per order, where before an unchanged sub-status cost nothing.
+
+- **Legacy evidence is an OR, not an AND**, and carries no expiry. See section 4.
+
 - **Guard every array access on a lookup result.** The predecessor script read
   `lookupFields(...).custbody_finance_status[0].value` with no guard. `lookupFields` returns an
   empty array for an empty list field, so `[0]` is `undefined` and `.value` throws. Every sales
@@ -487,7 +541,7 @@ drift between scripts.
 | `OPPSYNC_MAP_PARSED` | debug | The mapping as actually parsed, one line of `key -> value` pairs. Normal operation. | Nothing. With Log Level on Debug this is how a typo is spotted by eye rather than inferred from an order that did not sync. |
 | `OPPSYNC_ORDER_FAILED` | error | One sales order threw while being read or written. **The remaining orders were still processed.** | Read the logged error against the named order. Usually a locked or deleted order, or a permission problem on the executing role. |
 | `OPPSYNC_GOVERNANCE_STOP` | error | The loop stopped with governance running low, naming how many orders were done and which were not reached. | Re-save the opportunity to pick up the rest. If it recurs, the opportunity has more orders than this design anticipated — see section 6. |
-| `OPPSYNC_READINESS` | debug | One line per sales order: order, quote type, decided status, ready true/false and the reason. Normal operation. | Nothing. This is the first place to look when an order's readiness is not what was expected — it names which gate spoke. |
+| `OPPSYNC_READINESS` | debug | One line per sales order: order, quote type, decided status, ready true/false, the reason, **and which path satisfied each certificate condition** — `modern`, `legacy`, `no installer` or `fail`. Normal operation. | Nothing. This is the first place to look when an order's readiness is not what was expected. **The paths are the only record of why an order with a blank installer is ready to ship** — when a legacy order surfaces in a year and nobody remembers these fields exist, this line is the explanation. |
 | `OPPSYNC_READINESS_NOT_APPLICABLE` | debug | The status this save wrote is in the excluded list, so readiness was **not evaluated** and both fields were left as they were. Normal operation. | Nothing. Note the readiness values shown are now frozen — see section 6. |
 | `OPPSYNC_QUOTE_TYPE_UNREADABLE` | error | A quote type record could not be read. Treated as **design-required, certificates not required** — the strictest reading of the design gate. | Check the quote type record exists and the executing role can read it. Until then those orders are gated on design. |
 | `OPPSYNC_INSTALLER_UNREADABLE` | error | The installer customer record could not be read for the two certificate fields. **Both certificates read as missing**, so the order is held. | Check the customer record and the two field ids in the parameters. The held order is the safe outcome, not the bug. |
@@ -549,7 +603,11 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    appearing twice (that is the `OPPSYNC_MAP_AMBIGUOUS` case) and no typos (that is
    `OPPSYNC_MAP_INVALID_ENTRY`). There is **no field to create on `customrecord_fin_stat`** and
    no data to populate on the Record Status records; see section 5.
-6. **Disable the old `acs_ue_update_so.js` deployment.** The two must not both run. Two writers
+6. Confirm the three **legacy evidence fields** exist on the sales order with exactly these
+   IDs — `custbodysubcontract_received_legacy` (**no underscore after `custbody`**),
+   `custbody_installer_qual_logged_legacy`, `custbody_installer_pl_logged_legacy`. A wrong ID
+   reads as blank, which silently removes the legacy path and holds every legacy order.
+7. **Disable the old `acs_ue_update_so.js` deployment.** The two must not both run. Two writers
    of `custbody_finance_status` means an ordering question nobody can answer from the logs.
 
 Shared AMD modules need no script record and no deployment record — a File Cabinet upload is
@@ -621,6 +679,14 @@ screen and a failure in the notes.
 | 42 | **Both** checkboxes ticked, status not design-ok, PL expired | Not ready, **PL reason only** — no design reason |
 | 43 | Non-excluded entry status, sub-status maps it **onto an excluded status** | Status and ship date written; **both readiness fields untouched** at whatever they held. `OPPSYNC_READINESS_NOT_APPLICABLE` at debug |
 | 44 | Status and ship date both unchanged, but a certificate has expired since the last save | **The write still happens**, carrying only the two readiness fields |
+| 47 | Won opportunity, **sub-status unchanged**, installer added | Readiness **re-evaluated and written**. This is the Phase 3a defect — a no-op here means the short-circuit is back |
+| 48 | Won opportunity, sub-status unchanged, **nothing** else changed | Evaluated, **no writes**. `OPPSYNC_ORDER_UNCHANGED` at debug |
+| 49 | Installer **blank**, all three legacy fields populated, design ok, DNO ok | **Ready**, blank reason — and **no customer lookup performed**. Check `paths=…legacy` in `OPPSYNC_READINESS` |
+| 50 | Installer blank, **only the PL legacy** field populated | Not ready. `Installer not set on opportunity` **exactly once**, not twice |
+| 51 | Installer set with valid certificates, legacy fields **also** populated | **Ready.** Legacy is redundant here, not conflicting |
+| 52 | Installer set, qualification **expired**, qual legacy field populated | **Ready** — legacy wins. It is an OR, not an AND |
+| 53 | Legacy subcontract populated, modern subcontract blank, all else ok | **Ready** |
+| 54 | All legacy fields populated but `custbody38` blank | Not ready, `Awaiting DNO`. **There is no legacy path for DNO** |
 
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
@@ -645,6 +711,9 @@ Script IDs only — **no internal IDs**, here or anywhere else in this document.
 | Sales Order: quote type | `custbody_quote_type` | List/Record → Quote Type record | Steve | 2026-09-15 |
 | Sales Order: subcontract received | `custbody_installer_subcontract_receive` | — | Steve | 2026-09-15 |
 | Sales Order: DNO status | `custbody38` | **Auto-assigned** script ID — see section 6 | Steve | 2026-09-15 |
+| Sales Order: legacy subcontract | `custbodysubcontract_received_legacy` | **No underscore after `custbody`** — see §0 trap 5 | Steve | 2026-09-15 |
+| Sales Order: legacy qualification logged | `custbody_installer_qual_logged_legacy` | Presence test only | Steve | 2026-09-15 |
+| Sales Order: legacy PL logged | `custbody_installer_pl_logged_legacy` | Presence test only | Steve | 2026-09-15 |
 | Opportunity: installer | `custbody_installer_ns` | List/Record → Customer | Steve | 2026-09-15 |
 | Quote Type record | `customrecord16` | **Auto-assigned** script ID — see section 6 | Steve | 2026-09-15 |
 | Quote Type: can ship without design | `custrecord_qt_no_design_required` | Checkbox | Steve | 2026-09-15 |
