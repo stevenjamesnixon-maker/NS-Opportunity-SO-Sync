@@ -85,7 +85,7 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.2.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
+| Shared config library | 1.2.1 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
 | Opportunity user event | 1.1.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
@@ -370,19 +370,32 @@ Agreed mapping, seven rows, **by name**:
 
 - **Design Cancelled is a one-way door**, and readiness freezes with it. See section 6.
 
-- **The four readiness parameters THROW when unset; the two Phase 2 ones do not.**
-  `getQualifyingStatuses()` and `getExcludedStatuses()` log at error and return an empty array,
-  which is right for them: an empty qualifying list closes the gate and nothing happens.
+- **Six of the seven parameters throw when unset. One does not. The rule is not importance —
+  it is what EMPTY MEANS.**
 
-  That is the wrong behaviour for readiness. An empty design-ok list does not stop anything — it
-  makes every order fail the design gate, and the script then writes *"not ready, Design not
-  complete"* onto orders that are perfectly ready. A missing customer field id does the same
-  through the certificate gate. Returning empty would produce confidently wrong data on every
-  order of the opportunity, which is worse than doing nothing.
+  Ask of each parameter: if it is empty, does the script do *less*, or does it do *more*?
 
-  So those four throw, and they are resolved **before the sales order loop begins**, so a missing
-  one cannot leave some orders written and the rest not. The throw is caught by the entry point's
+  | Parameter | Empty means | Behaviour |
+  |---|---|---|
+  | `custscript_opsync_qualifying_statuses` | No opportunity qualifies. The gate never opens, nothing is written | **Fails closed** — logs at error, returns `[]` |
+  | `custscript_opsync_excluded_statuses` | **Nothing is excluded** — the script writes over orders at Release to Warehouse, Cancelled and Design Cancelled | **Fails open → throws** |
+  | `custscript_opsync_status_map` | Nothing resolves, so no order is touched | Fails closed — logs at error, returns `null` |
+  | `custscript_opsync_design_ok_statuses` | **No status satisfies the design gate** — every order stamped *"not ready, Design not complete"*, including ready ones | **Fails open → throws** |
+  | `custscript_opsync_dno_ok_values` | **Every certificate-gated order reports *Awaiting DNO*** | **Fails open → throws** |
+  | `custscript_opsync_cust_qual_field` | **Certificates cannot be read at all**, so they read as missing and every gated order is held | **Fails open → throws** |
+  | `custscript_opsync_cust_pl_field` | As above | **Fails open → throws** |
+
+  The excluded list is the one that matters most and the one most easily got wrong, because it
+  reads like a safety mechanism and an empty safety mechanism looks harmless. It is not: an empty
+  exclusion list does not protect nothing *by default*, it protects nothing *at all*, and the
+  orders it stops protecting are precisely the ones the parameter exists for. A warehouse
+  instruction written over a delivered order is not recoverable by re-saving.
+
+  Every throwing parameter is resolved **before the sales order loop begins**, so a missing one
+  cannot leave some orders written and the rest not. The throw is caught by the entry point's
   outer handler and logged as `OPPSYNC_FAILED`; the opportunity still saves.
+
+  **When adding a parameter, apply the same test.** If empty removes a restriction, it throws.
 
 - **Date ordering is numeric, not string.** `asDateKey()` is for equality only. Its output is a
   localised `dd/mm/yyyy` string, and comparing those with `<` or `>` orders them alphabetically —
@@ -479,7 +492,7 @@ drift between scripts.
 | `OPPSYNC_QUOTE_TYPE_UNREADABLE` | error | A quote type record could not be read. Treated as **design-required, certificates not required** — the strictest reading of the design gate. | Check the quote type record exists and the executing role can read it. Until then those orders are gated on design. |
 | `OPPSYNC_INSTALLER_UNREADABLE` | error | The installer customer record could not be read for the two certificate fields. **Both certificates read as missing**, so the order is held. | Check the customer record and the two field ids in the parameters. The held order is the safe outcome, not the bug. |
 | `OPPSYNC_SYNC_SUMMARY` | audit | One line per opportunity: how many orders were updated, unchanged and skipped, and the status written. Normal operation. | Nothing. Use it to read the log at the level of "what did this save do". |
-| `OPPSYNC_PARAMETER_MISSING` | error | A script parameter is unset, unreadable, or held nothing usable. Names the parameter. An empty **qualifying** list means the gate never opens; an empty **mapping** means nothing resolves. For the four **readiness** parameters this is also **thrown**, so the save is abandoned before any order is written — see section 5. | Populate the parameter on the deployment **in this account**; the values differ by environment. See section 8. |
+| `OPPSYNC_PARAMETER_MISSING` | error | A script parameter is unset, unreadable, or held nothing usable. Names the parameter. For the **qualifying** list and the **mapping** it is logged only and the script exits harmlessly. For the other five — **excluded statuses** and the four readiness parameters — it is also **thrown**, so the save is abandoned before any sales order is written. See the table in section 5 for why the two behaviours differ. | Populate the parameter on the deployment **in this account**; the values differ by environment. See section 8. |
 | `OPPSYNC_FAILED` | error | The entry point threw outside the per-order loop. **The opportunity still saved**; its orders may be out of step. | Read the logged error. Nothing in this feature may ever block an opportunity save, so a failure here is always silent to the user. |
 
 > **Reserved — no script raises these.** Kept so a future session grepping for them finds this
@@ -518,7 +531,7 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    | Label | ID | Type | What goes in it |
    |---|---|---|---|
    | Qualifying Opportunity Statuses | `custscript_opsync_qualifying_statuses` | Free-Form Text | A comma-separated list of the `entitystatus` internal IDs that open the gate, **as they are in this account**. Currently *Won* alone. |
-   | Excluded Record Statuses | `custscript_opsync_excluded_statuses` | Free-Form Text | A comma-separated list of the Record Status internal IDs that must never be overwritten — the statuses whose orders belong to the warehouse and finance processes, **plus Cancelled**. |
+   | Excluded Record Statuses | `custscript_opsync_excluded_statuses` | Free-Form Text | A comma-separated list of the Record Status internal IDs that must never be overwritten — the statuses whose orders belong to the warehouse and finance processes, **plus Cancelled**. **Required — the script throws without it**, because an empty list would protect nothing rather than protecting everything. |
    | Status Map | `custscript_opsync_status_map` | Free-Form Text | The mapping from section 4, as comma-separated `subStatusId:recordStatusId` pairs — seven of them, **using the internal IDs as they are in this account**. Read `OPPSYNC_MAP_PARSED` in the execution log after the first save to confirm it parsed as intended. |
    | Design OK Statuses | `custscript_opsync_design_ok_statuses` | Free-Form Text | Comma-separated Record Status IDs at which the design is far enough along to ship. **Required — the script throws without it.** |
    | DNO OK Values | `custscript_opsync_dno_ok_values` | Free-Form Text | Comma-separated `custbody38` values that satisfy the DNO check. Blank on the order always fails. **Required.** |
@@ -602,6 +615,8 @@ screen and a failure in the notes.
 | 38 | Opportunity with 3 orders, one at an excluded **entry** status | That one untouched; the other two evaluated |
 | 39 | The same opportunity saved twice with no change | **Zero `submitFields` calls** on the second save. Check the orders' system notes |
 | 40 | Any of the four readiness parameters unset | `OPPSYNC_PARAMETER_MISSING` at error, **no partial writes** — no order is written at all |
+| 45 | **`custscript_opsync_excluded_statuses` unset**, on an opportunity with several orders including one at an excluded status | `OPPSYNC_PARAMETER_MISSING` at error and `OPPSYNC_FAILED`. **No write to any linked sales order** — the protected orders are untouched rather than overwritten. Contrast with scenario 46. **Revert afterwards** |
+| 46 | **`custscript_opsync_qualifying_statuses`** unset | `OPPSYNC_PARAMETER_MISSING` at error, **no `OPPSYNC_FAILED`**, nothing written. The gate simply never opens — this one fails closed and does *not* throw. See section 5 |
 | 41 | **Both** checkboxes ticked, status not design-ok, certificates all valid | **Ready** — design skipped, certificates pass. Neither checkbox short-circuits the other |
 | 42 | **Both** checkboxes ticked, status not design-ok, PL expired | Not ready, **PL reason only** — no design reason |
 | 43 | Non-excluded entry status, sub-status maps it **onto an excluded status** | Status and ship date written; **both readiness fields untouched** at whatever they held. `OPPSYNC_READINESS_NOT_APPLICABLE` at debug |

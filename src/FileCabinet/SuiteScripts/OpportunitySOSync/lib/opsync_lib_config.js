@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.2.0
+ * @version 1.2.1
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.2.0';
+    var VERSION = '1.2.1';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -257,9 +257,12 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * Parses a comma-separated script parameter into an array of id strings.
      *
      * An empty or unparseable parameter is a CONFIGURATION ERROR, not a reason to proceed: it is
-     * logged at error and an empty array is returned. Both callers fail safe on an empty array —
-     * an empty qualifying list means the gate never opens, and an empty excluded list is
-     * reported by the caller rather than treated as "nothing is protected".
+     * logged at error and an empty array is returned.
+     *
+     * Its ONE remaining caller is getQualifyingStatuses(), where an empty array fails closed —
+     * the gate never opens and nothing is written. Do not reuse this for a parameter whose empty
+     * value removes a restriction; use requiredValueList() for those. See the block comment
+     * above getExcludedStatuses().
      *
      * @param {string} parameterId
      * @returns {string[]} ids, or [] when the parameter is missing or empty
@@ -323,32 +326,51 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
     /**
      * The Record Statuses that must never be overwritten, from the deployment's script parameter.
      *
+     * REQUIRED — this throws when unset. An empty exclusion list does not mean "protect nothing
+     * by default", it means protect nothing at all: the script would write status, ship date and
+     * readiness onto orders at Release to Warehouse, Cancelled and Design Cancelled, which are
+     * precisely the orders this parameter exists to protect. Returning an empty array would make
+     * the safety mechanism fail open. The throw lands before the sales order loop, so those
+     * orders are left untouched.
+     *
      * Design Cancelled maps to Cancelled and Cancelled is in this list, so an order that lands
      * there can never be moved again by this sync. That is a deliberate one-way door — see
      * docs/context.md section 6. Do not "fix" it by removing Cancelled from the parameter.
      *
-     * @returns {string[]} ids as strings, or [] when unset
+     * @returns {string[]} ids as strings, at least one
+     * @throws {Error} OPPSYNC_PARAMETER_MISSING when absent or empty
      */
     function getExcludedStatuses() {
-        return parseIdListParameter(PARAMETERS.EXCLUDED_STATUSES);
+        return requiredValueList(PARAMETERS.EXCLUDED_STATUSES);
     }
 
     /* ------------------------------------------------------------------------------------------
-     * REQUIRED PARAMETERS — THESE THROW, THE PHASE 2 ONES DO NOT
+     * REQUIRED PARAMETERS — SIX THROW, ONE DOES NOT
      *
-     * getQualifyingStatuses() and getExcludedStatuses() log at error and return an empty array.
-     * That is right for them: an empty qualifying list closes the gate and the script does
-     * nothing, which is the safe outcome.
+     * The test is not "how important is this parameter". It is: WHAT DOES EMPTY MEAN?
      *
-     * It is the WRONG behaviour for the four readiness parameters. An empty design-ok list does
-     * not stop anything — it makes every order fail the design gate, and the script then writes
-     * "not ready, Design not complete" onto orders that are perfectly ready. A missing customer
-     * field id does the same through the certificate gate. Returning empty would produce
-     * confidently wrong data across every sales order on the opportunity.
+     * For getQualifyingStatuses(), empty means no opportunity qualifies. The gate never opens,
+     * the script does nothing, and no sales order is touched. Empty fails CLOSED, so it logs at
+     * error and returns an empty array. That one stays as it is.
      *
-     * So these four THROW, and they are resolved BEFORE the sales order loop begins, so that a
-     * missing one cannot leave some orders written and the rest not. The throw is caught by the
-     * entry point's outer handler and logged as OPPSYNC_FAILED; the opportunity still saves.
+     * For every other parameter, empty fails OPEN — it removes a restriction rather than
+     * applying one:
+     *
+     *   EXCLUDED_STATUSES   empty means nothing is excluded, so the script writes over orders at
+     *                       Release to Warehouse, Cancelled and Design Cancelled — exactly the
+     *                       orders the parameter exists to protect.
+     *   DESIGN_OK_STATUSES  empty means no status satisfies the design gate, so every order is
+     *                       stamped "not ready, Design not complete" including ones that are
+     *                       perfectly ready.
+     *   DNO_OK_VALUES       likewise: every certificate-gated order reports Awaiting DNO.
+     *   CUSTOMER_*_FIELD    empty means the certificate dates cannot be read at all, so they
+     *                       read as missing and every gated order is held.
+     *
+     * In each of those, returning an empty array produces confidently wrong data on every sales
+     * order of the opportunity — which is worse than doing nothing. So they THROW, and they are
+     * resolved BEFORE the sales order loop begins, so a missing one cannot leave some orders
+     * written and the rest not. The throw is caught by the entry point's outer handler and
+     * logged as OPPSYNC_FAILED; the opportunity still saves.
      * ------------------------------------------------------------------------------------------ */
 
     /**
