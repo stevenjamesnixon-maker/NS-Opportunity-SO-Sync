@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.1.0
+ * @version 1.2.0
  */
-define(['N/runtime', 'N/log'], function (runtime, log) {
+define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.1.0';
+    var VERSION = '1.2.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -70,7 +70,17 @@ define(['N/runtime', 'N/log'], function (runtime, log) {
          * still exists in NetSuite and is still what custbody_finance_status points at; this
          * code simply never loads it.
          */
-        SALES_ORDER: 'salesorder'
+        SALES_ORDER: 'salesorder',
+        /**
+         * The Quote Type list record, pointed at by the sales order's custbody_quote_type.
+         * Carries the two checkboxes that decide which readiness gates apply.
+         *
+         * "customrecord16" is an auto-assigned SCRIPT ID, not an internal id — NetSuite names a
+         * custom record customrecordN when the developer does not choose an id. It is committable
+         * on that basis, but see docs/context.md section 6: an auto-assigned id is only stable
+         * across accounts if the record travelled between them, and it must be confirmed in each.
+         */
+        QUOTE_TYPE: 'customrecord16'
     };
 
     /**
@@ -83,7 +93,14 @@ define(['N/runtime', 'N/log'], function (runtime, log) {
         /** List sourcing customlist_opp_sub_status_list. The design stage. */
         SUB_STATUS: 'custbody_opportunity_sub_status',
         /** Date. Copied directly to the order's expected ship date. */
-        DELIVERY_DATE: 'custbody_opp_del_date'
+        DELIVERY_DATE: 'custbody_opp_del_date',
+        /**
+         * List/Record -> Customer. The installer whose certificates gate delivery readiness.
+         * The certificate dates are NOT read from here — the equivalent opportunity fields are
+         * unstored sourced fields and cannot be searched. The script goes to the customer record
+         * this points at. See getCustomerQualField() and getCustomerPlField().
+         */
+        INSTALLER: 'custbody_installer_ns'
     };
 
     /**
@@ -101,11 +118,45 @@ define(['N/runtime', 'N/log'], function (runtime, log) {
          */
         OPPORTUNITY_LINK: 'opportunity',
         /** Native search filter. Body-level rows only, so each order is returned once. */
-        MAINLINE: 'mainline'
+        MAINLINE: 'mainline',
+        /**
+         * Checkbox. Is this order available to ship. Written by this script and nothing else;
+         * Inline Text on the forms so users cannot edit it.
+         */
+        READY_FOR_DELIVERY: 'custbody_ready_for_delivery',
+        /**
+         * Long text. Why the order is not ready, blank when it is. Written alongside
+         * READY_FOR_DELIVERY and never on its own.
+         */
+        DELIVERY_HOLD_REASON: 'custbody_delivery_hold_reason',
+        /** List/Record -> the Quote Type record. Decides which readiness gates apply. */
+        QUOTE_TYPE: 'custbody_quote_type',
+        /** Must not be blank before an order needing installer certificates is ready. */
+        SUBCONTRACT_RECEIVED: 'custbody_installer_subcontract_receive',
+        /**
+         * The DNO status. "custbody38" is an auto-assigned SCRIPT ID, not an internal id —
+         * NetSuite names a body field custbodyN when no id is chosen. See the note on
+         * RECORD_TYPES.QUOTE_TYPE and docs/context.md section 6.
+         */
+        DNO_STATUS: 'custbody38'
     };
 
     /**
-     * Script parameter IDs. All three are set on the DEPLOYMENT, so Sandbox and Production
+     * Checkbox script IDs on the Quote Type record.
+     *
+     * The two gates are INDEPENDENT. Neither checkbox short-circuits the other: a quote type
+     * with both ticked still has its certificates checked, it simply skips the design check.
+     * @type {Object}
+     */
+    var QUOTE_TYPE_FIELDS = {
+        /** Checkbox "Can ship without design". Ticked, the design gate passes with no check. */
+        NO_DESIGN_REQUIRED: 'custrecord_qt_no_design_required',
+        /** Checkbox "Requires installer certificates". Unticked, the certificate gate passes. */
+        REQUIRES_INSTALLER_CERTS: 'custrecord_qt_requires_installer_certs'
+    };
+
+    /**
+     * Script parameter IDs. All seven are set on the DEPLOYMENT, so Sandbox and Production
      * carry their own values and no internal id appears in code. See docs/context.md section 8.
      * @type {Object}
      */
@@ -119,7 +170,23 @@ define(['N/runtime', 'N/log'], function (runtime, log) {
          * subStatusId:recordStatusId pairs. See parseStatusMap() for the format and the
          * handling of malformed and duplicate entries.
          */
-        STATUS_MAP: 'custscript_opsync_status_map'
+        STATUS_MAP: 'custscript_opsync_status_map',
+        /** Free-Form Text. Comma-separated Record Status ids that satisfy the design gate. */
+        DESIGN_OK_STATUSES: 'custscript_opsync_design_ok_statuses',
+        /** Free-Form Text. Comma-separated custbody38 values that satisfy the DNO check. */
+        DNO_OK_VALUES: 'custscript_opsync_dno_ok_values',
+        /**
+         * Free-Form Text. The SCRIPT ID of the installer qualification expiry date field on the
+         * CUSTOMER record.
+         *
+         * A parameter rather than a constant because the equivalent field on the opportunity is
+         * an unstored sourced field and cannot be read by a search — the script has to go to the
+         * customer record that custbody_installer_ns points at, and which field that is has to
+         * be configurable per account.
+         */
+        CUSTOMER_QUAL_FIELD: 'custscript_opsync_cust_qual_field',
+        /** Free-Form Text. The SCRIPT ID of the Public Liability expiry date field. As above. */
+        CUSTOMER_PL_FIELD: 'custscript_opsync_cust_pl_field'
     };
 
     /* ------------------------------------------------------------------------------------------
@@ -264,6 +331,141 @@ define(['N/runtime', 'N/log'], function (runtime, log) {
      */
     function getExcludedStatuses() {
         return parseIdListParameter(PARAMETERS.EXCLUDED_STATUSES);
+    }
+
+    /* ------------------------------------------------------------------------------------------
+     * REQUIRED PARAMETERS — THESE THROW, THE PHASE 2 ONES DO NOT
+     *
+     * getQualifyingStatuses() and getExcludedStatuses() log at error and return an empty array.
+     * That is right for them: an empty qualifying list closes the gate and the script does
+     * nothing, which is the safe outcome.
+     *
+     * It is the WRONG behaviour for the four readiness parameters. An empty design-ok list does
+     * not stop anything — it makes every order fail the design gate, and the script then writes
+     * "not ready, Design not complete" onto orders that are perfectly ready. A missing customer
+     * field id does the same through the certificate gate. Returning empty would produce
+     * confidently wrong data across every sales order on the opportunity.
+     *
+     * So these four THROW, and they are resolved BEFORE the sales order loop begins, so that a
+     * missing one cannot leave some orders written and the rest not. The throw is caught by the
+     * entry point's outer handler and logged as OPPSYNC_FAILED; the opportunity still saves.
+     * ------------------------------------------------------------------------------------------ */
+
+    /**
+     * Reads a parameter that must be present, throwing when it is not.
+     *
+     * @param {string} parameterId
+     * @returns {string} the trimmed raw value
+     * @throws {Error} OPPSYNC_PARAMETER_MISSING when absent or empty
+     */
+    function requiredParameter(parameterId) {
+        var raw;
+        var trimmed;
+
+        try {
+            raw = runtime.getCurrentScript().getParameter({ name: parameterId });
+        } catch (e) {
+            raw = null;
+        }
+
+        trimmed = (raw === null || raw === undefined) ? '' : String(raw).replace(/^\s+|\s+$/g, '');
+
+        if (trimmed === '') {
+            log.error({
+                title: logKey('PARAMETER_MISSING'),
+                details: 'Required script parameter ' + parameterId + ' is not set. Delivery ' +
+                    'readiness cannot be evaluated without it, and guessing would write a ' +
+                    'confidently wrong readiness onto every sales order on this opportunity. ' +
+                    'Nothing was written. Populate it on the deployment in this account — its ' +
+                    'value differs by environment. See docs/context.md section 8.'
+            });
+            throw error.create({
+                name: logKey('PARAMETER_MISSING'),
+                message: 'Required script parameter ' + parameterId + ' is not set.',
+                notifyOff: true
+            });
+        }
+
+        return trimmed;
+    }
+
+    /**
+     * Reads a required comma-separated parameter as an array of trimmed values.
+     *
+     * Unlike parseIdListParameter() these are not necessarily numeric — getDnoOkValues() may
+     * hold list option ids or stored text, depending on how custbody38 is built in the account.
+     * They are compared as strings either way.
+     *
+     * @param {string} parameterId
+     * @returns {string[]} at least one entry
+     * @throws {Error} OPPSYNC_PARAMETER_MISSING when absent, empty, or holding nothing usable
+     */
+    function requiredValueList(parameterId) {
+        var parts = requiredParameter(parameterId).split(',');
+        var values = [];
+        var i;
+        var trimmed;
+
+        for (i = 0; i < parts.length; i += 1) {
+            trimmed = parts[i].replace(/^\s+|\s+$/g, '');
+            if (trimmed !== '') {
+                values.push(trimmed);
+            }
+        }
+
+        if (values.length === 0) {
+            log.error({
+                title: logKey('PARAMETER_MISSING'),
+                details: 'Required script parameter ' + parameterId + ' held no usable values.'
+            });
+            throw error.create({
+                name: logKey('PARAMETER_MISSING'),
+                message: 'Required script parameter ' + parameterId + ' held no usable values.',
+                notifyOff: true
+            });
+        }
+
+        return values;
+    }
+
+    /**
+     * Record Statuses that satisfy the design gate — the design is far enough along to ship.
+     *
+     * @returns {string[]}
+     * @throws {Error} OPPSYNC_PARAMETER_MISSING
+     */
+    function getDesignOkStatuses() {
+        return requiredValueList(PARAMETERS.DESIGN_OK_STATUSES);
+    }
+
+    /**
+     * custbody38 values that satisfy the DNO check. Blank or absent on the order always fails.
+     *
+     * @returns {string[]}
+     * @throws {Error} OPPSYNC_PARAMETER_MISSING
+     */
+    function getDnoOkValues() {
+        return requiredValueList(PARAMETERS.DNO_OK_VALUES);
+    }
+
+    /**
+     * Script ID of the installer qualification expiry date field on the CUSTOMER record.
+     *
+     * @returns {string}
+     * @throws {Error} OPPSYNC_PARAMETER_MISSING
+     */
+    function getCustomerQualField() {
+        return requiredParameter(PARAMETERS.CUSTOMER_QUAL_FIELD);
+    }
+
+    /**
+     * Script ID of the Public Liability expiry date field on the CUSTOMER record.
+     *
+     * @returns {string}
+     * @throws {Error} OPPSYNC_PARAMETER_MISSING
+     */
+    function getCustomerPlField() {
+        return requiredParameter(PARAMETERS.CUSTOMER_PL_FIELD);
     }
 
     /**
@@ -434,6 +636,7 @@ define(['N/runtime', 'N/log'], function (runtime, log) {
         VERSION: VERSION,
         LOG_PREFIX: LOG_PREFIX,
         RECORD_TYPES: RECORD_TYPES,
+        QUOTE_TYPE_FIELDS: QUOTE_TYPE_FIELDS,
         OPPORTUNITY_FIELDS: OPPORTUNITY_FIELDS,
         SALES_ORDER_FIELDS: SALES_ORDER_FIELDS,
         PARAMETERS: PARAMETERS,
@@ -441,6 +644,10 @@ define(['N/runtime', 'N/log'], function (runtime, log) {
         lookupValue: lookupValue,
         getQualifyingStatuses: getQualifyingStatuses,
         getExcludedStatuses: getExcludedStatuses,
+        getDesignOkStatuses: getDesignOkStatuses,
+        getDnoOkValues: getDnoOkValues,
+        getCustomerQualField: getCustomerQualField,
+        getCustomerPlField: getCustomerPlField,
         getMappedStatus: getMappedStatus
     };
 });

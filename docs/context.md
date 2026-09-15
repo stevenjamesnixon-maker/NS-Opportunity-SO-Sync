@@ -85,8 +85,8 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.1.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.0.2 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status and ship date to the sales orders | Not deployed |
+| Shared config library | 1.2.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the three script parameters — including the status mapping | Not deployed |
+| Opportunity user event | 1.1.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -169,9 +169,49 @@ opportunity is actually saved.
      - skip if its current status is in the excluded list
      - skip if nothing would actually change
      - submitFields
-8. Check remaining governance inside the loop; stop cleanly and log what was left undone.
-9. Audit-log every update and every skip, with the reason.
+8. Evaluate delivery readiness against the status THIS SAVE decided, unless that status is
+   itself excluded — then leave both readiness fields untouched.
+9. Fold readiness into the SAME submitFields. One read and one write per order.
+10. Check remaining governance inside the loop; stop cleanly and log what was left undone.
+11. Audit-log every update and every skip, with the reason, plus one summary per opportunity.
 ```
+
+### Delivery readiness
+
+Two **independent** gates, driven by two checkboxes on the Quote Type record that the order's
+`custbody_quote_type` points at. An order is ready only when **both** pass, and **neither
+checkbox short-circuits the other** — a quote type with both ticked still has its certificates
+checked, it simply skips the design check.
+
+| Gate | Checkbox | When ticked | When not ticked |
+|---|---|---|---|
+| Design | `custrecord_qt_no_design_required` — *"Can ship without design"* | Passes with no check | The status this save decided must be in `getDesignOkStatuses()`, else **Design not complete** |
+| Certificates | `custrecord_qt_requires_installer_certs` — *"Requires installer certificates"* | All five checks below | Passes with no check |
+
+The certificate checks, in the order their reasons are joined:
+
+| Check | Failure reason |
+|---|---|
+| Installer set on the opportunity at all | `Installer not set on opportunity` |
+| `custbody_installer_subcontract_receive` not blank | `Subcontract agreement not received` |
+| Qualification expiry | `Installer qualification certificate missing` / `… expired` |
+| Public Liability expiry | `Public Liability certificate missing` / `… expired` |
+| `custbody38` in `getDnoOkValues()` — blank or absent fails | `Awaiting DNO` |
+
+**When the installer is not set, the two expiry checks are skipped rather than reported.** With
+no installer there is no certificate to be missing, and three reasons for one root cause reads as
+three separate problems to fix.
+
+**A blank quote type behaves as neither checkbox ticked** — the design gate applies, the
+certificate gate does not. That is the conservative reading: an order with no quote type still
+has to have its design finished.
+
+**The certificate dates are read from the CUSTOMER record**, not the opportunity. The equivalent
+opportunity fields are unstored sourced fields and cannot be read by a search, so the script goes
+to the customer that `custbody_installer_ns` points at. Which two fields those are is held in
+script parameters, because it has to be configurable per account.
+
+**"On or after today" passes** — a certificate expiring today is still valid. See section 5.
 
 **The whole thing is wrapped. A failure must never block the opportunity save.** One
 unreachable sales order fails that order, logs `OPPSYNC_ORDER_FAILED`, and the loop continues —
@@ -183,6 +223,8 @@ hence the per-order try/catch at step 7 rather than one try/catch around the loo
 |---|---|---|
 | `custbody_opportunity_sub_status` | `custbody_finance_status` | Through the mapping |
 | `custbody_opp_del_date` | `custbody_defaultshipdate` | Direct — both dates |
+| *(derived — see below)* | `custbody_ready_for_delivery` | Two gates on the Quote Type record |
+| *(derived — see below)* | `custbody_delivery_hold_reason` | The failed gates, joined with `; ` |
 
 **The link between them** is the **native `opportunity`** field on the Sales Order. **Not
 `createdfrom`.** The search filters on it together with `mainline is T`, so each order comes back
@@ -326,7 +368,37 @@ Agreed mapping, seven rows, **by name**:
   They look redundant side by side and they are not. **Do not tidy them back into one
   variable** — the merged version passes every test run after the 13th of the month.
 
-- **Design Cancelled is a one-way door.** See section 6.
+- **Design Cancelled is a one-way door**, and readiness freezes with it. See section 6.
+
+- **The four readiness parameters THROW when unset; the two Phase 2 ones do not.**
+  `getQualifyingStatuses()` and `getExcludedStatuses()` log at error and return an empty array,
+  which is right for them: an empty qualifying list closes the gate and nothing happens.
+
+  That is the wrong behaviour for readiness. An empty design-ok list does not stop anything — it
+  makes every order fail the design gate, and the script then writes *"not ready, Design not
+  complete"* onto orders that are perfectly ready. A missing customer field id does the same
+  through the certificate gate. Returning empty would produce confidently wrong data on every
+  order of the opportunity, which is worse than doing nothing.
+
+  So those four throw, and they are resolved **before the sales order loop begins**, so a missing
+  one cannot leave some orders written and the rest not. The throw is caught by the entry point's
+  outer handler and logged as `OPPSYNC_FAILED`; the opportunity still saves.
+
+- **Date ordering is numeric, not string.** `asDateKey()` is for equality only. Its output is a
+  localised `dd/mm/yyyy` string, and comparing those with `<` or `>` orders them alphabetically —
+  `05/12/2026` sorts before `06/01/2026` though it is a year later. Certificate expiry therefore
+  goes through `asDayNumber()`, which builds a plain `YYYYMMDD` number from the date parts. Date
+  parts also discard any time component, so **a certificate expiring today is valid** rather than
+  failing on a stray timestamp — the case that would appear to work for every other date.
+
+- **A failed lookup holds the order rather than shipping it.** An unreadable quote type is
+  treated as design-required; an unreadable installer leaves both certificate dates blank, so
+  they read as missing. Both directions are chosen so a lookup failure can never let an order
+  through the gate it was supposed to be held by.
+
+- **Readiness is evaluated against the status this save decided**, not the status the order had
+  on entry. The design gate asks "will this order be far enough along once this save lands", not
+  "was it before".
 
 - **Guard every array access on a lookup result.** The predecessor script read
   `lookupFields(...).custbody_finance_status[0].value` with no guard. `lookupFields` returns an
@@ -375,8 +447,10 @@ widening it is a field edit rather than a code change.
 | Item | Detail |
 |---|---|
 | **Design Cancelled is a deliberate one-way door** | *Design Cancelled* maps to *Cancelled*, and *Cancelled* is in the excluded list. So this sync can move an order **to** Cancelled, and can never move it away again — the exclusion tests the order's current status, so a cancelled order is skipped from then on. **That is intended.** Un-cancelling an order should require a person looking at that order, not a status change on an opportunity that happens to cascade. **Do not "fix" it by removing Cancelled from the excluded list.** If it ever needs reversing it is a script parameter edit, not a code change. |
+| **…and readiness freezes at that moment** | The save that writes an excluded status is the **last one that will ever touch that order**. Readiness is deliberately not evaluated on that save: the status and ship date are written, and `custbody_ready_for_delivery` and `custbody_delivery_hold_reason` are left exactly as they were — not set to `false`, not given a reason, not included in the write at all. An excluded status means the order is past the delivery gate or is dead, so readiness is not applicable, and "not ready" on a delivered order is not merely stale, it is wrong. **A stale `true` on a cancelled or delivered order is therefore expected behaviour, not a bug.** Nothing will clear it, because nothing should. |
 | **Clearing a date by inline edit does not propagate** | On XEDIT a field absent from `newRecord` is indistinguishable from a field cleared to empty. The script resolves the ambiguity in favour of *absent* and falls back to `oldRecord` — so inline-clearing the delivery date leaves the orders' ship dates as they were. The safe failure was chosen deliberately: the alternative silently wipes ship dates on every unrelated inline edit. Clearing the date on the **full form** works normally. |
 | **Governance stops are silent to the user** | If an opportunity has enough sales orders to exhaust the user event's governance, the loop stops cleanly and logs `OPPSYNC_GOVERNANCE_STOP` naming the orders it did not reach. The user who saved the opportunity sees nothing. Re-saving picks up the rest. Not expected in practice — an opportunity has a handful of orders, not hundreds. |
+| **Two script IDs are auto-assigned and must be confirmed per account** | `customrecord16` (the Quote Type record) and `custbody38` (the DNO status) are **script IDs**, not internal IDs — NetSuite names an object `customrecordN` / `custbodyN` when the developer does not choose an id, so they are committable. But unlike a hand-chosen id they carry no guarantee of being the same in another account: they are only stable if the object travelled between accounts rather than being built separately in each. **Confirm both in Sandbox and Production before go-live.** A wrong one fails silently — `custbody38` reads as blank, which the DNO check reports as *Awaiting DNO* on every order. |
 | **The sync does not run for anyone who bypasses user events** | CSV import with *Run Server SuiteScript and Trigger Workflows* unticked, and any integration that suppresses user events, write the opportunity without this script running. The orders are then out of step until the opportunity is saved again. This is a NetSuite setting on each import, not something the script can detect or force. |
 
 Add further entries as they are found, with the date and the script version they were observed on.
@@ -400,7 +474,12 @@ drift between scripts.
 | `OPPSYNC_MAP_PARSED` | debug | The mapping as actually parsed, one line of `key -> value` pairs. Normal operation. | Nothing. With Log Level on Debug this is how a typo is spotted by eye rather than inferred from an order that did not sync. |
 | `OPPSYNC_ORDER_FAILED` | error | One sales order threw while being read or written. **The remaining orders were still processed.** | Read the logged error against the named order. Usually a locked or deleted order, or a permission problem on the executing role. |
 | `OPPSYNC_GOVERNANCE_STOP` | error | The loop stopped with governance running low, naming how many orders were done and which were not reached. | Re-save the opportunity to pick up the rest. If it recurs, the opportunity has more orders than this design anticipated — see section 6. |
-| `OPPSYNC_PARAMETER_MISSING` | error | A script parameter is unset, unreadable, or held nothing usable. Names the parameter. An empty **qualifying** list means the gate never opens; an empty **mapping** means nothing resolves. Either way the feature is inert. | Populate the parameter on the deployment **in this account**; the values differ by environment. See section 8. |
+| `OPPSYNC_READINESS` | debug | One line per sales order: order, quote type, decided status, ready true/false and the reason. Normal operation. | Nothing. This is the first place to look when an order's readiness is not what was expected — it names which gate spoke. |
+| `OPPSYNC_READINESS_NOT_APPLICABLE` | debug | The status this save wrote is in the excluded list, so readiness was **not evaluated** and both fields were left as they were. Normal operation. | Nothing. Note the readiness values shown are now frozen — see section 6. |
+| `OPPSYNC_QUOTE_TYPE_UNREADABLE` | error | A quote type record could not be read. Treated as **design-required, certificates not required** — the strictest reading of the design gate. | Check the quote type record exists and the executing role can read it. Until then those orders are gated on design. |
+| `OPPSYNC_INSTALLER_UNREADABLE` | error | The installer customer record could not be read for the two certificate fields. **Both certificates read as missing**, so the order is held. | Check the customer record and the two field ids in the parameters. The held order is the safe outcome, not the bug. |
+| `OPPSYNC_SYNC_SUMMARY` | audit | One line per opportunity: how many orders were updated, unchanged and skipped, and the status written. Normal operation. | Nothing. Use it to read the log at the level of "what did this save do". |
+| `OPPSYNC_PARAMETER_MISSING` | error | A script parameter is unset, unreadable, or held nothing usable. Names the parameter. An empty **qualifying** list means the gate never opens; an empty **mapping** means nothing resolves. For the four **readiness** parameters this is also **thrown**, so the save is abandoned before any order is written — see section 5. | Populate the parameter on the deployment **in this account**; the values differ by environment. See section 8. |
 | `OPPSYNC_FAILED` | error | The entry point threw outside the per-order loop. **The opportunity still saved**; its orders may be out of step. | Read the logged error. Nothing in this feature may ever block an opportunity save, so a failure here is always silent to the user. |
 
 > **Reserved — no script raises these.** Kept so a future session grepping for them finds this
@@ -433,7 +512,7 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    | `opsync_ue_opportunity.js` | `customscript_opsync_ue_opportunity` | `customdeploy_opsync_ue_opportunity` | Opportunity. `afterSubmit` only |
    | `lib/opsync_lib_config.js` | — | **None.** Shared AMD module — File Cabinet upload only. Creating a script record for it is wrong | — |
 
-4. **Define the three script parameters on the script record, and set their values on the
+4. **Define the seven script parameters on the script record, and set their values on the
    deployment:**
 
    | Label | ID | Type | What goes in it |
@@ -441,8 +520,12 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    | Qualifying Opportunity Statuses | `custscript_opsync_qualifying_statuses` | Free-Form Text | A comma-separated list of the `entitystatus` internal IDs that open the gate, **as they are in this account**. Currently *Won* alone. |
    | Excluded Record Statuses | `custscript_opsync_excluded_statuses` | Free-Form Text | A comma-separated list of the Record Status internal IDs that must never be overwritten — the statuses whose orders belong to the warehouse and finance processes, **plus Cancelled**. |
    | Status Map | `custscript_opsync_status_map` | Free-Form Text | The mapping from section 4, as comma-separated `subStatusId:recordStatusId` pairs — seven of them, **using the internal IDs as they are in this account**. Read `OPPSYNC_MAP_PARSED` in the execution log after the first save to confirm it parsed as intended. |
+   | Design OK Statuses | `custscript_opsync_design_ok_statuses` | Free-Form Text | Comma-separated Record Status IDs at which the design is far enough along to ship. **Required — the script throws without it.** |
+   | DNO OK Values | `custscript_opsync_dno_ok_values` | Free-Form Text | Comma-separated `custbody38` values that satisfy the DNO check. Blank on the order always fails. **Required.** |
+   | Customer Qualification Field | `custscript_opsync_cust_qual_field` | Free-Form Text | The **script ID** of the installer qualification expiry date field on the **customer** record. A parameter, not a constant, because the opportunity's equivalent is an unstored sourced field that cannot be searched. **Required.** |
+   | Customer PL Field | `custscript_opsync_cust_pl_field` | Free-Form Text | The **script ID** of the Public Liability expiry date field on the customer record. As above. **Required.** |
 
-   **All three must be populated at deployment time, in each environment separately.** Their values
+   **All seven must be populated at deployment time, in each environment separately.** Their values
    are internal IDs and therefore **differ between Sandbox and Production** — read them off the
    records in the account you are deploying to. They are not in this repository and must not be
    put in it (section 3). An unset parameter logs `OPPSYNC_PARAMETER_MISSING` at error; an unset
@@ -500,6 +583,30 @@ screen and a failure in the notes.
 | 24 | Clear the **mapping** parameter entirely and save | `OPPSYNC_PARAMETER_MISSING` at error, **nothing resolves, no order touched** — fails closed like the other two. **Revert afterwards** |
 | 25 | Read `OPPSYNC_MAP_PARSED` after the first save in a fresh environment | The line matches the seven rows in section 4, translated to that account's IDs. **Do this once per environment at deployment** — it is the cheapest possible check on a hand-typed parameter |
 
+### Delivery readiness
+
+| # | Scenario | Expected |
+|---|---|---|
+| 26 | Design-required quote type, status in the design-ok list | **Ready**, hold reason blank |
+| 27 | Design-required quote type, status not in the design-ok list | Not ready, `Design not complete` |
+| 28 | *"Can ship without design"* ticked, certificates not required | **Ready regardless of status** |
+| 29 | Blank quote type, status in the design-ok list | **Ready** |
+| 30 | Blank quote type, status not in the design-ok list | Not ready, `Design not complete` |
+| 31 | Certificates-required quote type, every condition passes | **Ready** |
+| 32 | Certificates required, PL expiry **yesterday** | Not ready, `Public Liability certificate expired` |
+| 33 | Certificates required, PL expiry **today** | **Ready.** On or after today passes — see section 5 |
+| 34 | Certificates required, qualification expiry **blank** | Not ready, `Installer qualification certificate missing` |
+| 35 | Certificates required, `custbody38` blank | Not ready, `Awaiting DNO` |
+| 36 | Certificates required, design incomplete **and** DNO blank | Not ready, both reasons joined with `; ` |
+| 37 | Certificates required, **installer blank** on the opportunity | Not ready, `Installer not set on opportunity` — and **not** two extra expiry reasons |
+| 38 | Opportunity with 3 orders, one at an excluded **entry** status | That one untouched; the other two evaluated |
+| 39 | The same opportunity saved twice with no change | **Zero `submitFields` calls** on the second save. Check the orders' system notes |
+| 40 | Any of the four readiness parameters unset | `OPPSYNC_PARAMETER_MISSING` at error, **no partial writes** — no order is written at all |
+| 41 | **Both** checkboxes ticked, status not design-ok, certificates all valid | **Ready** — design skipped, certificates pass. Neither checkbox short-circuits the other |
+| 42 | **Both** checkboxes ticked, status not design-ok, PL expired | Not ready, **PL reason only** — no design reason |
+| 43 | Non-excluded entry status, sub-status maps it **onto an excluded status** | Status and ship date written; **both readiness fields untouched** at whatever they held. `OPPSYNC_READINESS_NOT_APPLICABLE` at debug |
+| 44 | Status and ship date both unchanged, but a certificate has expired since the last save | **The write still happens**, carrying only the two readiness fields |
+
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
 ---
@@ -518,6 +625,15 @@ Script IDs only — **no internal IDs**, here or anywhere else in this document.
 | Sales Order: Record Status | `custbody_finance_status` | List/Record → `customrecord_fin_stat` | Steve | 2026-09-14 |
 | Sales Order: expected ship date | `custbody_defaultshipdate` | Date | Steve | 2026-09-14 |
 | Sales Order → Opportunity link | `opportunity` | **Native** field — not `createdfrom` | Steve | 2026-09-14 |
+| Sales Order: ready for delivery | `custbody_ready_for_delivery` | Checkbox, Inline Text on forms | Steve | 2026-09-15 |
+| Sales Order: delivery hold reason | `custbody_delivery_hold_reason` | Long text, Inline Text on forms | Steve | 2026-09-15 |
+| Sales Order: quote type | `custbody_quote_type` | List/Record → Quote Type record | Steve | 2026-09-15 |
+| Sales Order: subcontract received | `custbody_installer_subcontract_receive` | — | Steve | 2026-09-15 |
+| Sales Order: DNO status | `custbody38` | **Auto-assigned** script ID — see section 6 | Steve | 2026-09-15 |
+| Opportunity: installer | `custbody_installer_ns` | List/Record → Customer | Steve | 2026-09-15 |
+| Quote Type record | `customrecord16` | **Auto-assigned** script ID — see section 6 | Steve | 2026-09-15 |
+| Quote Type: can ship without design | `custrecord_qt_no_design_required` | Checkbox | Steve | 2026-09-15 |
+| Quote Type: requires installer certificates | `custrecord_qt_requires_installer_certs` | Checkbox | Steve | 2026-09-15 |
 
 ### Closed questions
 
@@ -544,6 +660,9 @@ Not code. These are account changes the scripts assume have been made.
 
 | # | Task | Why it matters |
 |---|---|---|
-| 1 | Define **three** script parameters on the script record and set their values on the deployment, **in each environment** | Section 8, step 4. This now includes the mapping itself. An unset qualifying list or an unset mapping makes the feature completely inert, and the only sign is one error line in the log. |
+| 1 | Define **seven** script parameters on the script record and set their values on the deployment, **in each environment** | Section 8, step 4. This now includes the mapping itself. An unset qualifying list or an unset mapping makes the feature completely inert, and the only sign is one error line in the log. |
 | 2 | Disable the `acs_ue_update_so.js` deployment when this one goes live | Section 8, step 6. Two writers of `custbody_finance_status`. |
-| 3 | Check `OPPSYNC_MAP_PARSED` in the log after the first save in each environment | Section 9, scenario 25. A hand-typed parameter of seven ID pairs is the most likely thing to be wrong, and this is the only place it becomes visible. |
+| 3 | Create the two checkboxes on the Quote Type record and tick them per quote type | Section 4. Until they exist every quote type reads as "design required, certificates not required" — orders will be gated on design alone. |
+| 4 | Set `custbody_ready_for_delivery` and `custbody_delivery_hold_reason` to **Inline Text** on all sales order forms | The script owns both fields. If users can edit them, their edits are silently overwritten on the next opportunity save. |
+| 5 | Confirm `customrecord16` and `custbody38` are those exact script IDs in **both** environments | Section 6. Auto-assigned ids carry no cross-account guarantee, and a wrong `custbody38` reads as blank — every order then reports *Awaiting DNO*. |
+| 6 | Check `OPPSYNC_MAP_PARSED` in the log after the first save in each environment | Section 9, scenario 25. A hand-typed parameter of seven ID pairs is the most likely thing to be wrong, and this is the only place it becomes visible. |

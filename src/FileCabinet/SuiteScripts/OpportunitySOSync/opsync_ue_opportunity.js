@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.0.2
+ * @version 1.1.0
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.0.2';
+    var VERSION = '1.1.0';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -160,6 +160,90 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
     }
 
     /**
+     * Reduces a date to a plain YYYYMMDD number for ORDERING.
+     *
+     * asDateKey() is deliberately not used for this. It produces a localised dd/mm/yyyy string,
+     * and comparing those with < or > orders them alphabetically — "05/12/2026" sorts before
+     * "06/01/2026" though it is a year later. Ordering must be numeric.
+     *
+     * The number is built from the date PARTS, so any time component is discarded rather than
+     * tipping a same-day comparison. A certificate expiring today is valid: the brief is
+     * explicit that "on or after the current date" passes, and a datetime comparison would fail
+     * exactly those same-day certificates while appearing to work for every other case.
+     *
+     * @param {Date} value
+     * @returns {number|null} e.g. 20260915, or null when not a date
+     */
+    function asDayNumber(value) {
+        if (Object.prototype.toString.call(value) !== '[object Date]' || isNaN(value.getTime())) {
+            return null;
+        }
+        return (value.getFullYear() * 10000) + ((value.getMonth() + 1) * 100) + value.getDate();
+    }
+
+    /**
+     * Parses a date that came back from search.lookupFields as a localised string.
+     *
+     * format.parse is the inverse of the format.format used in asDateKey, so the account's date
+     * preference is honoured in both directions. A value that will not parse is treated as
+     * absent rather than as a date in the distant past — an unreadable certificate date must
+     * read as "missing", never as "valid".
+     *
+     * @param {string} text
+     * @returns {Date|null}
+     */
+    function parseLookupDate(text) {
+        var parsed;
+
+        if (isEmpty(text)) {
+            return null;
+        }
+
+        try {
+            parsed = format.parse({ value: String(text), type: format.Type.DATE });
+        } catch (e) {
+            return null;
+        }
+
+        return Object.prototype.toString.call(parsed) === '[object Date]' ? parsed : null;
+    }
+
+    /**
+     * Today, as a YYYYMMDD number.
+     *
+     * @returns {number}
+     */
+    function todayDayNumber() {
+        return asDayNumber(new Date());
+    }
+
+    /**
+     * Appends a certificate expiry failure, if there is one.
+     *
+     * Blank and expired are different failures and are reported differently, because they need
+     * different actions: a blank field means nobody has recorded the certificate, an expired one
+     * means it needs renewing.
+     *
+     * @param {string[]} reasons - appended to in place
+     * @param {string} rawDate - the value as lookupFields returned it
+     * @param {number} today
+     * @param {string} label - e.g. 'Installer qualification certificate'
+     */
+    function checkExpiry(reasons, rawDate, today, label) {
+        var day = asDayNumber(parseLookupDate(rawDate));
+
+        if (day === null) {
+            reasons.push(label + ' missing');
+            return;
+        }
+
+        // On or after today passes. A certificate expiring today is still valid.
+        if (day < today) {
+            reasons.push(label + ' expired');
+        }
+    }
+
+    /**
      * True when the id appears in the list of ids. Both sides are normalised first.
      *
      * @param {string} id
@@ -248,12 +332,137 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
     }
 
     /**
-     * Brings one sales order into step with the opportunity.
+     * True when a checkbox value from search.lookupFields is ticked. lookupFields returns a
+     * boolean for a checkbox, but a string slips through often enough to be worth tolerating.
      *
-     * Reads the order's current Record Status and ship date in a single lookupFields, and takes
-     * every value off that result through opsyncConfig.lookupValue — which checks length before
-     * indexing. The predecessor read .custbody_finance_status[0].value unguarded and threw on
-     * any order whose status was blank; that is the specific bug that made it fragile.
+     * @param {*} value
+     * @returns {boolean}
+     */
+    function isTicked(value) {
+        return value === true || value === 'T' || value === 'true';
+    }
+
+    /**
+     * Reads the two gate checkboxes off a Quote Type record, through a per-save cache.
+     *
+     * Several sales orders on one opportunity commonly share a quote type, so the cache turns
+     * N lookups into one per distinct type. It lives for a single execution only — a cache that
+     * outlived the save would risk gating an order on a checkbox someone had since changed.
+     *
+     * A BLANK quote type behaves as neither checkbox ticked: the design gate applies and the
+     * certificate gate does not. That is the conservative reading — an order with no quote type
+     * still has to have its design finished before it ships.
+     *
+     * @param {string} quoteTypeId
+     * @param {Object} cache - keyed by quote type id, mutated in place
+     * @returns {Object} { noDesignRequired: boolean, requiresCerts: boolean }
+     */
+    function getQuoteTypeGates(quoteTypeId, cache) {
+        var lookup;
+        var gates;
+
+        if (isEmpty(quoteTypeId)) {
+            return { noDesignRequired: false, requiresCerts: false };
+        }
+
+        if (cache.hasOwnProperty(quoteTypeId)) {
+            return cache[quoteTypeId];
+        }
+
+        try {
+            lookup = search.lookupFields({
+                type: opsyncConfig.RECORD_TYPES.QUOTE_TYPE,
+                id: quoteTypeId,
+                columns: [
+                    opsyncConfig.QUOTE_TYPE_FIELDS.NO_DESIGN_REQUIRED,
+                    opsyncConfig.QUOTE_TYPE_FIELDS.REQUIRES_INSTALLER_CERTS
+                ]
+            });
+            gates = {
+                noDesignRequired: isTicked(
+                    lookup[opsyncConfig.QUOTE_TYPE_FIELDS.NO_DESIGN_REQUIRED]),
+                requiresCerts: isTicked(
+                    lookup[opsyncConfig.QUOTE_TYPE_FIELDS.REQUIRES_INSTALLER_CERTS])
+            };
+        } catch (e) {
+            // An unreadable quote type falls back to the strictest reading: design required,
+            // certificates not. Treating it as "can ship without design" would let an order
+            // through on the strength of a failed lookup.
+            log.error({
+                title: opsyncConfig.logKey('QUOTE_TYPE_UNREADABLE'),
+                details: 'Quote type ' + quoteTypeId + ' could not be read. Treated as ' +
+                    'design-required. ' + e
+            });
+            gates = { noDesignRequired: false, requiresCerts: false };
+        }
+
+        cache[quoteTypeId] = gates;
+        return gates;
+    }
+
+    /**
+     * Decides whether one sales order is ready for delivery, and why not.
+     *
+     * TWO INDEPENDENT GATES, and an order is ready only when BOTH pass. Neither checkbox
+     * short-circuits the other: a quote type with both ticked skips the design check and still
+     * has its certificates checked.
+     *
+     * Readiness is evaluated against the status THIS SAVE is about to write, not the status the
+     * order had on entry — the design gate is asking "will this order be far enough along once
+     * this save lands", not "was it before".
+     *
+     * @param {Object} order - { quoteTypeId, subcontractReceived, dnoStatus }
+     * @param {string} decidedStatus - the Record Status this save will write
+     * @param {Object} ctx - the per-opportunity readiness context
+     * @returns {Object} { ready: boolean, reason: string }
+     */
+    function evaluateReadiness(order, decidedStatus, ctx) {
+        var gates = getQuoteTypeGates(order.quoteTypeId, ctx.quoteTypeCache);
+        var reasons = [];
+
+        // (b) Design gate.
+        if (!gates.noDesignRequired && !contains(decidedStatus, ctx.designOkStatuses)) {
+            reasons.push('Design not complete');
+        }
+
+        // (c) Certificate gate.
+        if (gates.requiresCerts) {
+            if (isEmpty(ctx.installerId)) {
+                // The two expiry checks are deliberately SKIPPED here rather than reported as
+                // missing. With no installer there is no certificate to be missing, and three
+                // reasons for one root cause reads as three problems to fix.
+                reasons.push('Installer not set on opportunity');
+            }
+
+            if (isEmpty(order.subcontractReceived)) {
+                reasons.push('Subcontract agreement not received');
+            }
+
+            if (!isEmpty(ctx.installerId)) {
+                checkExpiry(reasons, ctx.qualExpiry, ctx.today,
+                    'Installer qualification certificate');
+                checkExpiry(reasons, ctx.plExpiry, ctx.today, 'Public Liability certificate');
+            }
+
+            // Blank or absent always fails — there is no "no news is good news" here.
+            if (!contains(order.dnoStatus, ctx.dnoOkValues)) {
+                reasons.push('Awaiting DNO');
+            }
+        }
+
+        return {
+            ready: reasons.length === 0,
+            reason: reasons.join('; ')
+        };
+    }
+
+    /**
+     * Brings one sales order into step with the opportunity: status, ship date, and readiness.
+     *
+     * Reads everything it needs in a SINGLE lookupFields and writes everything it changes in a
+     * SINGLE submitFields. Every value comes off the lookup through opsyncConfig.lookupValue,
+     * which checks length before indexing — the predecessor read
+     * .custbody_finance_status[0].value unguarded and threw on any order whose status was blank.
      *
      * The opportunity's delivery date arrives as BOTH a comparison key and a writable value.
      * They are not interchangeable — see asDateKey and asDateForWrite.
@@ -264,12 +473,19 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * @param {Date|string} deliveryDateValue - the original Date. Written, never compared
      * @param {string[]} excludedStatuses
      * @param {string} opportunityId - for the log only
+     * @param {Object} ctx - the per-opportunity readiness context
+     * @returns {string} 'updated', 'skipped' or 'unchanged'
      */
     function syncSalesOrder(orderId, mappedStatusId, deliveryDateKey, deliveryDateValue,
-        excludedStatuses, opportunityId) {
+        excludedStatuses, opportunityId, ctx) {
         var lookup;
         var currentStatus;
         var currentShipDateKey;
+        var currentReady;
+        var currentReason;
+        var quoteTypeId;
+        var verdict = null;
+        var targetExcluded;
         var values = {};
         var changes = [];
 
@@ -278,7 +494,12 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             id: orderId,
             columns: [
                 opsyncConfig.SALES_ORDER_FIELDS.RECORD_STATUS,
-                opsyncConfig.SALES_ORDER_FIELDS.SHIP_DATE
+                opsyncConfig.SALES_ORDER_FIELDS.SHIP_DATE,
+                opsyncConfig.SALES_ORDER_FIELDS.READY_FOR_DELIVERY,
+                opsyncConfig.SALES_ORDER_FIELDS.DELIVERY_HOLD_REASON,
+                opsyncConfig.SALES_ORDER_FIELDS.QUOTE_TYPE,
+                opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED,
+                opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS
             ]
         });
 
@@ -286,6 +507,11 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             lookup, opsyncConfig.SALES_ORDER_FIELDS.RECORD_STATUS);
         currentShipDateKey = asDateKey(opsyncConfig.lookupValue(
             lookup, opsyncConfig.SALES_ORDER_FIELDS.SHIP_DATE));
+        currentReady = isTicked(lookup[opsyncConfig.SALES_ORDER_FIELDS.READY_FOR_DELIVERY]);
+        currentReason = opsyncConfig.lookupValue(
+            lookup, opsyncConfig.SALES_ORDER_FIELDS.DELIVERY_HOLD_REASON);
+        quoteTypeId = opsyncConfig.lookupValue(
+            lookup, opsyncConfig.SALES_ORDER_FIELDS.QUOTE_TYPE);
 
         // The exclusion tests the order's CURRENT status, not the status being written. An order
         // the warehouse or finance has moved on is theirs, and the opportunity does not reclaim
@@ -296,7 +522,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 details: 'Sales order ' + orderId + ' left alone: its current Record Status (' +
                     currentStatus + ') is in the excluded list. Opportunity ' + opportunityId + '.'
             });
-            return;
+            return 'skipped';
         }
 
         if (asId(currentStatus) !== asId(mappedStatusId)) {
@@ -315,13 +541,59 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 (deliveryDateKey || '(empty)'));
         }
 
+        // THE SECOND EXCLUSION TEST, on the status this save DECIDES rather than the one the
+        // order arrived with. The status map can legitimately map a sub-status onto a value that
+        // is itself excluded — Design Cancelled -> Cancelled is the standing example.
+        //
+        // When that happens the status and ship date are written as normal, and readiness is
+        // left exactly as it is: not set to false, not given a reason, not included in the write
+        // at all. An excluded status means the order is past the delivery gate or is dead, so
+        // readiness is not applicable — and "not ready" on a delivered order is worse than
+        // stale, it is wrong. See docs/context.md section 6.
+        targetExcluded = contains(mappedStatusId, excludedStatuses);
+
+        if (targetExcluded) {
+            log.debug({
+                title: opsyncConfig.logKey('READINESS_NOT_APPLICABLE'),
+                details: 'Sales order ' + orderId + ': status ' + mappedStatusId + ' is in the ' +
+                    'excluded list, so readiness was not evaluated and both readiness fields ' +
+                    'were left as they were (ready=' + currentReady + ').'
+            });
+        } else {
+            verdict = evaluateReadiness({
+                quoteTypeId: quoteTypeId,
+                subcontractReceived: opsyncConfig.lookupValue(
+                    lookup, opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED),
+                dnoStatus: opsyncConfig.lookupValue(
+                    lookup, opsyncConfig.SALES_ORDER_FIELDS.DNO_STATUS)
+            }, mappedStatusId, ctx);
+
+            log.debug({
+                title: opsyncConfig.logKey('READINESS'),
+                details: 'Sales order ' + orderId + ', quote type ' +
+                    (quoteTypeId || '(none)') + ', status ' + mappedStatusId + ', ready=' +
+                    verdict.ready + ', reason=' + (verdict.reason || '(none)')
+            });
+
+            // Both fields are written together or not at all: a reason without its checkbox, or
+            // a checkbox without its reason, reads as a contradiction on the record.
+            if (verdict.ready !== currentReady || verdict.reason !== currentReason) {
+                values[opsyncConfig.SALES_ORDER_FIELDS.READY_FOR_DELIVERY] = verdict.ready;
+                values[opsyncConfig.SALES_ORDER_FIELDS.DELIVERY_HOLD_REASON] = verdict.reason;
+                changes.push('ready ' + currentReady + ' -> ' + verdict.ready +
+                    ' (' + (verdict.reason || 'no hold') + ')');
+            }
+        }
+
+        // Readiness alone is enough to justify the write — the status and ship date may both be
+        // unchanged while a certificate has expired since the last save.
         if (changes.length === 0) {
             log.debug({
                 title: opsyncConfig.logKey('ORDER_UNCHANGED'),
                 details: 'Sales order ' + orderId + ' already matches the opportunity. Nothing ' +
                     'written — no submitFields, no system note.'
             });
-            return;
+            return 'unchanged';
         }
 
         record.submitFields({
@@ -335,6 +607,75 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             details: 'Sales order ' + orderId + ' updated from opportunity ' + opportunityId +
                 ': ' + changes.join('; ') + '.'
         });
+
+        return 'updated';
+    }
+
+    /**
+     * Builds the per-opportunity readiness context, ONCE, before the sales order loop.
+     *
+     * Two things are resolved here and nowhere else:
+     *
+     * 1. The four required parameters. They are read UP FRONT precisely so that a missing one
+     *    throws before a single order has been written — a throw from inside the loop would
+     *    leave some orders updated and the rest not, which is the "no partial writes" the brief
+     *    asks for. See the note on requiredParameter() in opsync_lib_config.js.
+     *
+     * 2. The installer's two certificate expiry dates, in ONE lookupFields, cached for the whole
+     *    loop. The equivalent fields on the opportunity are unstored sourced fields and cannot
+     *    be read by a search, so the script goes to the customer record custbody_installer_ns
+     *    points at. When the installer is blank the lookup is skipped entirely — there is
+     *    nothing to look up, and the certificate gate reports the missing installer instead.
+     *
+     * @param {Record} newRecord
+     * @param {Record} oldRecord
+     * @param {boolean} sparse
+     * @returns {Object} the readiness context
+     * @throws {Error} OPPSYNC_PARAMETER_MISSING if any required parameter is unset
+     */
+    function buildReadinessContext(newRecord, oldRecord, sparse) {
+        var ctx = {
+            designOkStatuses: opsyncConfig.getDesignOkStatuses(),
+            dnoOkValues: opsyncConfig.getDnoOkValues(),
+            installerId: '',
+            qualExpiry: '',
+            plExpiry: '',
+            today: todayDayNumber(),
+            quoteTypeCache: {}
+        };
+        var qualField = opsyncConfig.getCustomerQualField();
+        var plField = opsyncConfig.getCustomerPlField();
+        var lookup;
+
+        ctx.installerId = asId(effectiveValue(
+            newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.INSTALLER, sparse));
+
+        if (isEmpty(ctx.installerId)) {
+            return ctx;
+        }
+
+        try {
+            lookup = search.lookupFields({
+                type: search.Type.CUSTOMER,
+                id: ctx.installerId,
+                columns: [qualField, plField]
+            });
+            // Through lookupValue, which checks length before indexing — lookupFields returns an
+            // empty array for an empty field.
+            ctx.qualExpiry = opsyncConfig.lookupValue(lookup, qualField);
+            ctx.plExpiry = opsyncConfig.lookupValue(lookup, plField);
+        } catch (e) {
+            // An unreadable installer leaves both dates blank, so the certificate gate reports
+            // them as missing. That is the safe direction: it holds the order rather than
+            // shipping it on the strength of a failed lookup.
+            log.error({
+                title: opsyncConfig.logKey('INSTALLER_UNREADABLE'),
+                details: 'Installer customer ' + ctx.installerId + ' could not be read for ' +
+                    qualField + ' / ' + plField + '. Both certificates will read as missing. ' + e
+            });
+        }
+
+        return ctx;
     }
 
     /**
@@ -356,7 +697,12 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         var deliveryDateRaw;
         var mappedStatusId;
         var orderIds;
+        var readinessContext;
         var processed = 0;
+        var updated = 0;
+        var skipped = 0;
+        var unchanged = 0;
+        var outcome;
         var i;
 
         try {
@@ -430,6 +776,11 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
 
             excludedStatuses = opsyncConfig.getExcludedStatuses();
 
+            // Readiness context BEFORE the loop: the four required parameters (so a missing one
+            // throws before anything is written) and the installer's certificates (one lookup,
+            // cached for every order). See buildReadinessContext.
+            readinessContext = buildReadinessContext(newRecord, oldRecord, sparse);
+
             // 6. One opportunity may have several sales orders.
             orderIds = findSalesOrders(opportunityId);
             if (orderIds.length === 0) {
@@ -454,9 +805,16 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 }
 
                 try {
-                    syncSalesOrder(orderIds[i], mappedStatusId, deliveryDateKey,
-                        deliveryDateValue, excludedStatuses, opportunityId);
+                    outcome = syncSalesOrder(orderIds[i], mappedStatusId, deliveryDateKey,
+                        deliveryDateValue, excludedStatuses, opportunityId, readinessContext);
                     processed += 1;
+                    if (outcome === 'updated') {
+                        updated += 1;
+                    } else if (outcome === 'skipped') {
+                        skipped += 1;
+                    } else {
+                        unchanged += 1;
+                    }
                 } catch (orderError) {
                     log.error({
                         title: opsyncConfig.logKey('ORDER_FAILED'),
@@ -466,6 +824,15 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                     });
                 }
             }
+
+            // One summary per opportunity, so the execution log can be read at the level of
+            // "what did this save do" without reconstructing it from the per-order lines.
+            log.audit({
+                title: opsyncConfig.logKey('SYNC_SUMMARY'),
+                details: 'Opportunity ' + opportunityId + ': ' + orderIds.length +
+                    ' sales order(s) — ' + updated + ' updated, ' + unchanged + ' unchanged, ' +
+                    skipped + ' skipped as excluded. Status ' + mappedStatusId + '.'
+            });
 
         } catch (e) {
             // The opportunity has already saved. Nothing here may change that.
