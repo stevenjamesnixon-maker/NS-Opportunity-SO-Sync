@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.5.1
+ * @version 1.5.2
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.5.1';
+    var VERSION = '1.5.2';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -91,9 +91,14 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * changed in the UI tomorrow by someone who will never read this file, and nothing in the
      * script would notice. This test survives that change; isEmpty() does not.
      *
-     * So use this for every presence-gates-shipping test, whether or not the type is confirmed.
-     * The one field still on !isEmpty() is custbody_installer_subcontract_receive — see the open
-     * question in docs/context.md section 10.
+     * So use this for EVERY presence-gates-shipping test, whether or not the type is confirmed.
+     * There is no longer an exception: custbody_installer_subcontract_receive was the last one
+     * on !isEmpty() and moved across in 1.5.2. A new presence test written as !isEmpty() is the
+     * defect, not the field it happens to be reading.
+     *
+     * It is correct on a lookupFields result as well as on a record, and the subcontract field
+     * is the proof: lookupValue() stringifies, so an unticked checkbox arrives as the STRING
+     * "false" rather than as boolean false. Both shapes are rejected below, by name.
      *
      * So false, '' , null and undefined are all absent. The string forms 'F' and 'false' are
      * treated as absent too, in case a checkbox reaches this by a path that stringifies it —
@@ -568,7 +573,22 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         if (gates.requiresCerts) {
 
             // 1. Subcontract. Either field satisfies it.
-            if (!isEmpty(order.subcontractReceived)) {
+            //
+            //    BOTH sides go through the presence test. The modern field's type is still
+            //    unconfirmed, and it was the last !isEmpty() presence test in this script — the
+            //    one place a type change in the UI could still flip a condition to fail OPEN,
+            //    in the ship-the-goods direction, with nothing logged.
+            //
+            //    IT ARRIVES FROM A lookupFields RESULT, NOT FROM THE RECORD, AND THAT IS WHY
+            //    THE TEST WORKS. lookupValue() stringifies, so an unticked checkbox reaches
+            //    here as the five-character string "false" rather than as boolean false — which
+            //    is exactly the shape !isEmpty() reads as PRESENT. The presence test rejects
+            //    'false' and 'F' by name for that case, so the lookup shape is covered as well
+            //    as the record shape.
+            //
+            //    It is a date today, so this changes no behaviour. The point is that the class
+            //    is closed rather than documented.
+            if (isLegacyPresent(order.subcontractReceived)) {
                 paths.subcontract = 'modern';
             } else if (isLegacyPresent(ctx.subcontractLegacy)) {
                 paths.subcontract = 'legacy';

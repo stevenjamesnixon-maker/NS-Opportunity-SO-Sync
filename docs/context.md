@@ -103,7 +103,7 @@ so it is where the sync belongs.
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
 | Shared config library | 1.6.1 | `lib/opsync_lib_config.js` | Every script ID in the project, and the eight script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.5.1 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Opportunity user event | 1.5.2 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -218,7 +218,7 @@ evaluated **independently**:
 
 | # | Condition | Satisfied by | Failure reason |
 |---|---|---|---|
-| 1 | Subcontract | `custbody_installer_subcontract_receive` **or** `custbodysubcontract_received_legacy` | `Subcontract agreement not received` |
+| 1 | Subcontract | `custbody_installer_subcontract_receive` **or** `custbodysubcontract_received_legacy` — **both** through the presence test | `Subcontract agreement not received` |
 | 2 | Installer qualification | `custbody_installer_qual_logged_legacy`, **else** the customer's qualification expiry | `Installer not set on opportunity` / `Installer qualification certificate missing` / `… expired` |
 | 3 | Public Liability | `custbody_installer_pl_logged_legacy`, **else** the customer's PL expiry | `Installer not set on opportunity` / `Public Liability certificate missing` / `… expired` |
 | 4 | DNO | `custbody38` **on the opportunity** in `getDnoOkValues()` — blank or absent fails. **No legacy path exists** | `Awaiting DNO` |
@@ -308,8 +308,16 @@ path that stringifies it. It is also correct for a date, which is why a confirme
 > `custbody_voucher_approval_date` today. It would stop being correct the moment somebody
 > changes that field to a checkbox in the UI, and nothing in the script would notice — the
 > failure is silent and in the ship-the-goods direction. **Close the class, not the instance.**
-> The one field still on `!isEmpty()` is `custbody_installer_subcontract_receive`, whose type is
-> still open — see section 10.
+>
+> **There is no longer any exception.** `custbody_installer_subcontract_receive` was the last
+> `!isEmpty()` test of this kind and moved across in 1.5.2. If a new presence-gates-shipping
+> test appears on `!isEmpty()`, that is the defect — not the field it happens to be reading.
+
+**It works on a `lookupFields` result as well as on a record, and the subcontract field is the
+proof.** That field is read through `lookupValue()`, which stringifies, so an unticked checkbox
+arrives as the five-character string `"false"` rather than as boolean `false` — precisely the
+shape `!isEmpty()` reads as **present**. The test rejects `'false'` and `'F'` by name for that
+case, so both shapes are covered.
 
 > **An unticked checkbox arrives as boolean `false`, and `String(false)` is the five-character
 > string `"false"`.** A presence test written as `!isEmpty(value)` or `value !== ''` therefore
@@ -944,14 +952,16 @@ back to `oldRecord` instead of reading a populated field as blank.
 | Ready for delivery | `custbody_ready_for_delivery` | Checkbox | boolean | `isTicked()` |
 | Delivery hold reason | `custbody_delivery_hold_reason` | Long text | string | `lookupValue()` |
 | Quote type | `custbody_quote_type` | List/Record → Quote Type | **array** | `lookupValue()` |
-| Subcontract received | `custbody_installer_subcontract_receive` | **Unconfirmed** — see the warning below | string | `lookupValue()` + `isEmpty()` |
+| Subcontract received | `custbody_installer_subcontract_receive` | **Unconfirmed**, and no longer load-bearing — see below | string | `lookupValue()` + `isLegacyPresent()` |
 
-> ⚠️ **`custbody_installer_subcontract_receive`'s type is not confirmed, and it matters.** It is
-> tested with `!isEmpty()`. If it is a **checkbox**, `lookupFields` returns boolean `false` for
-> unticked, `String(false)` is `"false"`, and `isEmpty("false")` is `false` — so an **unticked
-> box would satisfy the subcontract condition**. It fails open, in the ship-the-goods direction,
-> and logs nothing. Confirm the type; if it is a checkbox, route it through `isLegacyPresent()`
-> as the legacy flags already are.
+> ✅ **`custbody_installer_subcontract_receive`'s type is still not confirmed, and it no longer
+> matters.** It was tested with `!isEmpty()`, which would have read an **unticked checkbox as
+> satisfying the subcontract condition**: `lookupFields` returns boolean `false` for unticked,
+> `lookupValue()` stringifies it to `"false"`, and `isEmpty("false")` is `false`. It failed open,
+> in the ship-the-goods direction, and logged nothing. **Closed in 1.5.2** — it goes through the
+> presence test like the legacy flags and the voucher date, which rejects `'false'` and `'F'` by
+> name for exactly that shape. It is a date today, so nothing changed in behaviour; what changed
+> is that the answer stopped being needed.
 
 #### Written to the SALES ORDER — one `record.submitFields` per order
 
@@ -994,13 +1004,13 @@ because the equivalent opportunity fields are unstored sourced fields and cannot
 | 5 | How should XEDIT's sparse `newRecord` be handled? | Read `newRecord` first, fall back to `oldRecord`. See section 5. | 2026-09-14 |
 | 6 | Should the mapping be a field on `customrecord_fin_stat`? | **No, and the field will not be created.** It is the script parameter `custscript_opsync_status_map`. The record approach was specified, written, and abandoned after Sandbox testing — a single pair of IDs does not justify a custom record. See section 5. | 2026-09-14 |
 | — | Should the status internal IDs stay in this document as human reference? | **No.** Every one removed, and the rule now has no exceptions. See section 3. | 2026-09-14 |
+| 0b | What TYPE is `custbody_installer_subcontract_receive`? | **The code no longer needs the answer**, which is the only durable way to close it. It was the last presence-gates-shipping test on `!isEmpty()`; in 1.5.2 it moved to the project presence test, which is correct for checkbox, date and text alike and rejects the stringified `"false"` that a `lookupFields` result would deliver. Still worth confirming for its own sake. | 2026-09-15 |
 
 ### Open questions
 
 | # | Question | Status |
 |---|---|---|
 | 0 | What TYPE are the three legacy evidence fields — checkbox, date or text? | **Open, and the code does not need the answer.** `isLegacyPresent()` is correct for all three. Worth confirming anyway: if any is a checkbox, §9 scenario 61 is the one that must pass. |
-| 0b | What TYPE is `custbody_installer_subcontract_receive`? | **Open, and the code DOES need the answer.** It is the **only** presence-gates-shipping test still on `!isEmpty()`, which reads an unticked checkbox as satisfied — see the warning in the field table above. If it is a checkbox this is a live fail-open defect. The voucher date closed the same class in 1.5.1 by moving to `isLegacyPresent()`; this one has not, because it is read from a `lookupFields` result rather than the record and the change was out of scope for that patch. |
 | 1 | Should `custbody_cad_worklist` on existing sales orders be **cleared** when the worklist record retires, or left as history? | **Open.** Clearing is a one-off data job, not something this feature does. Leaving it means a field pointing at a retired record. Nothing in this repo reads or writes it. |
 | 2 | Is the *Won* gate early enough to be useful? | **Open, and knowingly accepted.** See section 6. It is a parameter, so widening it needs no code. |
 
