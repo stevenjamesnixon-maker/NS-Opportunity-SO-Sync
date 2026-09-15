@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.6.0
+ * @version 1.6.1
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.6.0';
+    var VERSION = '1.6.1';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -976,10 +976,10 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             // one. Same source, same helper, same presence test — and consulted only after the
             // approval date has been found blank, so it cannot contradict an approval.
             //
-            // ⚠️ Its Applies To is NOT confirmed. If it is not on the opportunity this read
-            // returns blank rather than erroring, and every 'Awaiting BUS voucher approval'
-            // silently becomes 'Awaiting BUS voucher application'. See the field constant in
-            // opsync_lib_config.js and open question 3 in docs/context.md section 10.
+            // ON THE OPPORTUNITY, Date — confirmed from the field definition's Applies To, so
+            // this read is the right one. Were it ever moved, this would return blank rather
+            // than erroring and every 'Awaiting BUS voucher approval' would silently become
+            // 'Awaiting BUS voucher application'. Section 9 scenario 70 is what would catch it.
             applicationDate: effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.APPLICATION_DATE, sparse),
             // '' when the parameter is unset, which applies the BUS condition to everything

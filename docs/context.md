@@ -102,8 +102,8 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.7.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the eight script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.6.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Shared config library | 1.7.1 | `lib/opsync_lib_config.js` | Every script ID in the project, and the eight script parameters — including the status mapping | Not deployed |
+| Opportunity user event | 1.6.1 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -267,7 +267,7 @@ order.
 | Field | Script ID | Type |
 |---|---|---|
 | Voucher approval date | `custbody_voucher_approval_date` | **Date — confirmed.** Tested with `isPresent()`, not `isEmpty()` |
-| Voucher **application** date | `custbody_application_date` | **Date — Applies To NOT confirmed.** See open question 3 |
+| Voucher **application** date | `custbody_application_date` | **Date — confirmed.** Tested with `isPresent()`, not `isEmpty()` |
 | Intended for BUS | `custbody_bus_project_rhi_intended` | List → `customlist92` (*YesNo*) |
 
 The rule, evaluated inside the certificate gate and **only** there:
@@ -301,11 +301,13 @@ make the whole condition moot.
 **The application date is only ever consulted once the approval date is known to be blank**, so
 it can never contradict an approval.
 
-> ⚠️ **`custbody_application_date`'s Applies To is NOT confirmed**, unlike every other field in
-> this table. If it is not on the opportunity the read returns **blank** rather than erroring —
-> and the failure is silent and specific: every `Awaiting BUS voucher approval` becomes
-> `Awaiting BUS voucher application`, rewriting a genuine wait as somebody's job. **Confirm
-> before deployment.** See section 0 trap 6, and open question 3.
+**All three are confirmed on the Opportunity from their field definitions' Applies To**, which
+for `custbody_application_date` is what makes the read above the right one. A field that does
+not apply to the record being asked returns **blank** rather than erroring, and blank is not
+inert here: it would rewrite every `Awaiting BUS voucher approval` as `Awaiting BUS voucher
+application` — a genuine wait reported as somebody's job, with nothing logged. §9 scenario 70
+is the regression test, and the only thing that would notice if the field were moved. See
+section 0, trap 6.
 
 **Blank is deliberately treated as "intended" and holds the order.** A project that should have
 claimed a voucher and shipped without one cannot claim it retrospectively, so the safe direction
@@ -938,7 +940,7 @@ certificate gate is the definition. Check `busNo=`, `rhiRaw=… -> …` and `vou
 | # | Scenario | Expected |
 |---|---|---|
 | 69 | Heat pump, RHI = *Yes*, voucher date present, all else passing | **Ready**, blank reason |
-| 70 | Heat pump, RHI = *Yes*, voucher date **blank**, application date **present** | Not ready, `Awaiting BUS voucher approval`. **This is also the Applies To test for `custbody_application_date`** — if it reports *application* instead, the field is not on the opportunity and is reading blank. See open question 3 |
+| 70 | Heat pump, RHI = *Yes*, voucher date **blank**, application date **present** | Not ready, `Awaiting BUS voucher approval`. **Also the standing regression test for `custbody_application_date` being on the opportunity** — if it reports *application* instead, the field is reading blank because it has been moved. Confirmed 2026-09-15, so this now guards a known-good fact rather than probing an open one; a moved field fails silently and nothing else would notice. See closed question 7 |
 | 71 | Heat pump, RHI = *No*, voucher date blank, all else passing | **Ready** — the condition does not apply |
 | 72 | Heat pump, RHI **blank**, voucher date blank | Not ready, `BUS intention not confirmed`. A different reason from 70 on purpose — a missing answer, not a wait |
 | 73 | Heat pump, RHI blank, voucher date **present** | **Ready** — an approved voucher answers the question regardless |
@@ -979,7 +981,7 @@ back to `oldRecord` instead of reading a populated field as blank.
 | Legacy qualification | `custbody_installer_qual_logged_legacy` | **Unconfirmed** | `isPresent()` |
 | Legacy PL | `custbody_installer_pl_logged_legacy` | **Unconfirmed** | `isPresent()` |
 | **Voucher approval date** | `custbody_voucher_approval_date` | **Date — confirmed** | `isPresent()` — presence only, never parsed |
-| **Voucher application date** | `custbody_application_date` | Date — **Applies To NOT confirmed**, see question 3 | `isPresent()` — presence only, never parsed |
+| **Voucher application date** | `custbody_application_date` | **Date — confirmed** | `isPresent()` — presence only, never parsed |
 | **Intended for BUS** | `custbody_bus_project_rhi_intended` | **List → `customlist92` (*YesNo*) — confirmed** | `asSelectId()` |
 
 #### Read from the SALES ORDER — one `search.lookupFields` per order
@@ -1043,6 +1045,7 @@ because the equivalent opportunity fields are unstored sourced fields and cannot
 | 5 | How should XEDIT's sparse `newRecord` be handled? | Read `newRecord` first, fall back to `oldRecord`. See section 5. | 2026-09-14 |
 | 6 | Should the mapping be a field on `customrecord_fin_stat`? | **No, and the field will not be created.** It is the script parameter `custscript_opsync_status_map`. The record approach was specified, written, and abandoned after Sandbox testing — a single pair of IDs does not justify a custom record. See section 5. | 2026-09-14 |
 | — | Should the status internal IDs stay in this document as human reference? | **No.** Every one removed, and the rule now has no exceptions. See section 3. | 2026-09-14 |
+| 7 | Is `custbody_application_date` **on the Opportunity**? *(was open question 3 — renumbered on closing, because this table already had a 3)* | **Yes — Opportunity, Date**, read from the field definition's Applies To. It was implemented opportunity-level in 1.6.0 on the specification alone, because that session had no NetSuite access; the assumption markers cleared in 1.6.1. §9 scenario 70 stays as the **regression test** rather than being retired with the question: it is the only thing that would notice if the field were ever moved, and a moved field fails silently. | 2026-09-15 |
 | 0b | What TYPE is `custbody_installer_subcontract_receive`? | **The code no longer needs the answer**, which is the only durable way to close it. It was the last presence-gates-shipping test on `!isEmpty()`; in 1.5.2 it moved to the project presence test, which is correct for checkbox, date and text alike and rejects the stringified `"false"` that a `lookupFields` result would deliver. Still worth confirming for its own sake. | 2026-09-15 |
 
 ### Open questions
@@ -1050,7 +1053,6 @@ because the equivalent opportunity fields are unstored sourced fields and cannot
 | # | Question | Status |
 |---|---|---|
 | 0 | What TYPE are the three legacy evidence fields — checkbox, date or text? | **Open, and the code does not need the answer.** `isPresent()` is correct for all three. Worth confirming anyway: if any is a checkbox, §9 scenario 61 is the one that must pass. |
-| 3 | Is `custbody_application_date` **on the Opportunity**? | **OPEN, AND IT MUST BE ANSWERED BEFORE DEPLOYMENT.** It was specified as opportunity-level and implemented on that basis in 1.6.0, but unlike every other field in this project its Applies To has **not been read from the field definition** — the implementation had no NetSuite access. If it is not on the opportunity, `getValue()` returns **blank** rather than erroring, and the effect is silent and specific: the fourth branch of condition 5 always fires, so every `Awaiting BUS voucher approval` is rewritten as `Awaiting BUS voucher application` — a genuine wait reported as somebody's job. §9 scenario 70 is the one that catches it. This is section 0 trap 6 with a live instance. |
 | 1 | Should `custbody_cad_worklist` on existing sales orders be **cleared** when the worklist record retires, or left as history? | **Open.** Clearing is a one-off data job, not something this feature does. Leaving it means a field pointing at a retired record. Nothing in this repo reads or writes it. |
 | 2 | Is the *Won* gate early enough to be useful? | **Open, and knowingly accepted.** See section 6. It is a parameter, so widening it needs no code. |
 
@@ -1065,6 +1067,6 @@ Not code. These are account changes the scripts assume have been made.
 | 3 | Create the two checkboxes on the Quote Type record and tick them per quote type | Section 4. Until they exist every quote type reads as "design required, certificates not required" — orders will be gated on design alone. |
 | 4 | Set `custbody_ready_for_delivery` and `custbody_delivery_hold_reason` to **Inline Text** on all sales order forms | The script owns both fields. If users can edit them, their edits are silently overwritten on the next opportunity save. |
 | 5 | Confirm `customrecord16`, `custbody38` and `customlist92` are those exact script IDs in **both** environments | Section 6. Auto-assigned ids carry no cross-account guarantee, and a wrong `custbody38` reads as blank — every order then reports *Awaiting DNO*. A wrong `customlist92` means the *No* option id in `custscript_opsync_bus_no_value` matches nothing and every heat pump order is held for a voucher. |
-| 8 | **Confirm `custbody_application_date`'s Applies To includes Opportunity** — open the field definition and read it | Open question 3. It is the only field in this project committed without that check. If it is not on the opportunity, every *Awaiting BUS voucher approval* becomes *Awaiting BUS voucher application* silently. **Do this before the first Sandbox run**, not after. |
+| 8 | ✅ **DONE 2026-09-15** — confirm `custbody_application_date`'s Applies To includes Opportunity | Closed question 7. Confirmed **Opportunity, Date** from the field definition. Kept here rather than deleted so the check is visible as having happened: it was the only field in this project committed before that check, and §9 scenario 70 is now its standing regression test. |
 | 7 | Set `custscript_opsync_bus_no_value` to the `customlist92` **No** option id in each environment | Section 4. It is a list option internal id and differs by account. Unset, the BUS condition applies to every heat pump order — safe, but everything is held. |
 | 6 | Check `OPPSYNC_MAP_PARSED` in the log after the first save in each environment | Section 9, scenario 25. A hand-typed parameter of seven ID pairs is the most likely thing to be wrong, and this is the only place it becomes visible. |

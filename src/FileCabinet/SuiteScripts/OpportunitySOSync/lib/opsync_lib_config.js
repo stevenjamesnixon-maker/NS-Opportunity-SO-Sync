@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.7.0
+ * @version 1.7.1
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.7.0';
+    var VERSION = '1.7.1';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -182,13 +182,15 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          * not-yet-applied is somebody's job. Only ever consulted once the voucher approval date
          * is known to be blank, so it can never contradict an approval.
          *
-         * ⚠️ APPLIES TO NOT CONFIRMED — see docs/context.md section 10, open question 3. Every
-         * other field in this block was confirmed on the Opportunity before it was committed;
-         * this one was specified as opportunity-level but the field definition has not been
-         * read. If it is NOT on the opportunity it returns BLANK rather than erroring, and the
-         * failure is silent and specific: every "Awaiting BUS voucher approval" becomes
-         * "Awaiting BUS voucher application", rewriting a genuine wait as somebody's job.
-         * Confirm before deployment. See section 0, trap 6.
+         * ON THE OPPORTUNITY, Date — confirmed from the field definition's Applies To, like
+         * every other field in this block. See docs/context.md section 10, closed question 7.
+         *
+         * That it is opportunity-level is the load-bearing part, not a detail: a field that
+         * does not apply to the record being asked returns BLANK rather than erroring, and here
+         * blank is not inert. It would rewrite every "Awaiting BUS voucher approval" as
+         * "Awaiting BUS voucher application" — a genuine wait reported as somebody's job, with
+         * nothing logged. Section 9 scenario 70 is the regression test for that, and it is the
+         * only thing that would notice if the field were ever moved. See section 0, trap 6.
          */
         APPLICATION_DATE: 'custbody_application_date',
         /**
