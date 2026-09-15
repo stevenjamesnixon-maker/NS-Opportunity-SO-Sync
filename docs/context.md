@@ -102,8 +102,8 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.6.2 | `lib/opsync_lib_config.js` | Every script ID in the project, and the eight script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.5.3 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Shared config library | 1.7.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the eight script parameters — including the status mapping | Not deployed |
+| Opportunity user event | 1.6.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -222,7 +222,7 @@ evaluated **independently**:
 | 2 | Installer qualification | `custbody_installer_qual_logged_legacy`, **else** the customer's qualification expiry | `Installer not set on opportunity` / `Installer qualification certificate missing` / `… expired` |
 | 3 | Public Liability | `custbody_installer_pl_logged_legacy`, **else** the customer's PL expiry | `Installer not set on opportunity` / `Public Liability certificate missing` / `… expired` |
 | 4 | DNO | `custbody38` **on the opportunity** in `getDnoOkValues()` — blank or absent fails. **No legacy path exists** | `Awaiting DNO` |
-| 5 | BUS voucher | `custbody_bus_project_rhi_intended` = `getBusNoValue()` (condition does not apply), **else** `custbody_voucher_approval_date` non-blank. **No legacy path exists** | `BUS intention not confirmed` / `Awaiting BUS voucher approval` |
+| 5 | BUS voucher | `custbody_bus_project_rhi_intended` = `getBusNoValue()` (condition does not apply), **else** `custbody_voucher_approval_date` non-blank. **No legacy path exists** | `BUS intention not confirmed` / `Awaiting BUS voucher application` / `Awaiting BUS voucher approval` — **at most one** |
 
 **`Installer not set on opportunity` is de-duplicated.** Conditions 2 and 3 raise it
 independently, and one missing installer is one problem to fix — saying so twice reads as two.
@@ -267,6 +267,7 @@ order.
 | Field | Script ID | Type |
 |---|---|---|
 | Voucher approval date | `custbody_voucher_approval_date` | **Date — confirmed.** Tested with `isPresent()`, not `isEmpty()` |
+| Voucher **application** date | `custbody_application_date` | **Date — Applies To NOT confirmed.** See open question 3 |
 | Intended for BUS | `custbody_bus_project_rhi_intended` | List → `customlist92` (*YesNo*) |
 
 The rule, evaluated inside the certificate gate and **only** there:
@@ -275,14 +276,42 @@ The rule, evaluated inside the certificate gate and **only** there:
    apply**, passes with no check.
 2. Otherwise `custbody_voucher_approval_date` is not blank → **passes**.
 3. Otherwise the intention is **blank** → not ready, `BUS intention not confirmed`.
-4. Otherwise → not ready, `Awaiting BUS voucher approval`.
+4. Otherwise `custbody_application_date` is **blank** → not ready,
+   `Awaiting BUS voucher application`.
+5. Otherwise → not ready, `Awaiting BUS voucher approval`.
+
+**The three failure reasons are actioned by three different people**, which is the whole reason
+they are separate:
+
+| Reason | What it means | Who acts |
+|---|---|---|
+| `BUS intention not confirmed` | Nobody has recorded whether this project is for BUS | Whoever owns the opportunity — it may make the condition moot |
+| `Awaiting BUS voucher application` | Intended for BUS, nobody has applied yet | Whoever submits applications — this is a job, not a wait |
+| `Awaiting BUS voucher approval` | Applied, waiting on the scheme | Nobody here. A genuine wait, and nothing to chase |
+
+**At most one BUS reason ever appears in the hold string.** It is one `if/else` chain, not four
+independent tests. Two BUS reasons at once would read as two problems where there is one — do
+not refactor it into separate `if`s.
+
+**The intention question takes precedence over the application question.** A blank intention
+reports `BUS intention not confirmed` whether or not an application date exists: an application
+recorded against an unrecorded intention is still an unanswered question, and answering it may
+make the whole condition moot.
+
+**The application date is only ever consulted once the approval date is known to be blank**, so
+it can never contradict an approval.
+
+> ⚠️ **`custbody_application_date`'s Applies To is NOT confirmed**, unlike every other field in
+> this table. If it is not on the opportunity the read returns **blank** rather than erroring —
+> and the failure is silent and specific: every `Awaiting BUS voucher approval` becomes
+> `Awaiting BUS voucher application`, rewriting a genuine wait as somebody's job. **Confirm
+> before deployment.** See section 0 trap 6, and open question 3.
 
 **Blank is deliberately treated as "intended" and holds the order.** A project that should have
 claimed a voucher and shipped without one cannot claim it retrospectively, so the safe direction
 is to hold and ask.
 
-**The two failure reasons are deliberately different and must not be merged.** One is a missing
-answer, the other is a genuine wait, and they are actioned by different people.
+**The failure reasons are deliberately different and must not be merged.** See the table above.
 
 **There is no legacy path, and there is no legacy field to build one from.** The BUS scheme
 postdates the old process entirely; the three legacy flags say nothing about a voucher and must
@@ -909,13 +938,16 @@ certificate gate is the definition. Check `busNo=`, `rhiRaw=… -> …` and `vou
 | # | Scenario | Expected |
 |---|---|---|
 | 69 | Heat pump, RHI = *Yes*, voucher date present, all else passing | **Ready**, blank reason |
-| 70 | Heat pump, RHI = *Yes*, voucher date **blank** | Not ready, `Awaiting BUS voucher approval` |
+| 70 | Heat pump, RHI = *Yes*, voucher date **blank**, application date **present** | Not ready, `Awaiting BUS voucher approval`. **This is also the Applies To test for `custbody_application_date`** — if it reports *application* instead, the field is not on the opportunity and is reading blank. See open question 3 |
 | 71 | Heat pump, RHI = *No*, voucher date blank, all else passing | **Ready** — the condition does not apply |
 | 72 | Heat pump, RHI **blank**, voucher date blank | Not ready, `BUS intention not confirmed`. A different reason from 70 on purpose — a missing answer, not a wait |
 | 73 | Heat pump, RHI blank, voucher date **present** | **Ready** — an approved voucher answers the question regardless |
 | 74 | Heat emitter / UFH quote type (certificates **not** required), RHI blank, voucher blank | **Ready** — the certificate gate does not run, so BUS is never reached |
 | 75 | Heat pump, design incomplete **and** voucher missing | Not ready, `Design not complete; Awaiting BUS voucher approval` — BUS is appended after DNO, and the design reason still comes first |
 | 76 | All three legacy flags set, RHI = *Yes*, voucher blank | **Not ready.** Legacy does not satisfy BUS — there is no legacy path and no legacy BUS field |
+| 78 | Heat pump, RHI = *Yes*, voucher date blank, application date **blank** | Not ready, `Awaiting BUS voucher application` |
+| 79 | Heat pump, RHI **blank**, voucher date blank, application date **present** | Not ready, `BUS intention not confirmed` — the intention question still takes precedence, and **only one** BUS reason appears |
+| 80 | Heat pump, RHI = *No*, voucher date blank, application date blank | **Ready.** The condition does not apply, so **no BUS reason of either kind** |
 | 77 | Clear `custscript_opsync_bus_no_value` and save a heat pump order at RHI = *No* | `OPPSYNC_PARAMETER_MISSING` at **error**, **no `OPPSYNC_FAILED`**, and the order is **held** — `Awaiting BUS voucher approval`. Empty applies the condition to everything; it does not throw. **Revert afterwards** |
 
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
@@ -947,6 +979,7 @@ back to `oldRecord` instead of reading a populated field as blank.
 | Legacy qualification | `custbody_installer_qual_logged_legacy` | **Unconfirmed** | `isPresent()` |
 | Legacy PL | `custbody_installer_pl_logged_legacy` | **Unconfirmed** | `isPresent()` |
 | **Voucher approval date** | `custbody_voucher_approval_date` | **Date — confirmed** | `isPresent()` — presence only, never parsed |
+| **Voucher application date** | `custbody_application_date` | Date — **Applies To NOT confirmed**, see question 3 | `isPresent()` — presence only, never parsed |
 | **Intended for BUS** | `custbody_bus_project_rhi_intended` | **List → `customlist92` (*YesNo*) — confirmed** | `asSelectId()` |
 
 #### Read from the SALES ORDER — one `search.lookupFields` per order
@@ -1017,6 +1050,7 @@ because the equivalent opportunity fields are unstored sourced fields and cannot
 | # | Question | Status |
 |---|---|---|
 | 0 | What TYPE are the three legacy evidence fields — checkbox, date or text? | **Open, and the code does not need the answer.** `isPresent()` is correct for all three. Worth confirming anyway: if any is a checkbox, §9 scenario 61 is the one that must pass. |
+| 3 | Is `custbody_application_date` **on the Opportunity**? | **OPEN, AND IT MUST BE ANSWERED BEFORE DEPLOYMENT.** It was specified as opportunity-level and implemented on that basis in 1.6.0, but unlike every other field in this project its Applies To has **not been read from the field definition** — the implementation had no NetSuite access. If it is not on the opportunity, `getValue()` returns **blank** rather than erroring, and the effect is silent and specific: the fourth branch of condition 5 always fires, so every `Awaiting BUS voucher approval` is rewritten as `Awaiting BUS voucher application` — a genuine wait reported as somebody's job. §9 scenario 70 is the one that catches it. This is section 0 trap 6 with a live instance. |
 | 1 | Should `custbody_cad_worklist` on existing sales orders be **cleared** when the worklist record retires, or left as history? | **Open.** Clearing is a one-off data job, not something this feature does. Leaving it means a field pointing at a retired record. Nothing in this repo reads or writes it. |
 | 2 | Is the *Won* gate early enough to be useful? | **Open, and knowingly accepted.** See section 6. It is a parameter, so widening it needs no code. |
 
@@ -1031,5 +1065,6 @@ Not code. These are account changes the scripts assume have been made.
 | 3 | Create the two checkboxes on the Quote Type record and tick them per quote type | Section 4. Until they exist every quote type reads as "design required, certificates not required" — orders will be gated on design alone. |
 | 4 | Set `custbody_ready_for_delivery` and `custbody_delivery_hold_reason` to **Inline Text** on all sales order forms | The script owns both fields. If users can edit them, their edits are silently overwritten on the next opportunity save. |
 | 5 | Confirm `customrecord16`, `custbody38` and `customlist92` are those exact script IDs in **both** environments | Section 6. Auto-assigned ids carry no cross-account guarantee, and a wrong `custbody38` reads as blank — every order then reports *Awaiting DNO*. A wrong `customlist92` means the *No* option id in `custscript_opsync_bus_no_value` matches nothing and every heat pump order is held for a voucher. |
+| 8 | **Confirm `custbody_application_date`'s Applies To includes Opportunity** — open the field definition and read it | Open question 3. It is the only field in this project committed without that check. If it is not on the opportunity, every *Awaiting BUS voucher approval* becomes *Awaiting BUS voucher application* silently. **Do this before the first Sandbox run**, not after. |
 | 7 | Set `custscript_opsync_bus_no_value` to the `customlist92` **No** option id in each environment | Section 4. It is a list option internal id and differs by account. Unset, the BUS condition applies to every heat pump order — safe, but everything is held. |
 | 6 | Check `OPPSYNC_MAP_PARSED` in the log after the first save in each environment | Section 9, scenario 25. A hand-typed parameter of seven ID pairs is the most likely thing to be wrong, and this is the only place it becomes visible. |

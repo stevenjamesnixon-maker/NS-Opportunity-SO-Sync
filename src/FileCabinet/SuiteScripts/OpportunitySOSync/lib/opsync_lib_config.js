@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.6.2
+ * @version 1.7.0
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.6.2';
+    var VERSION = '1.7.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -174,6 +174,23 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
         /** Date. Non-blank means the voucher has been approved. Presence test only, no expiry. */
         VOUCHER_APPROVAL_DATE: 'custbody_voucher_approval_date',
+        /**
+         * Date. Non-blank means the voucher has been APPLIED for — not approved. Presence test
+         * only, no expiry.
+         *
+         * It splits one failure into two: applied-and-waiting is a genuine wait on the scheme,
+         * not-yet-applied is somebody's job. Only ever consulted once the voucher approval date
+         * is known to be blank, so it can never contradict an approval.
+         *
+         * ⚠️ APPLIES TO NOT CONFIRMED — see docs/context.md section 10, open question 3. Every
+         * other field in this block was confirmed on the Opportunity before it was committed;
+         * this one was specified as opportunity-level but the field definition has not been
+         * read. If it is NOT on the opportunity it returns BLANK rather than erroring, and the
+         * failure is silent and specific: every "Awaiting BUS voucher approval" becomes
+         * "Awaiting BUS voucher application", rewriting a genuine wait as somebody's job.
+         * Confirm before deployment. See section 0, trap 6.
+         */
+        APPLICATION_DATE: 'custbody_application_date',
         /**
          * List -> customlist92 ("YesNo"). Is the project intended for BUS.
          *

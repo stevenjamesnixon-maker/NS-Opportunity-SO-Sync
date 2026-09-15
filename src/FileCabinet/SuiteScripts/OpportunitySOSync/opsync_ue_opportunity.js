@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.5.3
+ * @version 1.6.0
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.5.3';
+    var VERSION = '1.6.0';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -639,9 +639,22 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             //    without one cannot claim it retrospectively. The safe direction is to hold and
             //    ask.
             //
-            //    THE TWO FAILURE REASONS ARE DELIBERATELY DIFFERENT and must not be merged. One
-            //    is a missing answer and one is a genuine wait, and they are actioned by
-            //    different people.
+            //    THE THREE FAILURE REASONS ARE DELIBERATELY DIFFERENT and must not be merged.
+            //    Each is actioned by a different person:
+            //
+            //      'BUS intention not confirmed'      a missing answer — somebody must decide
+            //      'Awaiting BUS voucher application' nobody has applied yet — somebody's job
+            //      'Awaiting BUS voucher approval'    applied and waiting on the scheme — a
+            //                                         genuine wait, and nothing to chase here
+            //
+            //    AT MOST ONE OF THEM EVER APPEARS, because this is one if/else chain and not
+            //    four independent tests. Do not refactor it into separate ifs: two BUS reasons
+            //    in one hold string would read as two problems where there is one.
+            //
+            //    THE INTENTION QUESTION TAKES PRECEDENCE over the application question. A blank
+            //    intention reports 'BUS intention not confirmed' whether or not an application
+            //    date exists, because an application against an unrecorded intention is still
+            //    an unanswered question — and answering it may make the whole condition moot.
             //
             //    ctx.busNoValue IS CHECKED FOR EMPTY FIRST, and that guard is load-bearing. An
             //    unset parameter leaves it '', a blank intention normalises to '' too, and a
@@ -656,14 +669,18 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 //
                 // isPresent(), not isEmpty(), although the field is a CONFIRMED Date and
                 // isEmpty() would be correct for one. The tolerant test is correct for a date
-                // too, and this is the third field in this codebase where a type change in the
-                // UI would flip an isEmpty() test to fail OPEN, in the ship-the-goods direction.
-                // The class is closed here rather than the instance — see isPresent(),
-                // whose name is historical and does not mean legacy-only.
+                // too, and a type change in the UI would flip an isEmpty() test to fail OPEN,
+                // in the ship-the-goods direction. The class is closed, not the instance.
                 paths.busVoucher = 'approved';
             } else if (isEmpty(ctx.busRhiIntended)) {
                 paths.busVoucher = 'fail unconfirmed';
                 reasons.push('BUS intention not confirmed');
+            } else if (!isPresent(ctx.applicationDate)) {
+                // Reached ONLY when the intention is recorded and not "No", and the voucher is
+                // not yet approved. So the question is genuinely "has anyone applied", and a
+                // blank application date is the answer.
+                paths.busVoucher = 'fail not applied';
+                reasons.push('Awaiting BUS voucher application');
             } else {
                 paths.busVoucher = 'fail awaiting';
                 reasons.push('Awaiting BUS voucher approval');
@@ -843,7 +860,8 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                     ', rhiRaw=' + JSON.stringify(ctx.busRhiIntendedRaw) +
                     ' -> ' + (ctx.busRhiIntended || '(blank)') +
                     ', busNo=' + (ctx.busNoValue || '(unset — condition applies to all)') +
-                    ', voucherDate=' + (asDateKey(ctx.voucherApprovalDate) || '(blank)')
+                    ', voucherDate=' + (asDateKey(ctx.voucherApprovalDate) || '(blank)') +
+                    ', applicationDate=' + (asDateKey(ctx.applicationDate) || '(blank)')
             });
 
             // Both fields are written together or not at all: a reason without its checkbox, or
@@ -954,6 +972,16 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             voucherApprovalDate: effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.VOUCHER_APPROVAL_DATE,
                 sparse),
+            // The APPLICATION date, which is not the approval date and must never be read as
+            // one. Same source, same helper, same presence test — and consulted only after the
+            // approval date has been found blank, so it cannot contradict an approval.
+            //
+            // ⚠️ Its Applies To is NOT confirmed. If it is not on the opportunity this read
+            // returns blank rather than erroring, and every 'Awaiting BUS voucher approval'
+            // silently becomes 'Awaiting BUS voucher application'. See the field constant in
+            // opsync_lib_config.js and open question 3 in docs/context.md section 10.
+            applicationDate: effectiveValue(
+                newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.APPLICATION_DATE, sparse),
             // '' when the parameter is unset, which applies the BUS condition to everything
             // rather than to nothing. It does not throw — see getBusNoValue().
             busNoValue: opsyncConfig.getBusNoValue(),
