@@ -102,8 +102,11 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.8.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the nine script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.7.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Shared config library | 1.9.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the nine script parameters — including the status mapping | Not deployed |
+| Shared value library | 1.0.0 | `lib/opsync_lib_values.js` | The value-shape layer — one definition of what a select, a date or a presence flag *means*, whichever API returned it | Not deployed |
+| Shared readiness library | 1.0.0 | `lib/opsync_lib_readiness.js` | **The one definition of delivery readiness.** Both user events call it; neither has a copy | Not deployed |
+| Opportunity user event | 1.8.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Sales order user event | 1.0.0 | `opsync_ue_salesorder.js` | `afterSubmit` on Sales Order — re-evaluates readiness for that one order. Writes the two readiness fields and **nothing else** | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -401,6 +404,100 @@ hence the per-order try/catch at step 7 rather than one try/catch around the loo
 | `custbody_opp_del_date` | `custbody_defaultshipdate` | Direct — both dates, **unless the decided status suppresses it** (below) |
 | *(derived — see below)* | `custbody_ready_for_delivery` | Two gates on the Quote Type record |
 | *(derived — see below)* | `custbody_delivery_hold_reason` | The failed gates, joined with `; ` |
+
+### Readiness is evaluated by TWO scripts
+
+Until 1.8.0 readiness was evaluated only in the opportunity's `afterSubmit`, so it only
+refreshed when somebody saved the **opportunity**. Once design is complete people work on the
+**sales order** — the subcontract date, the quote type, the finance status — and nothing saves
+the opportunity, so nothing re-evaluated. The two readiness fields went stale exactly when the
+order was in active use, and a stale *ready* ships goods.
+
+`opsync_ue_salesorder.js` closes that. `afterSubmit` on the Sales Order, in order:
+
+1. Recursion guard — **change detection only**, see section 5.
+2. **No linked opportunity → skip.** No context to evaluate from.
+3. **Record Status in `getExcludedStatuses()` → skip.** The *same* list the opportunity script
+   uses — see below.
+4. Build the opportunity context: **one** `lookupFields` on the linked opportunity, then one on
+   the installer's customer record, **skipped entirely when the installer is blank**.
+5. Read the quote type's two checkboxes.
+6. Evaluate, compare with what the order holds, `submitFields` **only if something changed**.
+7. Log one line per save either way.
+
+**It writes two fields and only two** — `custbody_ready_for_delivery` and
+`custbody_delivery_hold_reason`. The Record Status and the expected ship date stay
+opportunity-driven. Adding a third field to that write is how the two scripts start fighting
+over one record.
+
+**The order's own fields come from `newRecord` through `effectiveValue()`**, the same XEDIT-aware
+fallback the opportunity script uses. An inline edit gives a sparse `newRecord` where an
+untouched field reads as *empty* rather than as *unchanged* — reading the quote type straight off
+it would see a blank quote type, skip the certificate gate, and mark a held order ready.
+
+#### One rule, two callers
+
+The evaluation moved into `lib/opsync_lib_readiness.js` and **neither script has a copy**.
+
+> **If the two callers ever disagree about an order, the result is worse than either answer on
+> its own.** Each writes its verdict over the other's, on a record people are reading, with
+> nothing logged to say they differ. One shared module is the only defence. Do not inline "just
+> this one check" into either entry point.
+
+`evaluate(oppContext, orderFacts)` **takes a context, not a record**, and never loads a record or
+runs a search — the callers fetch, it decides. That is what lets one rule serve a caller reading
+off the record being saved and a caller reading through `lookupFields`, which return the same
+field in different shapes: a select is a plain id one way and an array of `{value,text}` the
+other; a date is a `Date` one way and a localised string the other. Every value is normalised
+through `lib/opsync_lib_values.js`, which accepts both.
+
+#### The excluded list is reused, deliberately
+
+The sales order script tests `getExcludedStatuses()` — **not** a second definition based on the
+native transaction status. That list already means *"past the delivery gate or dead"*, and
+*Release to Warehouse* is already in it.
+
+**Two definitions of done are two answers to one question.** A second one would drift from the
+first, and the drift would show up as an order the opportunity thinks is live and the sales
+order thinks is finished.
+
+#### ⚠️ Six parameters now exist in TWO places
+
+Script parameters belong to a **script record**, so `customscript_opsync_ue_salesorder` needs its
+own copies of the six the evaluation uses:
+
+| Parameter | On the opportunity script | On the sales order script |
+|---|---|---|
+| `custscript_opsync_excluded_statuses` | ✅ | ✅ |
+| `custscript_opsync_design_ok_statuses` | ✅ | ✅ |
+| `custscript_opsync_dno_ok_values` | ✅ | ✅ |
+| `custscript_opsync_cust_qual_field` | ✅ | ✅ |
+| `custscript_opsync_cust_pl_field` | ✅ | ✅ |
+| `custscript_opsync_bus_no_value` | ✅ | ✅ |
+
+Same IDs, same failure-mode behaviour, **separate values**.
+
+> **They must be kept in step, and nothing enforces it.** If they diverge the opportunity and the
+> sales order will disagree about whether an order is ready — and disagree **silently**, each
+> overwriting the other on the next save of its own record. There is no log line for
+> "the two scripts hold different parameter values", because neither can see the other's.
+
+**This duplication was chosen deliberately over a shared configuration record**, and the
+trade-off was weighed rather than defaulted into:
+
+| | Duplicated parameters (chosen) | A shared config record |
+|---|---|---|
+| Environment-specific values stay out of the repo | Yes | Yes |
+| New NetSuite object to create in each account | None | One custom record, plus rows |
+| Cost per evaluation | A parameter read | **A search on every save of every order** |
+| Failure mode | Two values drift apart | One value, but a search that can fail or be slow |
+| Precedent in this project | The status map moved **off** a record and onto a parameter for exactly these reasons — section 5 | — |
+
+The deciding factor is the third row. The sales order script runs on **every save of every sales
+order**, which is far more often than the opportunity script runs, and a configuration search on
+that path is a cost paid forever to avoid a copy-paste that happens twice. The risk is real and
+is why it is flagged here, in the config library and in the deployment checklist — but a search
+per save is a worse permanent trade than a checklist item.
 
 ### Suppressing the ship date by status
 
@@ -748,6 +845,32 @@ Agreed mapping, seven rows, **by name**:
 - **The BUS voucher has no legacy path and cannot acquire one.** The scheme postdates the old
   process, so no legacy BUS field exists. Setting all three legacy flags does not satisfy it.
 
+- **There is NO supported API that identifies a save triggered by another user event, and the
+  recursion guard is change detection alone.**
+
+  The opportunity script writes to sales orders with `record.submitFields`, which fires
+  `opsync_ue_salesorder.js`. The obvious guard would be to detect that nesting and return. It
+  cannot be done:
+
+  | Candidate | Verdict |
+  |---|---|
+  | `runtime.executionContext` | **Does not distinguish it.** It reports the origin of the whole **request**, not the immediate trigger of the current script. A user event fired by another user event's `submitFields` during a UI save still reads `USERINTERFACE`. The `USEREVENT` context type exists for records generated in the backend, not for nesting. |
+  | `record.submitFields`'s `disableTriggers` | **Undocumented.** It is not in Oracle's SuiteScript 2.x reference for `submitFields`, which documents `enableSourcing` and `ignoreMandatoryFields` only. Building the recursion guarantee on undocumented behaviour that would fail *silently* is exactly what this project does not do. |
+  | A module-level "I am writing" flag | Does not survive across script executions — the two user events are separate executions. |
+
+  **So the guard is change detection and nothing else**, and it is sound: the opportunity script
+  has just written the readiness values, the sales order script evaluates the same context
+  through the same module, the verdict compares equal, and no `submitFields` happens. The chain
+  is **bounded at depth two** even when a write *is* warranted — the sales order script's own
+  write fires it again, which finds nothing to change and stops.
+
+  **It is single-layered and is deliberately named as one.** A second layer that did not
+  actually work would be worse than knowing there is one, because it would be trusted.
+
+  This also means the value-level comparison is now load-bearing in a second way. It was already
+  what keeps the feedback loop in section 0 trap 3 broken; it is now the only thing terminating
+  the opportunity → order → order chain. **Do not replace it with an early exit.**
+
 - **Legacy evidence is an OR, not an AND**, carries no expiry, and lives on the **opportunity**.
   See section 4 — including why its presence test is not `isEmpty()`, and why satisfying every
   linked order is intended rather than a leak.
@@ -847,6 +970,11 @@ drift between scripts.
 | `OPPSYNC_INSTALLER_UNREADABLE` | error | The installer customer record could not be read for the two certificate fields. **Both certificates read as missing**, so the order is held. | Check the customer record and the two field ids in the parameters. The held order is the safe outcome, not the bug. |
 | `OPPSYNC_SYNC_SUMMARY` | audit | One line per opportunity: how many orders were updated, unchanged and skipped, and the status written. Normal operation. | Nothing. Use it to read the log at the level of "what did this save do". |
 | `OPPSYNC_PARAMETER_MISSING` | error | A script parameter is unset, unreadable, or held nothing usable. Names the parameter. For the **qualifying** list and the **mapping** it is logged only and the script exits harmlessly. For the other six — **excluded statuses**, the four readiness parameters and the **no-ship-date statuses** — it is also **thrown**, so the save is abandoned before any sales order is written. See the table in section 5 for why the two behaviours differ. | Populate the parameter on the deployment **in this account**; the values differ by environment. See section 8. |
+| `OPPSYNC_SO_READINESS` | debug | **Sales order script.** One line per save of a sales order, written **whether or not anything changed**: order, opportunity, quote type, status, ready, reason, the certificate paths, and `written=true/false`. Normal operation. | Nothing. It exists because **a readiness value that did not change looks identical on the record to one that was never evaluated** — this line is the difference. |
+| `OPPSYNC_SO_READINESS_UPDATED` | audit | **Sales order script.** Readiness changed on the order's own save and was written. Names the before/after. Normal operation. | Nothing. This is the feature working — readiness refreshing without anyone touching the opportunity. |
+| `OPPSYNC_SO_SKIPPED` | debug | **Sales order script.** The order's Record Status is in the excluded list, so readiness is not applicable and nothing was evaluated or written. | Nothing. Same meaning as `OPPSYNC_ORDER_SKIPPED` on the opportunity side, and the **same** parameter — there is deliberately not a second definition of "done". |
+| `OPPSYNC_SO_NO_OPPORTUNITY` | debug | **Sales order script.** The order has no linked opportunity, so there is no context to evaluate readiness from. | Nothing. An order raised outside this process is not this script's business. If an order that *should* be linked shows this, check the native `opportunity` field — **not** `createdfrom`. |
+| `OPPSYNC_SO_FAILED` | error | **Sales order script.** Its entry point threw. **The sales order still saved**; its readiness fields may be out of step. | Read the logged error. Nothing in this feature may ever block a save, so a failure here is silent to the user. |
 | `OPPSYNC_FAILED` | error | The entry point threw outside the per-order loop. **The opportunity still saved**; its orders may be out of step. | Read the logged error. Nothing in this feature may ever block an opportunity save, so a failure here is always silent to the user. |
 
 > **Reserved — no script raises these.** Kept so a future session grepping for them finds this
@@ -867,17 +995,26 @@ rather than silently doing nothing — particularly for anything that fell throu
 Deployment is **manual File Cabinet upload**. There is no SDF project and no automated deploy.
 **Steve deploys. Claude never deploys.**
 
-1. **Upload `lib/opsync_lib_config.js` to the File Cabinet first.** The entry point imports it by
-   relative path and fails *at load time* if it is absent — the failure looks like a broken
-   script record, not a missing file.
-2. Upload `opsync_ue_opportunity.js`. It must sit in the **same folder** as `lib/`, with the
-   library beneath it — the import is a relative path.
+1. **Upload the three `lib/` modules to the File Cabinet first**, in this order — each imports
+   the one before it by relative path and fails *at load time* if it is absent, and the failure
+   looks like a broken script record rather than a missing file:
+
+   1. `lib/opsync_lib_config.js`
+   2. `lib/opsync_lib_values.js`
+   3. `lib/opsync_lib_readiness.js` — imports `opsync_lib_values`
+
+2. Upload **both** entry points, `opsync_ue_opportunity.js` and `opsync_ue_salesorder.js`. They
+   must sit in the **same folder** as `lib/`, with the libraries beneath them — the imports are
+   relative paths.
 3. Create or update the script record and deployment:
 
    | Script | Script ID | Deployment | Applies to |
    |---|---|---|---|
    | `opsync_ue_opportunity.js` | `customscript_opsync_ue_opportunity` | `customdeploy_opsync_ue_opportunity` | Opportunity. `afterSubmit` only |
+   | `opsync_ue_salesorder.js` | `customscript_opsync_ue_salesorder` | `customdeploy_opsync_ue_salesorder` | **Sales Order. `afterSubmit` only** |
    | `lib/opsync_lib_config.js` | — | **None.** Shared AMD module — File Cabinet upload only. Creating a script record for it is wrong | — |
+   | `lib/opsync_lib_values.js` | — | **None.** As above | — |
+   | `lib/opsync_lib_readiness.js` | — | **None.** As above | — |
 
 4. **Define the nine script parameters on the script record, and set their values on the
    deployment — BEFORE uploading the scripts that read them.** Six of the nine throw when unset
@@ -894,6 +1031,16 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    | Customer PL Field | `custscript_opsync_cust_pl_field` | Free-Form Text | The **script ID** of the Public Liability expiry date field on the customer record. As above. **Required.** |
    | BUS "No" Value | `custscript_opsync_bus_no_value` | Free-Form Text | The single `customlist92` option internal ID meaning **not intended for BUS**. **Not required — does not throw.** Unset, no value is recognised as *No*, so every heat pump order is held for a voucher: safe, but everything stops. |
    | No Ship Date Statuses | `custscript_opsync_no_shipdate_statuses` | Free-Form Text | Comma-separated Record Status internal IDs for which the **expected ship date is not written** — *Design Complete* and *Redraw Required*. The order keeps its own delivery date from that point. **Required — the script throws without it**, because an empty list suppresses nothing and the opportunity goes straight back to overwriting dates it should not. **Not the excluded list** — see section 4. |
+
+   **Then define SIX of them again on `customscript_opsync_ue_salesorder`**, with the **same
+   values**: `custscript_opsync_excluded_statuses`, `custscript_opsync_design_ok_statuses`,
+   `custscript_opsync_dno_ok_values`, `custscript_opsync_cust_qual_field`,
+   `custscript_opsync_cust_pl_field` and `custscript_opsync_bus_no_value`. Script parameters
+   belong to a script record, so there is no way to share them — see section 4 for why that
+   duplication was chosen over a configuration record, and what it costs.
+
+   ⚠️ **If the two sets ever diverge, the two scripts disagree about whether an order is ready
+   and each overwrites the other, silently.** Re-check both whenever either is changed.
 
    **All seven must be populated at deployment time, in each environment separately.** Their values
    are internal IDs and therefore **differ between Sandbox and Production** — read them off the
@@ -1044,6 +1191,26 @@ scenario 84 is a "nothing written" test and only the notes prove it.
 | 87 | Readiness at **Design Complete** with the parameter populated | Readiness **evaluated and written** normally. This is the scenario the excluded list would have broken |
 | 88 | Order **ready**, then moved to **Redraw Required** | Readiness **drops to not-ready** and the hold reason is written, while the ship date is suppressed. The second scenario the excluded list would have broken |
 
+### Readiness on sales order save
+
+Requires `customscript_opsync_ue_salesorder` deployed and its **six** parameters populated to
+match the opportunity script's. Grep for `OPPSYNC_SO_` after every one of these.
+
+| # | Scenario | Expected |
+|---|---|---|
+| 89 | Order at an **excluded** status, saved | **Skipped, no write.** `OPPSYNC_SO_SKIPPED` naming the status. Uses the *same* excluded list as the opportunity script — there is deliberately no second definition |
+| 90 | Order with **no linked opportunity**, saved | **Skipped, no write.** `OPPSYNC_SO_NO_OPPORTUNITY`. Check the native `opportunity` field, not `createdfrom` |
+| 91 | Order at a design-ok status, **subcontract date added**, all else valid | **Becomes ready**, hold reason cleared. `OPPSYNC_SO_READINESS_UPDATED`. This is the whole point of the feature — nobody touched the opportunity |
+| 92 | The same order, **subcontract date cleared** | **Becomes not ready**, `Subcontract agreement not received` |
+| 93 | Quote type changed from **UFH to heat pump** | The certificate gate now applies — readiness re-evaluated against all five conditions, not just design |
+| 94 | Order saved with **nothing relevant changed** | **Evaluated, no write.** `OPPSYNC_SO_READINESS` with `written=false`; no `submitFields`, no system note. Check the system notes, not just the fields |
+| 95 | **Save the opportunity**, which writes to the order | The sales order script fires, finds nothing to change, **writes nothing, no loop.** `OPPSYNC_SO_READINESS` with `written=false` immediately after `OPPSYNC_ORDER_UPDATED`. **This is the recursion test — run it deliberately**, and confirm the execution log does not repeat |
+| 96 | Installer **blank** on the opportunity, order saved | **No customer lookup performed.** `paths=…legacy` or `no installer` in `OPPSYNC_SO_READINESS` |
+| 97 | Any of the **six** sales-order-side parameters missing | Same behaviour as on the opportunity script — five throw and log `OPPSYNC_SO_FAILED`, `bus_no_value` fails closed. The **order still saves**. **Revert afterwards** |
+| 98 | The six parameters set to **different values** on the two script records — e.g. an extra design-ok status on one | The two scripts **disagree** and each overwrites the other on the next save of its own record. **There is no log line for this.** Run it once to see the failure mode, then put them back. This is the cost of the duplication in section 4 |
+| 99 | **Inline edit** a field on the sales order list view | Evaluated normally. This is the XEDIT path — a sparse `newRecord` must not read an untouched quote type as blank and skip the certificate gate |
+| 100 | **Full opportunity-side regression** — every scenario from 1 to 88 | **Unchanged.** The 1.8.0 refactor moved the evaluation into `lib/opsync_lib_readiness.js` and must not have altered a single verdict. Any scenario here that needs amending means the refactor changed something it should not have |
+
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
 ---
@@ -1160,6 +1327,8 @@ Not code. These are account changes the scripts assume have been made.
 | 4 | Set `custbody_ready_for_delivery` and `custbody_delivery_hold_reason` to **Inline Text** on all sales order forms | The script owns both fields. If users can edit them, their edits are silently overwritten on the next opportunity save. |
 | 5 | Confirm `customrecord16`, `custbody38` and `customlist92` are those exact script IDs in **both** environments | Section 6. Auto-assigned ids carry no cross-account guarantee, and a wrong `custbody38` reads as blank — every order then reports *Awaiting DNO*. A wrong `customlist92` means the *No* option id in `custscript_opsync_bus_no_value` matches nothing and every heat pump order is held for a voucher. |
 | 8 | ✅ **DONE 2026-09-15** — confirm `custbody_application_date`'s Applies To includes Opportunity | Closed question 7. Confirmed **Opportunity, Date** from the field definition. Kept here rather than deleted so the check is visible as having happened: it was the only field in this project committed before that check, and §9 scenario 70 is now its standing regression test. |
+| 10 | **Create the `customscript_opsync_ue_salesorder` script record and deployment**, `afterSubmit` on Sales Order | Section 4. Without it readiness only ever refreshes when somebody saves the opportunity, which is the defect Phase 6 exists to fix. |
+| 11 | **Define the SIX shared parameters on the sales order script record with the same values as the opportunity script**, and re-check both whenever either changes | Section 4. Script parameters belong to a script record and cannot be shared. If the two sets diverge the scripts disagree about readiness and overwrite each other — **silently**, because neither can see the other's values. |
 | 9 | **Define `custscript_opsync_no_shipdate_statuses` and populate it BEFORE uploading UE 1.7.0** — the *Design Complete* and *Redraw Required* Record Status ids, in each environment | Section 4. It **throws** when unset, so uploading the script first makes the whole sync inert — `OPPSYNC_PARAMETER_MISSING` and `OPPSYNC_FAILED` on every qualifying save, with nothing written. The parameter must exist before the code that reads it. |
 | 7 | Set `custscript_opsync_bus_no_value` to the `customlist92` **No** option id in each environment | Section 4. It is a list option internal id and differs by account. Unset, the BUS condition applies to every heat pump order — safe, but everything is held. |
 | 6 | Check `OPPSYNC_MAP_PARSED` in the log after the first save in each environment | Section 9, scenario 25. A hand-typed parameter of seven ID pairs is the most likely thing to be wrong, and this is the only place it becomes visible. |

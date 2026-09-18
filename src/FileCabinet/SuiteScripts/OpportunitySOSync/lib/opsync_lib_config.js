@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.8.0
+ * @version 1.9.0
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.8.0';
+    var VERSION = '1.9.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -71,6 +71,12 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          * code simply never loads it.
          */
         SALES_ORDER: 'salesorder',
+        /**
+         * Native opportunity record type. Read by opsync_ue_salesorder.js, which reaches the
+         * opportunity through the order's native `opportunity` field and takes the readiness
+         * context from it in ONE lookupFields.
+         */
+        OPPORTUNITY: 'opportunity',
         /**
          * The Quote Type list record, pointed at by the sales order's custbody_quote_type.
          * Carries the two checkboxes that decide which readiness gates apply.
@@ -264,7 +270,18 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
     };
 
     /**
-     * Script parameter IDs. All nine are set on the DEPLOYMENT, so Sandbox and Production
+     * Script parameter IDs.
+     *
+     * ⚠️ SIX OF THESE NOW EXIST ON TWO SCRIPT RECORDS AND MUST BE KEPT IN STEP — see
+     * docs/context.md section 4. Script parameters belong to a script record, so
+     * customscript_opsync_ue_salesorder carries its own copies of the six the readiness
+     * evaluation uses: EXCLUDED_STATUSES, DESIGN_OK_STATUSES, DNO_OK_VALUES,
+     * CUSTOMER_QUAL_FIELD, CUSTOMER_PL_FIELD and BUS_NO_VALUE. Same IDs, same failure-mode
+     * behaviour, SEPARATE VALUES. If they diverge the two scripts disagree about whether an
+     * order is ready, and each writes its verdict over the other's with nothing logged to say
+     * they differ.
+     *
+     * All nine are set on the DEPLOYMENT, so Sandbox and Production
      * carry their own values and no internal id appears in code. See docs/context.md section 8.
      * @type {Object}
      */
