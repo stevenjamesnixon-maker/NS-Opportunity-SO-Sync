@@ -24,14 +24,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.6.1
+ * @version 1.7.0
  */
 define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
     function (search, record, format, runtime, log, opsyncConfig) {
 
     'use strict';
 
-    var VERSION = '1.6.1';
+    var VERSION = '1.7.0';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -746,6 +746,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         var decidedStatus;
         var verdict = null;
         var targetExcluded;
+        var shipDateSuppressed;
         var values = {};
         var changes = [];
 
@@ -809,10 +810,46 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         //
         // What is WRITTEN is the original Date, never the key. The key is a localised dd/mm
         // string and a mis-parse downstream would silently move the date. See asDateForWrite.
+        //
+        // SUPPRESSED BY STATUS. Once a job reaches design complete the delivery date is managed
+        // on the SALES ORDER, and the opportunity must stop overwriting it. Only this ONE FIELD
+        // is suppressed: the status write and the full readiness evaluation below both run
+        // exactly as they would otherwise.
+        //
+        // NOT THE EXCLUDED LIST, and this is the distinction the whole design turns on. Adding
+        // these statuses to custscript_opsync_excluded_statuses would skip the order entirely —
+        // no status, no ship date and NO READINESS EVALUATION. Design Complete is the status
+        // where readiness matters most, and Redraw Required is where readiness must DROP to
+        // not-ready. Excluding either would silently disable delivery readiness for exactly the
+        // orders it exists for. See docs/context.md section 4.
+        //
+        // IT TESTS THE DECIDED STATUS, not the status the order arrived with. So the save that
+        // MOVES an order into Design Complete already stops syncing the date. That is the
+        // boundary being the order reaching the stage, rather than the next save after it — see
+        // the note on the alternative in docs/context.md section 4.
+        shipDateSuppressed = contains(decidedStatus, ctx.noShipDateStatuses);
+
         if (currentShipDateKey !== deliveryDateKey) {
-            values[opsyncConfig.SALES_ORDER_FIELDS.SHIP_DATE] = deliveryDateValue;
-            changes.push('ship date ' + (currentShipDateKey || '(empty)') + ' -> ' +
-                (deliveryDateKey || '(empty)'));
+            if (shipDateSuppressed) {
+                // Logged because a ship date silently NOT updating looks identical on the record
+                // to one that did not need updating. Only logged when the write would actually
+                // have happened — saying "suppressed" where nothing was going to be written
+                // would be noise, and would make the real cases harder to find.
+                log.debug({
+                    title: opsyncConfig.logKey('SHIPDATE_SUPPRESSED'),
+                    details: 'Sales order ' + orderId + ': expected ship date left at ' +
+                        (currentShipDateKey || '(empty)') + ' rather than being set to ' +
+                        (deliveryDateKey || '(empty)') + ', because its decided Record Status (' +
+                        decidedStatus + ') is in ' +
+                        opsyncConfig.PARAMETERS.NO_SHIPDATE_STATUSES + '. The delivery date is ' +
+                        'managed on the sales order at this status. Status and readiness were ' +
+                        'still evaluated and written as normal.'
+                });
+            } else {
+                values[opsyncConfig.SALES_ORDER_FIELDS.SHIP_DATE] = deliveryDateValue;
+                changes.push('ship date ' + (currentShipDateKey || '(empty)') + ' -> ' +
+                    (deliveryDateKey || '(empty)'));
+            }
         }
 
         // THE SECOND EXCLUSION TEST, on the status this save DECIDES rather than the one the
@@ -901,11 +938,15 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
     }
 
     /**
-     * Builds the per-opportunity readiness context, ONCE, before the sales order loop.
+     * Builds the per-opportunity context, ONCE, before the sales order loop.
+     *
+     * Mostly readiness, and named for that, but it also carries the ship-date suppression list —
+     * which is not a readiness value at all. It lives here because the rule that governs it is
+     * the same one: every throwing parameter is resolved before the loop.
      *
      * Two things are resolved here and nowhere else:
      *
-     * 1. The four throwing parameters, plus getBusNoValue() which does not throw. They are read
+     * 1. The five throwing parameters, plus getBusNoValue() which does not throw. They are read
      *    UP FRONT precisely so that a missing one
      *    throws before a single order has been written — a throw from inside the loop would
      *    leave some orders updated and the rest not, which is the "no partial writes" the brief
@@ -934,6 +975,11 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         var ctx = {
             designOkStatuses: opsyncConfig.getDesignOkStatuses(),
             dnoOkValues: opsyncConfig.getDnoOkValues(),
+            // Not a readiness value — it governs the SHIP DATE write. It is resolved here for
+            // the same reason the readiness parameters are: every throwing parameter must be
+            // read BEFORE the sales order loop, so a missing one cannot leave some orders
+            // written and the rest not.
+            noShipDateStatuses: opsyncConfig.getNoShipDateStatuses(),
             installerId: '',
             qualExpiry: '',
             plExpiry: '',

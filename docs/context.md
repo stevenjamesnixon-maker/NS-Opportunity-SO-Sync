@@ -102,8 +102,8 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.7.1 | `lib/opsync_lib_config.js` | Every script ID in the project, and the eight script parameters — including the status mapping | Not deployed |
-| Opportunity user event | 1.6.1 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Shared config library | 1.8.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the nine script parameters — including the status mapping | Not deployed |
+| Opportunity user event | 1.7.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -398,9 +398,61 @@ hence the per-order try/catch at step 7 rather than one try/catch around the loo
 | From (Opportunity) | To (Sales Order) | How |
 |---|---|---|
 | `custbody_opportunity_sub_status` | `custbody_finance_status` | Through the mapping |
-| `custbody_opp_del_date` | `custbody_defaultshipdate` | Direct — both dates |
+| `custbody_opp_del_date` | `custbody_defaultshipdate` | Direct — both dates, **unless the decided status suppresses it** (below) |
 | *(derived — see below)* | `custbody_ready_for_delivery` | Two gates on the Quote Type record |
 | *(derived — see below)* | `custbody_delivery_hold_reason` | The failed gates, joined with `; ` |
+
+### Suppressing the ship date by status
+
+Once a job reaches design complete the delivery date is managed **on the sales order**. The
+opportunity must stop overwriting it at that point.
+
+`custscript_opsync_no_shipdate_statuses` holds the `custbody_finance_status` ids for which the
+ship-date write is suppressed — *Design Complete* and *Redraw Required* in this account. When the
+order's **decided status** is in that list:
+
+- `custbody_defaultshipdate` is **not written**;
+- everything else happens **exactly as before** — the Record Status write, and the full readiness
+  evaluation including `custbody_ready_for_delivery` and `custbody_delivery_hold_reason`.
+
+#### Do NOT solve this with the excluded list
+
+> **"Just add those statuses to `custscript_opsync_excluded_statuses`" is the obvious answer and
+> it is wrong.** It is written here because someone will suggest it again.
+>
+> The excluded list **skips the order entirely** — no status write, no ship date, and **no
+> readiness evaluation**. That is the whole point of it, and it is precisely wrong here:
+>
+> - **Design Complete is the status where readiness matters most.** It is the point at which an
+>   order is a candidate to ship, and the gates decide whether it may.
+> - **Redraw Required is where readiness must DROP to not-ready.** An order that was ready and
+>   goes back for redraw has to stop being ready, and only an evaluation can do that.
+>
+> Excluding either would **silently disable the delivery readiness feature for exactly the orders
+> it exists for** — and silently, because a skipped order logs `OPPSYNC_ORDER_SKIPPED` at audit
+> and looks like normal operation.
+>
+> The two parameters are not interchangeable and must never be conflated: **the excluded list
+> skips the ORDER, this list suppresses ONE FIELD.**
+
+#### Why the decided status, not the entry status
+
+The test is on the **decided status** — the mapped status if there is one, otherwise the order's
+own current status. So **the save that moves an order INTO Design Complete already stops syncing
+the date**, on that same save.
+
+That is deliberate: the boundary is the order *reaching the stage*, not the save after it.
+
+**The alternative was to test the status on ENTRY**, which would allow one final sync — the date
+as it stood when the order arrived at design complete would be copied across, and only subsequent
+saves would be suppressed. It is recorded here so the choice is visible rather than looking like
+an oversight.
+
+It was rejected because that final write is the one most likely to be wrong: the save that moves
+an order to Design Complete is exactly when the sales order side starts owning the date, and a
+last copy from the opportunity would land on top of a value somebody may already have set. "One
+more sync" is also not a rule anyone can hold in their head — *"the opportunity stops writing the
+date once the order reaches this status"* is.
 
 ### The decided status
 
@@ -571,7 +623,7 @@ Agreed mapping, seven rows, **by name**:
 
 - **Design Cancelled is a one-way door**, and readiness freezes with it. See section 6.
 
-- **Five of the eight parameters throw when unset. Three do not. The rule is not importance —
+- **Six of the nine parameters throw when unset. Three do not. The rule is not importance —
   it is what EMPTY MEANS.**
 
   Ask of each parameter: if it is empty, does the script do *less*, or does it do *more*?
@@ -592,9 +644,10 @@ Agreed mapping, seven rows, **by name**:
   | `custscript_opsync_cust_qual_field` | **Certificates cannot be read at all**, so they read as missing and every gated order is held | **Fails open → throws** |
   | `custscript_opsync_cust_pl_field` | As above | **Fails open → throws** |
   | `custscript_opsync_bus_no_value` | **No** value is recognised as *not intended for BUS*, so the BUS condition applies to everything — orders are held, never shipped | **Fails closed** — logs at error, returns `''` |
+  | `custscript_opsync_no_shipdate_statuses` | **No status suppresses the ship date**, so the opportunity goes back to overwriting delivery dates on orders that own them — the defect the parameter exists to fix, restored in full | **Fails open → throws** |
 
   Three fail closed — `custscript_opsync_qualifying_statuses`, `custscript_opsync_status_map`
-  and `custscript_opsync_bus_no_value`. Five throw. The status map is the one most often
+  and `custscript_opsync_bus_no_value`. Six throw. The status map is the one most often
   miscounted, because *"nothing resolves"* sounds like a failure rather than a safe one: an
   unmapped save still evaluates readiness against each order's **own** current status — see
   *the decided status* in section 4 — but it writes no status anywhere, which is the test.
@@ -610,6 +663,24 @@ Agreed mapping, seven rows, **by name**:
   outer handler and logged as `OPPSYNC_FAILED`; the opportunity still saves.
 
   **When adding a parameter, apply the same test.** If empty removes a restriction, it throws.
+
+  `custscript_opsync_no_shipdate_statuses` is the worked example in the other direction, and
+  the argument against throwing is worth recording because it is a reasonable one. A throw
+  abandons the status sync and the readiness evaluation as well, and the harm from an empty list
+  is a **wrong date** rather than **goods shipped** — so why not log and carry on?
+
+  Because that is exactly the trade `custscript_opsync_excluded_statuses` and
+  `custscript_opsync_design_ok_statuses` already make, and it was weighed and accepted for them:
+  doing nothing is recoverable and says so in the log; writing confidently wrong data is neither.
+  A wrong ship date is not cheap either — the previous value is gone from the field, on every
+  order of the opportunity, and the people who own those dates are not reading the execution log.
+
+  Softening it here would also replace one rule with two — *"empty that removes a restriction
+  throws, unless the damage is only a date"* — and the next person adding a parameter would have
+  to guess which test applied. **One rule, no exceptions.**
+
+  The cost is real and it is a **deployment ordering** problem: uploading the new script before
+  the parameter exists makes the whole sync inert. See section 8.
 
   `custscript_opsync_bus_no_value` is the worked example. It *sounds* required — without it the
   BUS condition cannot tell a "No" from anything else — but empty makes the script do **more**,
@@ -770,11 +841,12 @@ drift between scripts.
 | `OPPSYNC_ORDER_FAILED` | error | One sales order threw while being read or written. **The remaining orders were still processed.** | Read the logged error against the named order. Usually a locked or deleted order, or a permission problem on the executing role. |
 | `OPPSYNC_GOVERNANCE_STOP` | error | The loop stopped with governance running low, naming how many orders were done and which were not reached. | Re-save the opportunity to pick up the rest. If it recurs, the opportunity has more orders than this design anticipated — see section 6. |
 | `OPPSYNC_READINESS` | debug | One line per sales order: order, quote type, decided status, ready true/false, the reason, **which path satisfied each certificate condition** — `modern`, `legacy`, `no installer` or `fail` — **and the raw `custbody38` value, what it normalised to, and the acceptable set**. Normal operation. | Nothing. This is the first place to look when an order's readiness is not what was expected. **The paths are the only record of why an order with a blank installer is ready to ship** — when a legacy order surfaces in a year and nobody remembers these fields exist, this line is the explanation. The `dnoRaw=… -> … dnoOk=…` fragment exists because the DNO check once failed for a whole Sandbox cycle with no error and no clue; it shows the value, the normalised id and the parameter side by side. |
+| `OPPSYNC_SHIPDATE_SUPPRESSED` | debug | The ship date **would** have been written but was not, because the order's decided Record Status is in `custscript_opsync_no_shipdate_statuses`. Names the status, the value left in place and the value not written. The status and readiness were still evaluated and written as normal. Normal operation. | Nothing. **This log exists because the alternative is invisible** — a ship date silently not updating looks identical on the record to one that did not need updating. It is raised only when a write would otherwise have happened. |
 | `OPPSYNC_READINESS_NOT_APPLICABLE` | debug | The status this save wrote is in the excluded list, so readiness was **not evaluated** and both fields were left as they were. Normal operation. | Nothing. Note the readiness values shown are now frozen — see section 6. |
 | `OPPSYNC_QUOTE_TYPE_UNREADABLE` | error | A quote type record could not be read. Treated as **design-required, certificates not required** — the strictest reading of the design gate. | Check the quote type record exists and the executing role can read it. Until then those orders are gated on design. |
 | `OPPSYNC_INSTALLER_UNREADABLE` | error | The installer customer record could not be read for the two certificate fields. **Both certificates read as missing**, so the order is held. | Check the customer record and the two field ids in the parameters. The held order is the safe outcome, not the bug. |
 | `OPPSYNC_SYNC_SUMMARY` | audit | One line per opportunity: how many orders were updated, unchanged and skipped, and the status written. Normal operation. | Nothing. Use it to read the log at the level of "what did this save do". |
-| `OPPSYNC_PARAMETER_MISSING` | error | A script parameter is unset, unreadable, or held nothing usable. Names the parameter. For the **qualifying** list and the **mapping** it is logged only and the script exits harmlessly. For the other five — **excluded statuses** and the four readiness parameters — it is also **thrown**, so the save is abandoned before any sales order is written. See the table in section 5 for why the two behaviours differ. | Populate the parameter on the deployment **in this account**; the values differ by environment. See section 8. |
+| `OPPSYNC_PARAMETER_MISSING` | error | A script parameter is unset, unreadable, or held nothing usable. Names the parameter. For the **qualifying** list and the **mapping** it is logged only and the script exits harmlessly. For the other six — **excluded statuses**, the four readiness parameters and the **no-ship-date statuses** — it is also **thrown**, so the save is abandoned before any sales order is written. See the table in section 5 for why the two behaviours differ. | Populate the parameter on the deployment **in this account**; the values differ by environment. See section 8. |
 | `OPPSYNC_FAILED` | error | The entry point threw outside the per-order loop. **The opportunity still saved**; its orders may be out of step. | Read the logged error. Nothing in this feature may ever block an opportunity save, so a failure here is always silent to the user. |
 
 > **Reserved — no script raises these.** Kept so a future session grepping for them finds this
@@ -807,8 +879,9 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    | `opsync_ue_opportunity.js` | `customscript_opsync_ue_opportunity` | `customdeploy_opsync_ue_opportunity` | Opportunity. `afterSubmit` only |
    | `lib/opsync_lib_config.js` | — | **None.** Shared AMD module — File Cabinet upload only. Creating a script record for it is wrong | — |
 
-4. **Define the seven script parameters on the script record, and set their values on the
-   deployment:**
+4. **Define the nine script parameters on the script record, and set their values on the
+   deployment — BEFORE uploading the scripts that read them.** Six of the nine throw when unset
+   (section 5), and a script uploaded ahead of its parameters is inert on every qualifying save:
 
    | Label | ID | Type | What goes in it |
    |---|---|---|---|
@@ -819,6 +892,8 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    | DNO OK Values | `custscript_opsync_dno_ok_values` | Free-Form Text | Comma-separated `custbody38` values that satisfy the DNO check. Blank on the order always fails. **Required.** |
    | Customer Qualification Field | `custscript_opsync_cust_qual_field` | Free-Form Text | The **script ID** of the installer qualification expiry date field on the **customer** record. A parameter, not a constant, because the opportunity's equivalent is an unstored sourced field that cannot be searched. **Required.** |
    | Customer PL Field | `custscript_opsync_cust_pl_field` | Free-Form Text | The **script ID** of the Public Liability expiry date field on the customer record. As above. **Required.** |
+   | BUS "No" Value | `custscript_opsync_bus_no_value` | Free-Form Text | The single `customlist92` option internal ID meaning **not intended for BUS**. **Not required — does not throw.** Unset, no value is recognised as *No*, so every heat pump order is held for a voucher: safe, but everything stops. |
+   | No Ship Date Statuses | `custscript_opsync_no_shipdate_statuses` | Free-Form Text | Comma-separated Record Status internal IDs for which the **expected ship date is not written** — *Design Complete* and *Redraw Required*. The order keeps its own delivery date from that point. **Required — the script throws without it**, because an empty list suppresses nothing and the opportunity goes straight back to overwriting dates it should not. **Not the excluded list** — see section 4. |
 
    **All seven must be populated at deployment time, in each environment separately.** Their values
    are internal IDs and therefore **differ between Sandbox and Production** — read them off the
@@ -952,6 +1027,23 @@ certificate gate is the definition. Check `busNo=`, `rhiRaw=… -> …` and `vou
 | 80 | Heat pump, RHI = *No*, voucher date blank, application date blank | **Ready.** The condition does not apply, so **no BUS reason of either kind** |
 | 77 | Clear `custscript_opsync_bus_no_value` and save a heat pump order at RHI = *No* | `OPPSYNC_PARAMETER_MISSING` at **error**, **no `OPPSYNC_FAILED`**, and the order is **held** — `Awaiting BUS voucher approval`. Empty applies the condition to everything; it does not throw. **Revert afterwards** |
 
+### Ship-date suppression by status
+
+Populate `custscript_opsync_no_shipdate_statuses` with the *Design Complete* and *Redraw
+Required* Record Status ids first. Watch the order's **system notes** as well as its fields —
+scenario 84 is a "nothing written" test and only the notes prove it.
+
+| # | Scenario | Expected |
+|---|---|---|
+| 81 | Order at a **suppressed** status, opportunity delivery date changed | **Ship date NOT written.** Status and readiness **still written**. `OPPSYNC_SHIPDATE_SUPPRESSED` at debug naming the status |
+| 82 | Order at a **non-suppressed** status, delivery date changed | Ship date written, exactly as before. No suppression log |
+| 83 | A save that **moves** an order into a suppressed status, delivery date differs | **Ship date NOT written on that save** — the test is on the *decided* status, so the boundary is the order reaching the stage, not the save after it. See section 4 |
+| 84 | Order at a suppressed status, **nothing else changed** | **No writes at all.** `OPPSYNC_ORDER_UNCHANGED` at debug, no `submitFields`, no system note. Suppression must not manufacture a write, and must not manufacture a log either — 81's line should **not** appear |
+| 85 | Order at a suppressed status that is **also at an excluded entry status** | **Skipped entirely**, `OPPSYNC_ORDER_SKIPPED`, as now. The exclusion is tested first and nothing else runs |
+| 86 | `custscript_opsync_no_shipdate_statuses` **empty** | `OPPSYNC_PARAMETER_MISSING` at error **and** `OPPSYNC_FAILED`. **No write to any linked sales order.** It throws — see section 5. **Revert afterwards** |
+| 87 | Readiness at **Design Complete** with the parameter populated | Readiness **evaluated and written** normally. This is the scenario the excluded list would have broken |
+| 88 | Order **ready**, then moved to **Redraw Required** | Readiness **drops to not-ready** and the hold reason is written, while the ship date is suppressed. The second scenario the excluded list would have broken |
+
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
 ---
@@ -1062,11 +1154,12 @@ Not code. These are account changes the scripts assume have been made.
 
 | # | Task | Why it matters |
 |---|---|---|
-| 1 | Define **eight** script parameters on the script record and set their values on the deployment, **in each environment** | Section 8, step 4. This now includes the mapping itself and `custscript_opsync_bus_no_value`. An unset qualifying list or an unset mapping makes the feature completely inert, and the only sign is one error line in the log. |
+| 1 | Define **nine** script parameters on the script record and set their values on the deployment, **in each environment** | Section 8, step 4. This now includes the mapping itself and `custscript_opsync_bus_no_value`. An unset qualifying list or an unset mapping makes the feature completely inert, and the only sign is one error line in the log. |
 | 2 | Disable the `acs_ue_update_so.js` deployment when this one goes live | Section 8, step 6. Two writers of `custbody_finance_status`. |
 | 3 | Create the two checkboxes on the Quote Type record and tick them per quote type | Section 4. Until they exist every quote type reads as "design required, certificates not required" — orders will be gated on design alone. |
 | 4 | Set `custbody_ready_for_delivery` and `custbody_delivery_hold_reason` to **Inline Text** on all sales order forms | The script owns both fields. If users can edit them, their edits are silently overwritten on the next opportunity save. |
 | 5 | Confirm `customrecord16`, `custbody38` and `customlist92` are those exact script IDs in **both** environments | Section 6. Auto-assigned ids carry no cross-account guarantee, and a wrong `custbody38` reads as blank — every order then reports *Awaiting DNO*. A wrong `customlist92` means the *No* option id in `custscript_opsync_bus_no_value` matches nothing and every heat pump order is held for a voucher. |
 | 8 | ✅ **DONE 2026-09-15** — confirm `custbody_application_date`'s Applies To includes Opportunity | Closed question 7. Confirmed **Opportunity, Date** from the field definition. Kept here rather than deleted so the check is visible as having happened: it was the only field in this project committed before that check, and §9 scenario 70 is now its standing regression test. |
+| 9 | **Define `custscript_opsync_no_shipdate_statuses` and populate it BEFORE uploading UE 1.7.0** — the *Design Complete* and *Redraw Required* Record Status ids, in each environment | Section 4. It **throws** when unset, so uploading the script first makes the whole sync inert — `OPPSYNC_PARAMETER_MISSING` and `OPPSYNC_FAILED` on every qualifying save, with nothing written. The parameter must exist before the code that reads it. |
 | 7 | Set `custscript_opsync_bus_no_value` to the `customlist92` **No** option id in each environment | Section 4. It is a list option internal id and differs by account. Unset, the BUS condition applies to every heat pump order — safe, but everything is held. |
 | 6 | Check `OPPSYNC_MAP_PARSED` in the log after the first save in each environment | Section 9, scenario 25. A hand-typed parameter of seven ID pairs is the most likely thing to be wrong, and this is the only place it becomes visible. |

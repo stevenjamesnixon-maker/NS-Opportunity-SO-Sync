@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.7.1
+ * @version 1.8.0
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.7.1';
+    var VERSION = '1.8.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -264,7 +264,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
     };
 
     /**
-     * Script parameter IDs. All eight are set on the DEPLOYMENT, so Sandbox and Production
+     * Script parameter IDs. All nine are set on the DEPLOYMENT, so Sandbox and Production
      * carry their own values and no internal id appears in code. See docs/context.md section 8.
      * @type {Object}
      */
@@ -303,7 +303,17 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          * A parameter rather than a constant for the usual reason: it is a list option internal
          * id and differs by account. See getBusNoValue() for why it does NOT throw when unset.
          */
-        BUS_NO_VALUE: 'custscript_opsync_bus_no_value'
+        BUS_NO_VALUE: 'custscript_opsync_bus_no_value',
+        /**
+         * Free-Form Text. Comma-separated custbody_finance_status ids for which the EXPECTED
+         * SHIP DATE write is suppressed — Design Complete and Redraw Required in this account.
+         *
+         * NOT the same thing as EXCLUDED_STATUSES and must never be conflated with it. This one
+         * suppresses ONE FIELD. The excluded list skips the order entirely — no status, no ship
+         * date and NO READINESS EVALUATION — which is precisely wrong for these statuses. See
+         * getNoShipDateStatuses() and docs/context.md section 4.
+         */
+        NO_SHIPDATE_STATUSES: 'custscript_opsync_no_shipdate_statuses'
     };
 
     /* ------------------------------------------------------------------------------------------
@@ -462,7 +472,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
     }
 
     /* ------------------------------------------------------------------------------------------
-     * REQUIRED PARAMETERS — FIVE OF THE EIGHT THROW, THREE DO NOT
+     * REQUIRED PARAMETERS — SIX OF THE NINE THROW, THREE DO NOT
      *
      * Count them against the code before trusting any prose, here or in docs/context.md section
      * 5: this count was wrong in both places until 1.6.1, and it is consulted precisely when
@@ -487,7 +497,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      *                        somebody looks at the log. getBusNoValue() logs at error and
      *                        returns ''. See the note on that function.
      *
-     * THE FIVE THAT THROW all fail OPEN — empty removes a restriction rather than applying one:
+     * THE SIX THAT THROW all fail OPEN — empty removes a restriction rather than applying one:
      *
      *   EXCLUDED_STATUSES   empty means nothing is excluded, so the script writes over orders at
      *                       Release to Warehouse, Cancelled and Design Cancelled — exactly the
@@ -498,8 +508,11 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      *   DNO_OK_VALUES       likewise: every certificate-gated order reports Awaiting DNO.
      *   CUSTOMER_*_FIELD    empty means the certificate dates cannot be read at all, so they
      *                       read as missing and every gated order is held.
+     *   NO_SHIPDATE_        empty means NO status suppresses the ship date, so the opportunity
+     *     STATUSES          goes back to overwriting delivery dates on orders that own them —
+     *                       which is the entire defect the parameter exists to fix.
      *
-     * In each of those five, returning an empty array produces confidently wrong data on every
+     * In each of those six, returning an empty array produces confidently wrong data on every
      * sales order of the opportunity — which is worse than doing nothing. So they THROW, and
      * they are resolved BEFORE the sales order loop begins, so a missing one cannot leave some
      * orders written and the rest not. The throw is caught by the entry point's outer handler and
@@ -601,6 +614,39 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      */
     function getDnoOkValues() {
         return requiredValueList(PARAMETERS.DNO_OK_VALUES);
+    }
+
+    /**
+     * Record Statuses for which the EXPECTED SHIP DATE is not written.
+     *
+     * REQUIRED — this throws when unset, and the §5 test is what decides that rather than any
+     * judgement about importance. Ask what EMPTY means: no status suppresses the ship date, so
+     * the opportunity goes straight back to overwriting delivery dates on the orders that own
+     * them. That is not a reduced behaviour, it is the DEFECT THIS PARAMETER EXISTS TO FIX,
+     * restored in full and silently. Empty fails OPEN, so it throws.
+     *
+     * THE ARGUMENT AGAINST, ANSWERED. A throw abandons the status sync and the readiness
+     * evaluation too, and the harm here is a wrong date rather than goods shipped — so it is
+     * tempting to log and carry on. That is exactly the trade EXCLUDED_STATUSES and
+     * DESIGN_OK_STATUSES already make, and it was weighed and accepted for them: doing nothing
+     * is recoverable and says so in the log, writing confidently wrong data is neither. A wrong
+     * ship date is not cheap either — the previous value is gone from the field, on every order
+     * of the opportunity, and the people who own those dates are not watching the execution log.
+     *
+     * Softening it here would also replace one rule with two: "empty that removes a restriction
+     * throws, unless the damage is only a date". The next person adding a parameter would have
+     * to guess which test applies. One rule, no exceptions — see the block above.
+     *
+     * THE COST IS REAL AND IS A DEPLOYMENT ORDERING PROBLEM: uploading this version before the
+     * parameter exists on the deployment makes the whole sync inert, logging
+     * OPPSYNC_PARAMETER_MISSING on every qualifying save. Define and populate the parameter
+     * FIRST. See docs/context.md section 8.
+     *
+     * @returns {string[]} ids as strings, at least one
+     * @throws {Error} OPPSYNC_PARAMETER_MISSING when absent or empty
+     */
+    function getNoShipDateStatuses() {
+        return requiredValueList(PARAMETERS.NO_SHIPDATE_STATUSES);
     }
 
     /**
@@ -852,6 +898,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
         getExcludedStatuses: getExcludedStatuses,
         getDesignOkStatuses: getDesignOkStatuses,
         getDnoOkValues: getDnoOkValues,
+        getNoShipDateStatuses: getNoShipDateStatuses,
         getCustomerQualField: getCustomerQualField,
         getCustomerPlField: getCustomerPlField,
         getBusNoValue: getBusNoValue,
