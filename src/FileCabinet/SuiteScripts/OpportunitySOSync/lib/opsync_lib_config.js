@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.8.0
+ * @version 1.10.0
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.8.0';
+    var VERSION = '1.10.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -45,7 +45,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      *   Sales Order -> Opportunity link    opportunity                            Native field
      *
      * The sub-status -> Record Status mapping is NOT held on a record. It is a script
-     * parameter — see PARAMETERS.STATUS_MAP and getMappedStatus(). A custom record was
+     * parameter — see statusMapId and getMappedStatus(). A custom record was
      * specified first and deliberately abandoned: see docs/context.md section 5.
      * ------------------------------------------------------------------------------------------ */
 
@@ -71,6 +71,12 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          * code simply never loads it.
          */
         SALES_ORDER: 'salesorder',
+        /**
+         * Native opportunity record type. Read by opsync_ue_salesorder.js, which reaches the
+         * opportunity through the order's native `opportunity` field and takes the readiness
+         * context from it in ONE lookupFields.
+         */
+        OPPORTUNITY: 'opportunity',
         /**
          * The Quote Type list record, pointed at by the sales order's custbody_quote_type.
          * Carries the two checkboxes that decide which readiness gates apply.
@@ -198,7 +204,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          *
          * BLANK IS TREATED AS "INTENDED" and holds the order — see the rule in
          * opsync_ue_opportunity.js. The internal id that means "No" differs by account, so it is
-         * read from a script parameter: see PARAMETERS.BUS_NO_VALUE and getBusNoValue().
+         * read from a script parameter: see busNoValueId and getBusNoValue().
          */
         BUS_RHI_INTENDED: 'custbody_bus_project_rhi_intended'
     };
@@ -264,56 +270,104 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
     };
 
     /**
-     * Script parameter IDs. All nine are set on the DEPLOYMENT, so Sandbox and Production
-     * carry their own values and no internal id appears in code. See docs/context.md section 8.
+     * Entry-point script IDs. The map below is keyed by these, and parameterId() resolves
+     * against runtime.getCurrentScript().id, so a script that is not here cannot read a
+     * parameter at all.
      * @type {Object}
      */
-    var PARAMETERS = {
-        /** Free-Form Text. Comma-separated entitystatus ids that open the gate. */
-        QUALIFYING_STATUSES: 'custscript_opsync_qualifying_statuses',
-        /** Free-Form Text. Comma-separated Record Status ids that must not be overwritten. */
-        EXCLUDED_STATUSES: 'custscript_opsync_excluded_statuses',
-        /**
-         * Free-Form Text. The sub-status -> Record Status mapping, as comma-separated
-         * subStatusId:recordStatusId pairs. See parseStatusMap() for the format and the
-         * handling of malformed and duplicate entries.
-         */
-        STATUS_MAP: 'custscript_opsync_status_map',
-        /** Free-Form Text. Comma-separated Record Status ids that satisfy the design gate. */
-        DESIGN_OK_STATUSES: 'custscript_opsync_design_ok_statuses',
-        /** Free-Form Text. Comma-separated custbody38 values that satisfy the DNO check. */
-        DNO_OK_VALUES: 'custscript_opsync_dno_ok_values',
-        /**
-         * Free-Form Text. The SCRIPT ID of the installer qualification expiry date field on the
-         * CUSTOMER record.
-         *
-         * A parameter rather than a constant because the equivalent field on the opportunity is
-         * an unstored sourced field and cannot be read by a search — the script has to go to the
-         * customer record that custbody_installer_ns points at, and which field that is has to
-         * be configurable per account.
-         */
-        CUSTOMER_QUAL_FIELD: 'custscript_opsync_cust_qual_field',
-        /** Free-Form Text. The SCRIPT ID of the Public Liability expiry date field. As above. */
-        CUSTOMER_PL_FIELD: 'custscript_opsync_cust_pl_field',
-        /**
-         * Free-Form Text. The single customlist92 option internal id that means "NOT intended
-         * for BUS" — the one value of custbody_bus_project_rhi_intended that switches the BUS
-         * condition off. Every other value, blank included, leaves it on.
-         *
-         * A parameter rather than a constant for the usual reason: it is a list option internal
-         * id and differs by account. See getBusNoValue() for why it does NOT throw when unset.
-         */
-        BUS_NO_VALUE: 'custscript_opsync_bus_no_value',
-        /**
-         * Free-Form Text. Comma-separated custbody_finance_status ids for which the EXPECTED
-         * SHIP DATE write is suppressed — Design Complete and Redraw Required in this account.
-         *
-         * NOT the same thing as EXCLUDED_STATUSES and must never be conflated with it. This one
-         * suppresses ONE FIELD. The excluded list skips the order entirely — no status, no ship
-         * date and NO READINESS EVALUATION — which is precisely wrong for these statuses. See
-         * getNoShipDateStatuses() and docs/context.md section 4.
-         */
-        NO_SHIPDATE_STATUSES: 'custscript_opsync_no_shipdate_statuses'
+    var SCRIPTS = {
+        UE_OPPORTUNITY: 'customscript_opsync_ue_opportunity',
+        UE_SALESORDER: 'customscript_opsync_ue_salesorder'
+    };
+
+    /* ------------------------------------------------------------------------------------------
+     * SCRIPT PARAMETER IDS, PER SCRIPT — AND WHY THEY CANNOT BE SHARED
+     *
+     * A script parameter IS A CUSTOM FIELD, and custom field IDs are UNIQUE ACROSS THE NETSUITE
+     * ACCOUNT. A second script consuming the same configuration therefore cannot reuse the first
+     * script's parameter IDs: NetSuite rejects them as already in use. This was tried in the
+     * account and refused — it is not a theory, and it is the reason for everything below.
+     *
+     * So the six parameters the readiness evaluation needs exist TWICE, under DIFFERENT NAMES:
+     *
+     *   customscript_opsync_ue_opportunity      customscript_opsync_ue_salesorder
+     *   -------------------------------------   -------------------------------------
+     *   custscript_opsync_excluded_statuses     custscript_sosync_excluded_statuses
+     *   custscript_opsync_design_ok_statuses    custscript_sosync_design_ok_statuses
+     *   custscript_opsync_dno_ok_values         custscript_sosync_dno_ok_values
+     *   custscript_opsync_cust_qual_field       custscript_sosync_cust_qual_field
+     *   custscript_opsync_cust_pl_field         custscript_sosync_cust_pl_field
+     *   custscript_opsync_bus_no_value          custscript_sosync_bus_no_value
+     *
+     * ⚠️ THE PREFIXES DIFFER — opsync_ against sosync_ — WHICH MAKES THE RISK WORSE THAN A
+     * PLAIN COPY WOULD. Nobody comparing the two deployments side by side will notice
+     * that custscript_opsync_design_ok_statuses and custscript_sosync_design_ok_statuses are
+     * meant to hold the SAME VALUE. They do not sort together, they do not grep together, and
+     * nothing in NetSuite relates them. If they diverge the two scripts disagree about whether
+     * an order is ready and each overwrites the other, silently. See docs/context.md section 4.
+     *
+     * Three exist only on the opportunity script, because only it uses them: QUALIFYING_STATUSES,
+     * STATUS_MAP and NO_SHIPDATE_STATUSES. Asking for one of those from the sales order script
+     * throws — see parameterId().
+     *
+     * THE MAP IS EXPLICIT ON PURPOSE. It is not derived from the script id by string
+     * manipulation, and there is no "try one, fall back to the other":
+     *
+     *   a DERIVATION is magic that breaks silently the day a third script arrives with a
+     *   different prefix;
+     *   a FALLBACK masks a misconfiguration by reading the WRONG SCRIPT'S VALUE — the worst
+     *   possible outcome for two parameter sets whose entire job is to agree.
+     *
+     * A new script means a new row here. That is the intended cost.
+     * ------------------------------------------------------------------------------------------ */
+
+    /**
+     * Logical parameter key -> the real parameter ID, per executing script.
+     *
+     * The KEYS are the project's vocabulary and are the same everywhere; only the values differ
+     * by script. Every accessor names a key, never an ID.
+     *
+     * What each parameter holds:
+     *
+     *   QUALIFYING_STATUSES   comma-separated entitystatus ids that open the gate
+     *   EXCLUDED_STATUSES     comma-separated Record Status ids that must not be overwritten
+     *   STATUS_MAP            sub-status -> Record Status pairs; see parseStatusMap()
+     *   DESIGN_OK_STATUSES    Record Status ids that satisfy the design gate
+     *   DNO_OK_VALUES         custbody38 values that satisfy the DNO check
+     *   CUSTOMER_QUAL_FIELD   the SCRIPT ID of the qualification expiry field on the CUSTOMER
+     *                         record — a parameter, not a constant, because the opportunity's
+     *                         equivalent is an unstored sourced field that cannot be searched
+     *   CUSTOMER_PL_FIELD     the same for Public Liability
+     *   BUS_NO_VALUE          the single customlist92 option id meaning "NOT intended for BUS";
+     *                         see getBusNoValue() for why it does not throw when unset
+     *   NO_SHIPDATE_STATUSES  Record Status ids for which the expected ship date is NOT written.
+     *                         NOT the excluded list — that one skips the order entirely. This
+     *                         suppresses one field. See docs/context.md section 4
+     *
+     * All values are set on the DEPLOYMENT, so Sandbox and Production carry their own and no
+     * internal id appears in code. See docs/context.md section 8.
+     * @type {Object}
+     */
+    var SCRIPT_PARAMETERS = {
+        'customscript_opsync_ue_opportunity': {
+            QUALIFYING_STATUSES: 'custscript_opsync_qualifying_statuses',
+            EXCLUDED_STATUSES: 'custscript_opsync_excluded_statuses',
+            STATUS_MAP: 'custscript_opsync_status_map',
+            DESIGN_OK_STATUSES: 'custscript_opsync_design_ok_statuses',
+            DNO_OK_VALUES: 'custscript_opsync_dno_ok_values',
+            CUSTOMER_QUAL_FIELD: 'custscript_opsync_cust_qual_field',
+            CUSTOMER_PL_FIELD: 'custscript_opsync_cust_pl_field',
+            BUS_NO_VALUE: 'custscript_opsync_bus_no_value',
+            NO_SHIPDATE_STATUSES: 'custscript_opsync_no_shipdate_statuses'
+        },
+        'customscript_opsync_ue_salesorder': {
+            EXCLUDED_STATUSES: 'custscript_sosync_excluded_statuses',
+            DESIGN_OK_STATUSES: 'custscript_sosync_design_ok_statuses',
+            DNO_OK_VALUES: 'custscript_sosync_dno_ok_values',
+            CUSTOMER_QUAL_FIELD: 'custscript_sosync_cust_qual_field',
+            CUSTOMER_PL_FIELD: 'custscript_sosync_cust_pl_field',
+            BUS_NO_VALUE: 'custscript_sosync_bus_no_value'
+        }
     };
 
     /* ------------------------------------------------------------------------------------------
@@ -327,6 +381,92 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * Since the mapping moved from a saved search to a script parameter the cost is a string
      * split rather than a query, so there is even less to weigh against that risk than before.
      * ------------------------------------------------------------------------------------------ */
+
+    /**
+     * Resolves a logical parameter key to the real parameter ID for the EXECUTING script.
+     *
+     * Every accessor goes through here. Nothing in this project reads a parameter ID directly,
+     * because the ID depends on which script is running — see the block above for why they
+     * cannot be shared.
+     *
+     * TWO FAILURE MODES, BOTH THROWING, AND BOTH CONFIGURATION ERRORS RATHER THAN DATA STATES.
+     * That is why neither of them fails closed: a missing VALUE is a data state and the §5 test
+     * applies to it, but a script that is not in the map, or an accessor asking for a parameter
+     * its script does not define, is a mistake in the code or the deployment that no value could
+     * fix. Failing closed would turn one clear error into six confusing ones — every accessor
+     * quietly returning nothing, and the readiness verdict wrong in six ways at once.
+     *
+     *   UNKNOWN SCRIPT     the executing script is not in SCRIPT_PARAMETERS at all. Throws
+     *                      naming the script id, because the fix is to add its row.
+     *   WRONG SCRIPT       the script is known but does not define this parameter — e.g.
+     *                      getMappedStatus() reached from the sales order script, which has no
+     *                      status map. Throws naming both the accessor and the script, rather
+     *                      than behaving as though the parameter existed and were empty.
+     *
+     * The script id is lower-cased before lookup. NetSuite script IDs are lower-case by
+     * convention and getCurrentScript().id returns them that way, but a map miss here would be
+     * a total outage and the normalisation costs nothing.
+     *
+     * NOTE THE NAME. Two functions below take an argument called parameterId — the resolved
+     * ID, not a key — and a module-level function of that name would be shadowed inside them.
+     * Same name, two meanings, one file is how a later edit calls the wrong one.
+     *
+     * @param {string} key - a key from SCRIPT_PARAMETERS, e.g. 'DESIGN_OK_STATUSES'
+     * @param {string} accessor - the calling accessor's name, for the error message only
+     * @returns {string} the parameter ID for the currently executing script
+     * @throws {Error} OPPSYNC_SCRIPT_NOT_MAPPED or OPPSYNC_PARAMETER_NOT_ON_SCRIPT
+     */
+    function resolveParameterId(key, accessor) {
+        var scriptId;
+        var forScript;
+        var defined;
+
+        try {
+            scriptId = String(runtime.getCurrentScript().id).toLowerCase();
+        } catch (e) {
+            scriptId = '';
+        }
+
+        forScript = SCRIPT_PARAMETERS[scriptId];
+
+        if (!forScript) {
+            log.error({
+                title: logKey('SCRIPT_NOT_MAPPED'),
+                details: 'Script "' + scriptId + '" is not listed in SCRIPT_PARAMETERS in ' +
+                    'opsync_lib_config.js, so none of its parameter IDs can be resolved and ' +
+                    'nothing was read. Script parameter IDs are unique across the account, so ' +
+                    'every script that uses this library needs its OWN parameter IDs and its ' +
+                    'own row in that map. Add the row — do not derive the IDs and do not fall ' +
+                    'back to another script\'s. See docs/context.md section 4.'
+            });
+            throw error.create({
+                name: logKey('SCRIPT_NOT_MAPPED'),
+                message: 'Script "' + scriptId + '" has no parameter map in opsync_lib_config.js.',
+                notifyOff: true
+            });
+        }
+
+        if (!forScript.hasOwnProperty(key)) {
+            defined = Object.keys(forScript).join(', ');
+            log.error({
+                title: logKey('PARAMETER_NOT_ON_SCRIPT'),
+                details: accessor + '() asked for the ' + key + ' parameter, but script "' +
+                    scriptId + '" does not define one. That script defines: ' + defined + '. ' +
+                    'This is a coding error rather than a configuration one — the accessor is ' +
+                    'being called from a script the parameter was never meant for. It throws ' +
+                    'rather than returning empty, because empty would look like an unset ' +
+                    'parameter and be "fixed" on the deployment, where the field does not exist.'
+            });
+            throw error.create({
+                name: logKey('PARAMETER_NOT_ON_SCRIPT'),
+                message: accessor + '() is not available to script "' + scriptId +
+                    '": it defines no ' + key + ' parameter.',
+                notifyOff: true
+            });
+        }
+
+        return forScript[key];
+    }
 
     /**
      * Builds a log title. Every title in this project is built here, so the prefix cannot drift
@@ -447,7 +587,8 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * @returns {string[]} ids as strings, or [] when unset — which closes the gate entirely
      */
     function getQualifyingStatuses() {
-        return parseIdListParameter(PARAMETERS.QUALIFYING_STATUSES);
+        return parseIdListParameter(
+            resolveParameterId('QUALIFYING_STATUSES', 'getQualifyingStatuses'));
     }
 
     /**
@@ -468,7 +609,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * @throws {Error} OPPSYNC_PARAMETER_MISSING when absent or empty
      */
     function getExcludedStatuses() {
-        return requiredValueList(PARAMETERS.EXCLUDED_STATUSES);
+        return requiredValueList(resolveParameterId('EXCLUDED_STATUSES', 'getExcludedStatuses'));
     }
 
     /* ------------------------------------------------------------------------------------------
@@ -603,7 +744,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * @throws {Error} OPPSYNC_PARAMETER_MISSING
      */
     function getDesignOkStatuses() {
-        return requiredValueList(PARAMETERS.DESIGN_OK_STATUSES);
+        return requiredValueList(resolveParameterId('DESIGN_OK_STATUSES', 'getDesignOkStatuses'));
     }
 
     /**
@@ -613,7 +754,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * @throws {Error} OPPSYNC_PARAMETER_MISSING
      */
     function getDnoOkValues() {
-        return requiredValueList(PARAMETERS.DNO_OK_VALUES);
+        return requiredValueList(resolveParameterId('DNO_OK_VALUES', 'getDnoOkValues'));
     }
 
     /**
@@ -646,7 +787,8 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * @throws {Error} OPPSYNC_PARAMETER_MISSING when absent or empty
      */
     function getNoShipDateStatuses() {
-        return requiredValueList(PARAMETERS.NO_SHIPDATE_STATUSES);
+        return requiredValueList(
+            resolveParameterId('NO_SHIPDATE_STATUSES', 'getNoShipDateStatuses'));
     }
 
     /**
@@ -656,7 +798,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * @throws {Error} OPPSYNC_PARAMETER_MISSING
      */
     function getCustomerQualField() {
-        return requiredParameter(PARAMETERS.CUSTOMER_QUAL_FIELD);
+        return requiredParameter(resolveParameterId('CUSTOMER_QUAL_FIELD', 'getCustomerQualField'));
     }
 
     /**
@@ -666,7 +808,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * @throws {Error} OPPSYNC_PARAMETER_MISSING
      */
     function getCustomerPlField() {
-        return requiredParameter(PARAMETERS.CUSTOMER_PL_FIELD);
+        return requiredParameter(resolveParameterId('CUSTOMER_PL_FIELD', 'getCustomerPlField'));
     }
 
     /**
@@ -687,15 +829,16 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * @returns {string} the internal id, or '' when unset — which applies the condition to all
      */
     function getBusNoValue() {
+        var busNoValueId = resolveParameterId('BUS_NO_VALUE', 'getBusNoValue');
         var raw;
         var trimmed;
 
         try {
-            raw = runtime.getCurrentScript().getParameter({ name: PARAMETERS.BUS_NO_VALUE });
+            raw = runtime.getCurrentScript().getParameter({ name: busNoValueId });
         } catch (e) {
             log.error({
                 title: logKey('PARAMETER_MISSING'),
-                details: 'Could not read script parameter ' + PARAMETERS.BUS_NO_VALUE +
+                details: 'Could not read script parameter ' + busNoValueId +
                     '. Is it defined on the script record and set on the deployment? Every ' +
                     'certificate-gated order will be held for a BUS voucher until it is. ' + e
             });
@@ -707,7 +850,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
         if (trimmed === '') {
             log.error({
                 title: logKey('PARAMETER_MISSING'),
-                details: 'Script parameter ' + PARAMETERS.BUS_NO_VALUE + ' is empty, so no ' +
+                details: 'Script parameter ' + busNoValueId + ' is empty, so no ' +
                     'value of ' + OPPORTUNITY_FIELDS.BUS_RHI_INTENDED + ' is recognised as ' +
                     '"not intended for BUS" and every certificate-gated order is held for a ' +
                     'voucher. That is the safe direction, so nothing was thrown — but it is ' +
@@ -753,6 +896,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * @returns {Object|null} sub-status id -> Record Status id, or null when unusable
      */
     function parseStatusMap() {
+        var statusMapId = resolveParameterId('STATUS_MAP', 'getMappedStatus');
         var raw;
         var entries;
         var map = {};
@@ -766,11 +910,11 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
         var usable = 0;
 
         try {
-            raw = runtime.getCurrentScript().getParameter({ name: PARAMETERS.STATUS_MAP });
+            raw = runtime.getCurrentScript().getParameter({ name: statusMapId });
         } catch (e) {
             log.error({
                 title: logKey('PARAMETER_MISSING'),
-                details: 'Could not read script parameter ' + PARAMETERS.STATUS_MAP +
+                details: 'Could not read script parameter ' + statusMapId +
                     '. Is it defined on the script record and set on the deployment? ' + e
             });
             return null;
@@ -779,7 +923,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
         if (raw === null || raw === undefined || String(raw) === '') {
             log.error({
                 title: logKey('PARAMETER_MISSING'),
-                details: 'Script parameter ' + PARAMETERS.STATUS_MAP + ' is empty. No ' +
+                details: 'Script parameter ' + statusMapId + ' is empty. No ' +
                     'sub-status can be resolved, so no sales order will be updated at all. ' +
                     'Populate it on the deployment in this account — its value differs by ' +
                     'environment. See docs/context.md section 8.'
@@ -804,7 +948,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
             if (halves.length !== 2 || !isIdText(key) || !isIdText(value)) {
                 log.error({
                     title: logKey('MAP_INVALID_ENTRY'),
-                    details: 'Entry "' + entry + '" in ' + PARAMETERS.STATUS_MAP + ' is not a ' +
+                    details: 'Entry "' + entry + '" in ' + statusMapId + ' is not a ' +
                         'subStatusId:recordStatusId pair of whole numbers. It was skipped; the ' +
                         'rest of the mapping still applies. Correct it on the deployment.'
                 });
@@ -826,7 +970,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
             log.error({
                 title: logKey('MAP_AMBIGUOUS'),
                 details: 'Sub-status ' + duplicateKey + ' appears more than once in ' +
-                    PARAMETERS.STATUS_MAP + '. The whole entry was dropped rather than guessing ' +
+                    statusMapId + '. The whole entry was dropped rather than guessing ' +
                     'which mapping was meant, so that sub-status now resolves to nothing and ' +
                     'its sales orders are left alone. Remove the duplicate on the deployment.'
             });
@@ -837,7 +981,7 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
         if (usable <= 0) {
             log.error({
                 title: logKey('PARAMETER_MISSING'),
-                details: 'Script parameter ' + PARAMETERS.STATUS_MAP + ' held no usable pairs ' +
+                details: 'Script parameter ' + statusMapId + ' held no usable pairs ' +
                     'after parsing. Nothing can be resolved. Raw value: ' + raw
             });
             return null;
@@ -891,7 +1035,9 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
         QUOTE_TYPE_FIELDS: QUOTE_TYPE_FIELDS,
         OPPORTUNITY_FIELDS: OPPORTUNITY_FIELDS,
         SALES_ORDER_FIELDS: SALES_ORDER_FIELDS,
-        PARAMETERS: PARAMETERS,
+        SCRIPTS: SCRIPTS,
+        SCRIPT_PARAMETERS: SCRIPT_PARAMETERS,
+        resolveParameterId: resolveParameterId,
         logKey: logKey,
         lookupValue: lookupValue,
         getQualifyingStatuses: getQualifyingStatuses,

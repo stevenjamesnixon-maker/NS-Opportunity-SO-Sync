@@ -24,14 +24,15 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.7.0
+ * @version 1.8.1
  */
-define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_lib_config'],
-    function (search, record, format, runtime, log, opsyncConfig) {
+define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
+    './lib/opsync_lib_values', './lib/opsync_lib_readiness'],
+    function (search, record, runtime, log, opsyncConfig, values, readiness) {
 
     'use strict';
 
-    var VERSION = '1.7.0';
+    var VERSION = '1.8.1';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -47,14 +48,6 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
     var GOVERNANCE_FLOOR_UNITS = 100;
 
     /**
-     * Raised by the qualification condition and by the public liability condition independently.
-     * It is de-duplicated before the reasons are joined: one missing installer is one problem to
-     * fix, and saying so twice reads as two.
-     * @type {string}
-     */
-    var INSTALLER_NOT_SET = 'Installer not set on opportunity';
-
-    /**
      * Upper bound on the orders read for one opportunity. An opportunity legitimately has
      * several; it does not have thousands, and an unbounded getRange is how a user event starts
      * timing out on a record nobody expected.
@@ -62,377 +55,6 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
      * @type {number}
      */
     var MAX_ORDERS = 1000;
-
-    /**
-     * True when the value is absent, null, or the empty string.
-     *
-     * @param {*} value
-     * @returns {boolean}
-     */
-    function isEmpty(value) {
-        return value === null || value === undefined || String(value) === '';
-    }
-
-    /**
-     * THE PROJECT'S PRESENCE TEST for any field where "is this filled in" decides whether an
-     * order ships. NOT isEmpty() — see below.
-     *
-     * It was called isLegacyPresent() until 1.5.3, having been written for the three legacy
-     * evidence fields, whose types are NOT confirmed and may be checkbox, date or text. It was
-     * never legacy-only, and by then it also served a CONFIRMED Date and a lookupFields value —
-     * so a reader meeting isLegacyPresent(voucherDate) had to go and check whether they were
-     * looking at a bug. A helper whose name has to be explained away in a comment is the same
-     * defect as custbody_ meaning only "transaction body field", in a cheaper place.
-     *
-     * It is correct for a checkbox, a date and a text field alike, because the cost of being
-     * wrong is always in the same direction.
-     *
-     * THAT DIRECTION IS WHY THIS IS THE DEFAULT. An UNTICKED checkbox arrives as boolean FALSE.
-     * isEmpty(false) is false, because String(false) is the five-character string "false" — so a
-     * presence test written as !isEmpty(value), or as value !== '', reads an unticked box as
-     * PRESENT and hands the order a free pass on the condition. Silently, and in the direction
-     * that ships goods rather than holding them. A field whose type is confirmed today can be
-     * changed in the UI tomorrow by someone who will never read this file, and nothing in the
-     * script would notice. This test survives that change; isEmpty() does not.
-     *
-     * So use this for EVERY presence-gates-shipping test, whether or not the type is confirmed.
-     * There is no longer an exception: custbody_installer_subcontract_receive was the last one
-     * on !isEmpty() and moved across in 1.5.2. A new presence test written as !isEmpty() is the
-     * defect, not the field it happens to be reading.
-     *
-     * It is correct on a lookupFields result as well as on a record, and the subcontract field
-     * is the proof: lookupValue() stringifies, so an unticked checkbox arrives as the STRING
-     * "false" rather than as boolean false. Both shapes are rejected below, by name.
-     *
-     * So false, '' , null and undefined are all absent. The string forms 'F' and 'false' are
-     * treated as absent too, in case a checkbox reaches this by a path that stringifies it —
-     * neither is a plausible value for a genuine text or date field.
-     *
-     * @param {*} value
-     * @returns {boolean} true when the value is present
-     */
-    function isPresent(value) {
-        var text;
-
-        if (value === null || value === undefined || value === false) {
-            return false;
-        }
-
-        if (value === true) {
-            return true;
-        }
-
-        text = String(value).replace(/^\s+|\s+$/g, '');
-
-        return text !== '' && text !== 'F' && text !== 'false';
-    }
-
-    /**
-     * Reads a field from a record, tolerating a record that is absent (oldRecord on CREATE) or a
-     * field that is not present on it (any field on a sparse XEDIT newRecord).
-     *
-     * @param {Record} rec
-     * @param {string} fieldId
-     * @returns {*} the raw value, or null
-     */
-    function readField(rec, fieldId) {
-        if (!rec) {
-            return null;
-        }
-        try {
-            return rec.getValue({ fieldId: fieldId });
-        } catch (e) {
-            return null;
-        }
-    }
-
-    /**
-     * Normalises a list value for comparison. List fields return raw stored values, and both
-     * sides of every comparison in this script are ids from the same list, so this is a string
-     * coercion and nothing more — see docs/context.md section 0, trap 4.
-     *
-     * @param {*} value
-     * @returns {string}
-     */
-    function asId(value) {
-        return isEmpty(value) ? '' : String(value);
-    }
-
-    /**
-     * Normalises a select value to its internal ID string, whatever shape it arrives in.
-     *
-     * TWO APIS, TWO SHAPES. search.lookupFields returns a select as an ARRAY of {value, text};
-     * record.getValue returns the same field as a plain internal ID STRING. A value that moves
-     * between the two — as custbody38 did in 1.4.0, from a per-order lookupFields to a read off
-     * the opportunity record — changes shape without changing meaning.
-     *
-     * String([{value:'1'}]) is '[object Object]', which is in no parameter list, so a select
-     * compared in the wrong shape fails as a legitimate "not acceptable" rather than as an
-     * error. Nothing is logged and nothing throws. This is deliberately tolerant of BOTH shapes
-     * so the comparison stays correct wherever the value came from.
-     *
-     * It is not a substitute for knowing which record a field is on: a normaliser cannot fix a
-     * field that returns blank because it does not apply to the record being asked.
-     *
-     * @param {*} value - array of {value,text}, {value}, string, number, or empty
-     * @returns {string} the internal ID, or '' when blank
-     */
-    function asSelectId(value) {
-        if (value === null || value === undefined) {
-            return '';
-        }
-
-        if (Object.prototype.toString.call(value) === '[object Array]') {
-            if (value.length === 0) {
-                return '';
-            }
-            return asSelectId(value[0]);
-        }
-
-        if (typeof value === 'object') {
-            return (value.value === null || value.value === undefined) ? '' : String(value.value);
-        }
-
-        return String(value);
-    }
-
-    /**
-     * Normalises a date to a single representation so the two sides of a comparison can actually
-     * be equal.
-     *
-     * THIS IS THE TRAP. record.getValue() on a date field returns a Date OBJECT.
-     * search.lookupFields() returns the same field as a STRING in the current user's date format.
-     * Comparing them directly is always unequal — so "only write when something changed" quietly
-     * becomes "write every time", which fills every sales order with system notes, re-fires the
-     * orders' own user events on every opportunity save, and defeats the guard that breaks the
-     * feedback loop described in docs/context.md section 5.
-     *
-     * Both sides are therefore rendered as a string in the current user's date format, which is
-     * the representation lookupFields already returns.
-     *
-     * THE RESULT IS A COMPARISON KEY AND MUST NEVER BE WRITTEN TO A RECORD. It is a localised
-     * string — this is a UK account on dd/mm/yyyy — and anything in the chain that parses it as
-     * mm/dd turns 5 September into 9 May. The mis-parse is silent, and only possible for days
-     * below 13, so it survives a test run on the 14th and fails on the 5th. Use
-     * asDateForWrite() for the value that goes to submitFields. See docs/context.md section 5.
-     *
-     * @param {*} value - a Date, a formatted string, or empty
-     * @returns {string} a comparison key; '' when unset
-     */
-    function asDateKey(value) {
-        if (isEmpty(value)) {
-            return '';
-        }
-
-        if (Object.prototype.toString.call(value) === '[object Date]') {
-            return format.format({ value: value, type: format.Type.DATE });
-        }
-
-        return String(value).replace(/^\s+|\s+$/g, '');
-    }
-
-    /**
-     * Prepares a date for writing to a record.
-     *
-     * Returns the ORIGINAL Date object that record.getValue() handed back, untouched. NetSuite
-     * accepts a Date natively on submitFields, so no formatting, no locale and no parsing are
-     * involved in the write — and therefore nothing that can read 05/09 as 9 May.
-     *
-     * The split from asDateKey() is deliberate and is not tidiness waiting to happen:
-     *
-     *   the STRING is a comparison key only, and must never be written;
-     *   the DATE is written, and must never be compared.
-     *
-     * Do not collapse the two back into one variable. See docs/context.md section 5.
-     *
-     * Anything that is not a Date is treated as unset and returns '', which is how submitFields
-     * clears a date field. The value only ever arrives here from a date field's getValue(), so
-     * in practice that is the empty case and nothing else.
-     *
-     * @param {*} value - the raw value from the opportunity
-     * @returns {Date|string} the Date to write, or '' to clear
-     */
-    function asDateForWrite(value) {
-        if (Object.prototype.toString.call(value) === '[object Date]') {
-            return value;
-        }
-        return '';
-    }
-
-    /**
-     * Reduces a date to a plain YYYYMMDD number for ORDERING.
-     *
-     * asDateKey() is deliberately not used for this. It produces a localised dd/mm/yyyy string,
-     * and comparing those with < or > orders them alphabetically — "05/12/2026" sorts before
-     * "06/01/2026" though it is a year later. Ordering must be numeric.
-     *
-     * The number is built from the date PARTS, so any time component is discarded rather than
-     * tipping a same-day comparison. A certificate expiring today is valid: the brief is
-     * explicit that "on or after the current date" passes, and a datetime comparison would fail
-     * exactly those same-day certificates while appearing to work for every other case.
-     *
-     * @param {Date} value
-     * @returns {number|null} e.g. 20260915, or null when not a date
-     */
-    function asDayNumber(value) {
-        if (Object.prototype.toString.call(value) !== '[object Date]' || isNaN(value.getTime())) {
-            return null;
-        }
-        return (value.getFullYear() * 10000) + ((value.getMonth() + 1) * 100) + value.getDate();
-    }
-
-    /**
-     * Parses a date that came back from search.lookupFields as a localised string.
-     *
-     * format.parse is the inverse of the format.format used in asDateKey, so the account's date
-     * preference is honoured in both directions. A value that will not parse is treated as
-     * absent rather than as a date in the distant past — an unreadable certificate date must
-     * read as "missing", never as "valid".
-     *
-     * @param {string} text
-     * @returns {Date|null}
-     */
-    function parseLookupDate(text) {
-        var parsed;
-
-        if (isEmpty(text)) {
-            return null;
-        }
-
-        try {
-            parsed = format.parse({ value: String(text), type: format.Type.DATE });
-        } catch (e) {
-            return null;
-        }
-
-        return Object.prototype.toString.call(parsed) === '[object Date]' ? parsed : null;
-    }
-
-    /**
-     * Today, as a YYYYMMDD number.
-     *
-     * @returns {number}
-     */
-    function todayDayNumber() {
-        return asDayNumber(new Date());
-    }
-
-    /**
-     * Tests a certificate expiry date from the CUSTOMER record.
-     *
-     * Blank and expired are different failures and are reported differently, because they need
-     * different actions: a blank field means nobody recorded the certificate, an expired one
-     * means it needs renewing.
-     *
-     * @param {string} rawDate - the value as lookupFields returned it
-     * @param {number} today
-     * @param {string} label - e.g. 'Installer qualification certificate'
-     * @returns {string} '' when the certificate is valid, else the failure reason
-     */
-    function expiryFailure(rawDate, today, label) {
-        var day = asDayNumber(parseLookupDate(rawDate));
-
-        if (day === null) {
-            return label + ' missing';
-        }
-
-        // On or after today passes. A certificate expiring today is still valid.
-        return day < today ? (label + ' expired') : '';
-    }
-
-    /**
-     * Resolves one certificate condition — qualification or public liability.
-     *
-     * The legacy evidence field wins outright. It is an OR, not an AND: an order whose legacy
-     * flag is set is satisfied even if the modern certificate on the customer record has
-     * expired, because the legacy flag records that the evidence was verified under the old
-     * process and there is nothing to re-check.
-     *
-     * Only when there is no legacy evidence does the modern path matter, and only then does a
-     * missing installer become a problem — which is why "installer not set" is no longer a
-     * standalone check. An order satisfied entirely by legacy fields does not need an installer
-     * at all.
-     *
-     * @param {string} legacyValue - the legacy evidence field from the sales order
-     * @param {string} installerId
-     * @param {string} rawExpiry - the expiry from the customer record
-     * @param {number} today
-     * @param {string} label
-     * @returns {Object} { reason: string, path: string } — reason '' when satisfied
-     */
-    function resolveCertificate(legacyValue, installerId, rawExpiry, today, label) {
-        if (isPresent(legacyValue)) {
-            return { reason: '', path: 'legacy' };
-        }
-
-        if (isEmpty(installerId)) {
-            return { reason: INSTALLER_NOT_SET, path: 'no installer' };
-        }
-
-        var failure = expiryFailure(rawExpiry, today, label);
-        return { reason: failure, path: failure === '' ? 'modern' : 'modern fail' };
-    }
-
-    /**
-     * True when the id appears in the list of ids. Both sides are normalised first.
-     *
-     * @param {string} id
-     * @param {string[]} ids
-     * @returns {boolean}
-     */
-    function contains(id, ids) {
-        var i;
-        var needle = asId(id);
-
-        if (needle === '' || !ids) {
-            return false;
-        }
-
-        for (i = 0; i < ids.length; i += 1) {
-            if (asId(ids[i]) === needle) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * Reads an opportunity field, falling back to oldRecord when newRecord does not carry it.
-     *
-     * On XEDIT (inline edit) NetSuite populates newRecord with ONLY the fields that were edited.
-     * Reading straight off newRecord therefore returns empty for every field the user did not
-     * touch. Two things follow, and neither is obvious:
-     *
-     *   1. A gate reading entitystatus off newRecord sees an empty status on a perfectly valid
-     *      inline edit, exits, and logs nothing — the feature looks dead rather than broken.
-     *   2. Taking a field's value from a sparse newRecord and writing it to the sales order
-     *      would push an empty value onto the order, clearing a ship date nobody touched.
-     *
-     * oldRecord is complete on XEDIT, so it is the reliable source unless the field is itself
-     * what was edited — in which case newRecord carries it and wins.
-     *
-     * The fallback is applied ONLY on XEDIT for the synced fields. On CREATE and EDIT newRecord
-     * is complete, so an empty value there is a real clear by a real user and must be respected;
-     * falling back would resurrect a value the user had just removed.
-     *
-     * Do not "simplify" this to a plain newRecord read.
-     *
-     * @param {Record} newRecord
-     * @param {Record} oldRecord
-     * @param {string} fieldId
-     * @param {boolean} sparse - true when newRecord may be missing untouched fields (XEDIT)
-     * @returns {*}
-     */
-    function effectiveValue(newRecord, oldRecord, fieldId, sparse) {
-        var value = readField(newRecord, fieldId);
-
-        if (sparse && isEmpty(value)) {
-            return readField(oldRecord, fieldId);
-        }
-
-        return value;
-    }
 
     /**
      * Finds the sales orders linked to an opportunity.
@@ -462,17 +84,6 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
     }
 
     /**
-     * True when a checkbox value from search.lookupFields is ticked. lookupFields returns a
-     * boolean for a checkbox, but a string slips through often enough to be worth tolerating.
-     *
-     * @param {*} value
-     * @returns {boolean}
-     */
-    function isTicked(value) {
-        return value === true || value === 'T' || value === 'true';
-    }
-
-    /**
      * Reads the two gate checkboxes off a Quote Type record, through a per-save cache.
      *
      * Several sales orders on one opportunity commonly share a quote type, so the cache turns
@@ -491,7 +102,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         var lookup;
         var gates;
 
-        if (isEmpty(quoteTypeId)) {
+        if (values.isEmpty(quoteTypeId)) {
             return { noDesignRequired: false, requiresCerts: false };
         }
 
@@ -509,9 +120,9 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                 ]
             });
             gates = {
-                noDesignRequired: isTicked(
+                noDesignRequired: values.isTicked(
                     lookup[opsyncConfig.QUOTE_TYPE_FIELDS.NO_DESIGN_REQUIRED]),
-                requiresCerts: isTicked(
+                requiresCerts: values.isTicked(
                     lookup[opsyncConfig.QUOTE_TYPE_FIELDS.REQUIRES_INSTALLER_CERTS])
             };
         } catch (e) {
@@ -528,190 +139,6 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
 
         cache[quoteTypeId] = gates;
         return gates;
-    }
-
-    /**
-     * Decides whether one sales order is ready for delivery, and why not.
-     *
-     * TWO INDEPENDENT GATES, and an order is ready only when BOTH pass. Neither checkbox
-     * short-circuits the other: a quote type with both ticked skips the design check and still
-     * has its certificates checked.
-     *
-     * Readiness is evaluated against the status THIS SAVE is about to write, not the status the
-     * order had on entry — the design gate is asking "will this order be far enough along once
-     * this save lands", not "was it before".
-     *
-     * The first three certificate conditions have a LEGACY path — see resolveCertificate and the
-     * note on the legacy constants in opsync_lib_config.js. Legacy evidence satisfies its
-     * condition outright, so an order verified under the old process is ready even with a blank
-     * installer. DNO and the BUS voucher have no legacy path and must never be given one.
-     *
-     * THE CERTIFICATE GATE IS THE DEFINITION OF A HEAT PUMP PROJECT for this script. The BUS
-     * voucher condition sits inside it for exactly that reason and needs no field of its own to
-     * decide what a heat pump is. custbody_value_proposition is deliberately NOT consulted: the
-     * physical product decides these rules, not the commercial package, and a second definition
-     * of "heat pump" in the same rule would be free to disagree with the first.
-     *
-     * The legacy values come off the CONTEXT, not the order: they live on the opportunity and
-     * are read once per save. The evaluation rule is unchanged by that — only the source is.
-     *
-     * @param {Object} order - { quoteTypeId, subcontractReceived }
-     * @param {string} decidedStatus - the Record Status this save will write
-     * @param {Object} ctx - the per-opportunity readiness context
-     * @returns {Object} { ready: boolean, reason: string, paths: Object }
-     */
-    function evaluateReadiness(order, decidedStatus, ctx) {
-        var gates = getQuoteTypeGates(order.quoteTypeId, ctx.quoteTypeCache);
-        var reasons = [];
-        var paths = {};
-        var qual;
-        var pl;
-
-        // (b) Design gate.
-        if (!gates.noDesignRequired && !contains(decidedStatus, ctx.designOkStatuses)) {
-            reasons.push('Design not complete');
-        }
-
-        // (c) Certificate gate. Three conditions evaluated INDEPENDENTLY, each with its own
-        //     legacy path, plus DNO which has none.
-        if (gates.requiresCerts) {
-
-            // 1. Subcontract. Either field satisfies it.
-            //
-            //    BOTH sides go through the presence test. The modern field's type is still
-            //    unconfirmed, and it was the last !isEmpty() presence test in this script — the
-            //    one place a type change in the UI could still flip a condition to fail OPEN,
-            //    in the ship-the-goods direction, with nothing logged.
-            //
-            //    IT ARRIVES FROM A lookupFields RESULT, NOT FROM THE RECORD, AND THAT IS WHY
-            //    THE TEST WORKS. lookupValue() stringifies, so an unticked checkbox reaches
-            //    here as the five-character string "false" rather than as boolean false — which
-            //    is exactly the shape !isEmpty() reads as PRESENT. The presence test rejects
-            //    'false' and 'F' by name for that case, so the lookup shape is covered as well
-            //    as the record shape.
-            //
-            //    It is a date today, so this changes no behaviour. The point is that the class
-            //    is closed rather than documented.
-            if (isPresent(order.subcontractReceived)) {
-                paths.subcontract = 'modern';
-            } else if (isPresent(ctx.subcontractLegacy)) {
-                paths.subcontract = 'legacy';
-            } else {
-                paths.subcontract = 'fail';
-                reasons.push('Subcontract agreement not received');
-            }
-
-            // 2. Installer qualification.
-            qual = resolveCertificate(ctx.qualLegacy, ctx.installerId, ctx.qualExpiry,
-                ctx.today, 'Installer qualification certificate');
-            paths.qualification = qual.path;
-            if (qual.reason !== '') {
-                reasons.push(qual.reason);
-            }
-
-            // 3. Public liability.
-            pl = resolveCertificate(ctx.plLegacy, ctx.installerId, ctx.plExpiry,
-                ctx.today, 'Public Liability certificate');
-            paths.publicLiability = pl.path;
-            if (pl.reason !== '') {
-                // De-duplicate: both conditions raise the same reason when the installer is
-                // blank, and one missing installer is one problem to fix.
-                if (pl.reason !== INSTALLER_NOT_SET || qual.reason !== INSTALLER_NOT_SET) {
-                    reasons.push(pl.reason);
-                }
-            }
-
-            // 4. DNO. NO legacy equivalent exists, so there is no legacy path here. Blank or
-            //    absent always fails — there is no "no news is good news".
-            if (contains(ctx.dnoStatus, ctx.dnoOkValues)) {
-                paths.dno = 'modern';
-            } else {
-                paths.dno = 'fail';
-                reasons.push('Awaiting DNO');
-            }
-
-            // 5. BUS voucher. NO legacy path either, and for a firmer reason than DNO's: the BUS
-            //    scheme postdates the old process entirely, so no legacy BUS field exists and
-            //    the three legacy flags say nothing about a voucher. Do not wire them in.
-            //
-            //    THE BLANK CASE IS THE POINT. A blank intention is treated as INTENDED and holds
-            //    the order, because a project that should have claimed a voucher and shipped
-            //    without one cannot claim it retrospectively. The safe direction is to hold and
-            //    ask.
-            //
-            //    THE THREE FAILURE REASONS ARE DELIBERATELY DIFFERENT and must not be merged.
-            //    Each is actioned by a different person:
-            //
-            //      'BUS intention not confirmed'      a missing answer — somebody must decide
-            //      'Awaiting BUS voucher application' nobody has applied yet — somebody's job
-            //      'Awaiting BUS voucher approval'    applied and waiting on the scheme — a
-            //                                         genuine wait, and nothing to chase here
-            //
-            //    AT MOST ONE OF THEM EVER APPEARS, because this is one if/else chain and not
-            //    four independent tests. Do not refactor it into separate ifs: two BUS reasons
-            //    in one hold string would read as two problems where there is one.
-            //
-            //    THE INTENTION QUESTION TAKES PRECEDENCE over the application question. A blank
-            //    intention reports 'BUS intention not confirmed' whether or not an application
-            //    date exists, because an application against an unrecorded intention is still
-            //    an unanswered question — and answering it may make the whole condition moot.
-            //
-            //    ctx.busNoValue IS CHECKED FOR EMPTY FIRST, and that guard is load-bearing. An
-            //    unset parameter leaves it '', a blank intention normalises to '' too, and a
-            //    bare equality test would then match the two and switch the condition OFF for
-            //    every order — turning a parameter that is supposed to fail closed into one that
-            //    ships goods. See getBusNoValue() in opsync_lib_config.js.
-            if (ctx.busNoValue !== '' && ctx.busRhiIntended === ctx.busNoValue) {
-                paths.busVoucher = 'not intended';
-            } else if (isPresent(ctx.voucherApprovalDate)) {
-                // Presence only, never an expiry comparison: an approved voucher does not lapse
-                // for this purpose.
-                //
-                // isPresent(), not isEmpty(), although the field is a CONFIRMED Date and
-                // isEmpty() would be correct for one. The tolerant test is correct for a date
-                // too, and a type change in the UI would flip an isEmpty() test to fail OPEN,
-                // in the ship-the-goods direction. The class is closed, not the instance.
-                paths.busVoucher = 'approved';
-            } else if (isEmpty(ctx.busRhiIntended)) {
-                paths.busVoucher = 'fail unconfirmed';
-                reasons.push('BUS intention not confirmed');
-            } else if (!isPresent(ctx.applicationDate)) {
-                // Reached ONLY when the intention is recorded and not "No", and the voucher is
-                // not yet approved. So the question is genuinely "has anyone applied", and a
-                // blank application date is the answer.
-                paths.busVoucher = 'fail not applied';
-                reasons.push('Awaiting BUS voucher application');
-            } else {
-                paths.busVoucher = 'fail awaiting';
-                reasons.push('Awaiting BUS voucher approval');
-            }
-        }
-
-        return {
-            ready: reasons.length === 0,
-            reason: reasons.join('; '),
-            paths: paths
-        };
-    }
-
-    /**
-     * Renders the certificate paths for the log. Empty when the certificate gate did not apply.
-     *
-     * @param {Object} paths
-     * @returns {string}
-     */
-    function describePaths(paths) {
-        var parts = [];
-
-        if (!paths) {
-            return '(none)';
-        }
-
-        Object.keys(paths).forEach(function (key) {
-            parts.push(key + '=' + paths[key]);
-        });
-
-        return parts.length === 0 ? '(certificates not required)' : parts.join(' ');
     }
 
     /**
@@ -747,6 +174,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         var verdict = null;
         var targetExcluded;
         var shipDateSuppressed;
+        var gates;
         var values = {};
         var changes = [];
 
@@ -765,9 +193,9 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
 
         currentStatus = opsyncConfig.lookupValue(
             lookup, opsyncConfig.SALES_ORDER_FIELDS.RECORD_STATUS);
-        currentShipDateKey = asDateKey(opsyncConfig.lookupValue(
+        currentShipDateKey = values.asDateKey(opsyncConfig.lookupValue(
             lookup, opsyncConfig.SALES_ORDER_FIELDS.SHIP_DATE));
-        currentReady = isTicked(lookup[opsyncConfig.SALES_ORDER_FIELDS.READY_FOR_DELIVERY]);
+        currentReady = values.isTicked(lookup[opsyncConfig.SALES_ORDER_FIELDS.READY_FOR_DELIVERY]);
         currentReason = opsyncConfig.lookupValue(
             lookup, opsyncConfig.SALES_ORDER_FIELDS.DELIVERY_HOLD_REASON);
         quoteTypeId = opsyncConfig.lookupValue(
@@ -776,7 +204,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         // The exclusion tests the order's CURRENT status, not the status being written. An order
         // the warehouse or finance has moved on is theirs, and the opportunity does not reclaim
         // it. An empty current status is not excluded — it is exactly the order that needs one.
-        if (contains(currentStatus, excludedStatuses)) {
+        if (values.contains(currentStatus, excludedStatuses)) {
             log.audit({
                 title: opsyncConfig.logKey('ORDER_SKIPPED'),
                 details: 'Sales order ' + orderId + ' left alone: its current Record Status (' +
@@ -794,7 +222,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         // sub-status means the order keeps the status it has — writing currentStatus back over
         // itself would be a no-op anyway, but the guard says so explicitly rather than relying
         // on that.
-        if (mappedStatusId !== null && asId(currentStatus) !== asId(mappedStatusId)) {
+        if (mappedStatusId !== null && values.asId(currentStatus) !== values.asId(mappedStatusId)) {
             values[opsyncConfig.SALES_ORDER_FIELDS.RECORD_STATUS] = mappedStatusId;
             changes.push('Record Status ' + (currentStatus || '(empty)') + ' -> ' + mappedStatusId);
         }
@@ -827,7 +255,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         // MOVES an order into Design Complete already stops syncing the date. That is the
         // boundary being the order reaching the stage, rather than the next save after it — see
         // the note on the alternative in docs/context.md section 4.
-        shipDateSuppressed = contains(decidedStatus, ctx.noShipDateStatuses);
+        shipDateSuppressed = values.contains(decidedStatus, ctx.noShipDateStatuses);
 
         if (currentShipDateKey !== deliveryDateKey) {
             if (shipDateSuppressed) {
@@ -841,7 +269,8 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                         (currentShipDateKey || '(empty)') + ' rather than being set to ' +
                         (deliveryDateKey || '(empty)') + ', because its decided Record Status (' +
                         decidedStatus + ') is in ' +
-                        opsyncConfig.PARAMETERS.NO_SHIPDATE_STATUSES + '. The delivery date is ' +
+                        opsyncConfig.resolveParameterId('NO_SHIPDATE_STATUSES',
+                            'getNoShipDateStatuses') + '. The delivery date is ' +
                         'managed on the sales order at this status. Status and readiness were ' +
                         'still evaluated and written as normal.'
                 });
@@ -864,7 +293,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         // On an unmapped save decidedStatus IS currentStatus, which already passed the entry
         // exclusion test above — so this can only fire when the mapping actually moved the order
         // onto an excluded status.
-        targetExcluded = contains(decidedStatus, excludedStatuses);
+        targetExcluded = values.contains(decidedStatus, excludedStatuses);
 
         if (targetExcluded) {
             log.debug({
@@ -874,11 +303,19 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                     'were left as they were (ready=' + currentReady + ').'
             });
         } else {
-            verdict = evaluateReadiness({
+            // The gates are resolved HERE, not inside readiness.evaluate() — that function
+            // takes facts and never runs a lookup. getQuoteTypeGates() keeps its per-save cache,
+            // so several orders sharing a quote type still cost one lookup between them.
+            gates = getQuoteTypeGates(quoteTypeId, ctx.quoteTypeCache);
+
+            verdict = readiness.evaluate(ctx, {
                 quoteTypeId: quoteTypeId,
+                noDesignRequired: gates.noDesignRequired,
+                requiresCerts: gates.requiresCerts,
+                decidedStatus: decidedStatus,
                 subcontractReceived: opsyncConfig.lookupValue(
                     lookup, opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED)
-            }, decidedStatus, ctx);
+            });
 
             // The paths matter as much as the verdict. When a legacy order comes up in a year
             // and nobody remembers these fields exist, this line is the only thing that explains
@@ -890,15 +327,15 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
                     (mappedStatusId === null ? ' (unmapped — order\'s own)' : ' (mapped)') +
                     ', ready=' +
                     verdict.ready + ', reason=' + (verdict.reason || '(none)') +
-                    ', paths=' + describePaths(verdict.paths) +
+                    ', paths=' + readiness.describePaths(verdict.paths) +
                     ', dnoRaw=' + JSON.stringify(ctx.dnoStatusRaw) +
                     ' -> ' + (ctx.dnoStatus || '(blank)') +
                     ', dnoOk=' + ctx.dnoOkValues.join('/') +
                     ', rhiRaw=' + JSON.stringify(ctx.busRhiIntendedRaw) +
                     ' -> ' + (ctx.busRhiIntended || '(blank)') +
                     ', busNo=' + (ctx.busNoValue || '(unset — condition applies to all)') +
-                    ', voucherDate=' + (asDateKey(ctx.voucherApprovalDate) || '(blank)') +
-                    ', applicationDate=' + (asDateKey(ctx.applicationDate) || '(blank)')
+                    ', voucherDate=' + (values.asDateKey(ctx.voucherApprovalDate) || '(blank)') +
+                    ', applicationDate=' + (values.asDateKey(ctx.applicationDate) || '(blank)')
             });
 
             // Both fields are written together or not at all: a reason without its checkbox, or
@@ -986,7 +423,7 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             // The DNO status is on the OPPORTUNITY — the sales order has no DNO field at all.
             // The RAW shape is kept alongside the normalised id because it goes in the log: this
             // check once failed for a whole Sandbox cycle with no error and no clue as to why.
-            dnoStatusRaw: effectiveValue(
+            dnoStatusRaw: values.effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.DNO_STATUS, sparse),
 
             // Legacy evidence also lives on the OPPORTUNITY, so it too is read once here from
@@ -994,11 +431,11 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             // through effectiveValue like the installer, so a sparse XEDIT newRecord falls back
             // to oldRecord rather than reading a populated flag as blank and holding every
             // linked order.
-            subcontractLegacy: effectiveValue(
+            subcontractLegacy: values.effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.SUBCONTRACT_LEGACY, sparse),
-            qualLegacy: effectiveValue(
+            qualLegacy: values.effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.QUAL_LOGGED_LEGACY, sparse),
-            plLegacy: effectiveValue(
+            plLegacy: values.effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.PL_LOGGED_LEGACY, sparse),
 
             // The BUS voucher pair is on the OPPORTUNITY too, and is read here ONCE for the same
@@ -1010,12 +447,12 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             // exactly as dnoStatusRaw is. A select read off a record is a plain id string, but the
             // same field read through a search is an array of {value,text} — so it is normalised
             // through asSelectId() below and never through String().
-            busRhiIntendedRaw: effectiveValue(
+            busRhiIntendedRaw: values.effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.BUS_RHI_INTENDED, sparse),
             // A Date object from record.getValue(). Tested for PRESENCE only, through
             // isPresent() rather than isEmpty() — never parsed, never compared to today.
             // An approved voucher does not expire.
-            voucherApprovalDate: effectiveValue(
+            voucherApprovalDate: values.effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.VOUCHER_APPROVAL_DATE,
                 sparse),
             // The APPLICATION date, which is not the approval date and must never be read as
@@ -1026,13 +463,13 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             // this read is the right one. Were it ever moved, this would return blank rather
             // than erroring and every 'Awaiting BUS voucher approval' would silently become
             // 'Awaiting BUS voucher application'. Section 9 scenario 70 is what would catch it.
-            applicationDate: effectiveValue(
+            applicationDate: values.effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.APPLICATION_DATE, sparse),
             // '' when the parameter is unset, which applies the BUS condition to everything
             // rather than to nothing. It does not throw — see getBusNoValue().
             busNoValue: opsyncConfig.getBusNoValue(),
 
-            today: todayDayNumber(),
+            today: values.todayDayNumber(),
             quoteTypeCache: {}
         };
         var qualField = opsyncConfig.getCustomerQualField();
@@ -1042,13 +479,13 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
         // Selects are normalised through asSelectId, not asId: record.getValue returns a plain
         // id string, but the same field read through a search returns an array of {value,text},
         // and String() on that is '[object Object]'.
-        ctx.dnoStatus = asSelectId(ctx.dnoStatusRaw);
-        ctx.busRhiIntended = asSelectId(ctx.busRhiIntendedRaw);
+        ctx.dnoStatus = values.asSelectId(ctx.dnoStatusRaw);
+        ctx.busRhiIntended = values.asSelectId(ctx.busRhiIntendedRaw);
 
-        ctx.installerId = asSelectId(effectiveValue(
+        ctx.installerId = values.asSelectId(values.effectiveValue(
             newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.INSTALLER, sparse));
 
-        if (isEmpty(ctx.installerId)) {
+        if (values.isEmpty(ctx.installerId)) {
             return ctx;
         }
 
@@ -1120,25 +557,25 @@ define(['N/search', 'N/record', 'N/format', 'N/runtime', 'N/log', './lib/opsync_
             // 2. entitystatus from newRecord if it carries it, otherwise from oldRecord. See
             //    effectiveValue — on XEDIT newRecord holds only the edited fields, and a gate
             //    reading straight off it exits on every valid inline edit without logging.
-            entityStatus = asSelectId(effectiveValue(
+            entityStatus = values.asSelectId(values.effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.ENTITY_STATUS, true));
 
             // 3. The gate. An empty qualifying list means the parameter is unset; the library has
             //    already logged that at error, and the gate stays shut rather than opening wide.
             qualifyingStatuses = opsyncConfig.getQualifyingStatuses();
-            if (!contains(entityStatus, qualifyingStatuses)) {
+            if (!values.contains(entityStatus, qualifyingStatuses)) {
                 return;
             }
 
-            subStatus = asSelectId(effectiveValue(
+            subStatus = values.asSelectId(values.effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.SUB_STATUS, sparse));
             // Read the delivery date ONCE, then derive both forms from it: a key for comparing
             // and the original Date for writing. See asDateKey and asDateForWrite — they are
             // deliberately not the same value and must not be merged.
-            deliveryDateRaw = effectiveValue(
+            deliveryDateRaw = values.effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.DELIVERY_DATE, sparse);
-            deliveryDateKey = asDateKey(deliveryDateRaw);
-            deliveryDateValue = asDateForWrite(deliveryDateRaw);
+            deliveryDateKey = values.asDateKey(deliveryDateRaw);
+            deliveryDateValue = values.asDateForWrite(deliveryDateRaw);
 
             // 4. NO "HAS THE SUB-STATUS CHANGED" SHORT-CIRCUIT. Deliberately removed in 1.2.0,
             //    and it must not come back.
