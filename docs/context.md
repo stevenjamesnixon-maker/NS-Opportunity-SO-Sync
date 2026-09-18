@@ -102,10 +102,10 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.9.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the nine script parameters — including the status mapping | Not deployed |
+| Shared config library | 1.10.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the nine script parameters — including the status mapping | Not deployed |
 | Shared value library | 1.0.0 | `lib/opsync_lib_values.js` | The value-shape layer — one definition of what a select, a date or a presence flag *means*, whichever API returned it | Not deployed |
 | Shared readiness library | 1.0.0 | `lib/opsync_lib_readiness.js` | **The one definition of delivery readiness.** Both user events call it; neither has a copy | Not deployed |
-| Opportunity user event | 1.8.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
+| Opportunity user event | 1.8.1 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 | Sales order user event | 1.0.0 | `opsync_ue_salesorder.js` | `afterSubmit` on Sales Order — re-evaluates readiness for that one order. Writes the two readiness fields and **nothing else** | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
@@ -461,26 +461,62 @@ native transaction status. That list already means *"past the delivery gate or d
 first, and the drift would show up as an order the opportunity thinks is live and the sales
 order thinks is finished.
 
-#### ⚠️ Six parameters now exist in TWO places
+#### ⚠️ Six parameters exist twice, under DIFFERENT NAMES
 
-Script parameters belong to a **script record**, so `customscript_opsync_ue_salesorder` needs its
-own copies of the six the evaluation uses:
+**A script parameter is a custom field, and custom field IDs are unique across the NetSuite
+account.** A second script consuming the same configuration therefore **cannot** reuse the first
+script's parameter IDs — NetSuite rejects them as already in use. This was tried in the account
+and refused. It is not a theory, and it is the reason for everything in this section.
 
-| Parameter | On the opportunity script | On the sales order script |
+So the six the readiness evaluation needs exist twice, with **different prefixes**:
+
+| Purpose | `customscript_opsync_ue_opportunity` | `customscript_opsync_ue_salesorder` |
 |---|---|---|
-| `custscript_opsync_excluded_statuses` | ✅ | ✅ |
-| `custscript_opsync_design_ok_statuses` | ✅ | ✅ |
-| `custscript_opsync_dno_ok_values` | ✅ | ✅ |
-| `custscript_opsync_cust_qual_field` | ✅ | ✅ |
-| `custscript_opsync_cust_pl_field` | ✅ | ✅ |
-| `custscript_opsync_bus_no_value` | ✅ | ✅ |
+| Excluded statuses | `custscript_opsync_excluded_statuses` | `custscript_sosync_excluded_statuses` |
+| Design OK statuses | `custscript_opsync_design_ok_statuses` | `custscript_sosync_design_ok_statuses` |
+| DNO OK values | `custscript_opsync_dno_ok_values` | `custscript_sosync_dno_ok_values` |
+| Customer qualification field | `custscript_opsync_cust_qual_field` | `custscript_sosync_cust_qual_field` |
+| Customer PL field | `custscript_opsync_cust_pl_field` | `custscript_sosync_cust_pl_field` |
+| BUS "No" value | `custscript_opsync_bus_no_value` | `custscript_sosync_bus_no_value` |
 
-Same IDs, same failure-mode behaviour, **separate values**.
+Three exist **only** on the opportunity script, because only it uses them:
+`custscript_opsync_qualifying_statuses`, `custscript_opsync_status_map` and
+`custscript_opsync_no_shipdate_statuses`.
 
-> **They must be kept in step, and nothing enforces it.** If they diverge the opportunity and the
-> sales order will disagree about whether an order is ready — and disagree **silently**, each
-> overwriting the other on the next save of its own record. There is no log line for
-> "the two scripts hold different parameter values", because neither can see the other's.
+> **The differing prefix makes the duplication risk worse than a plain copy would be.**
+> `custscript_opsync_design_ok_statuses` and `custscript_sosync_design_ok_statuses` are meant to
+> hold the **same value**, and nobody comparing two deployments side by side will spot that.
+> They do not sort together, they do not grep together, and **nothing in NetSuite relates them**.
+>
+> If they diverge the two scripts disagree about whether an order is ready — and disagree
+> **silently**, each overwriting the other on the next save of its own record. There is no log
+> line for "the two scripts hold different parameter values", because neither can see the
+> other's. Scenario 98 exists to show the failure mode once, deliberately.
+
+#### How the library resolves them
+
+`opsync_lib_config.js` holds an explicit map keyed by script ID — `SCRIPT_PARAMETERS` — naming
+each script's parameters. Every accessor names a **logical key** (`DESIGN_OK_STATUSES`), and
+`resolveParameterId()` turns that into the real ID for
+`runtime.getCurrentScript().id`. Accessor names and return values are unchanged, so neither user
+event needed rewriting.
+
+**The map is explicit on purpose. There is no derivation and no fallback:**
+
+- a **derivation** from the script id — swapping `opsync` for `sosync` — is magic that breaks
+  silently the day a third script arrives with a different prefix;
+- a **fallback** — try one ID, then the other — masks a misconfiguration by reading the **wrong
+  script's value**, which is the worst possible outcome for two parameter sets whose entire job
+  is to agree.
+
+A new script means a new row in that map. That is the intended cost.
+
+| Failure | Behaviour |
+|---|---|
+| The executing script is **not in the map** | **Throws once**, naming the script id and saying to add its row. A configuration error, not a data state — failing closed would produce six confusing failures instead of one clear one |
+| An accessor is called for a parameter its script **does not define** — `getMappedStatus()` from the sales order script | **Throws**, naming both the accessor and the script. Not "empty": empty would look like an unset parameter and be "fixed" on a deployment where the field does not exist |
+
+Per-parameter failure modes are unchanged — six throw when missing, three fail closed.
 
 **This duplication was chosen deliberately over a shared configuration record**, and the
 trade-off was weighed rather than defaulted into:
@@ -845,6 +881,23 @@ Agreed mapping, seven rows, **by name**:
 - **The BUS voucher has no legacy path and cannot acquire one.** The scheme postdates the old
   process, so no legacy BUS field exists. Setting all three legacy flags does not satisfy it.
 
+- **Script parameter IDs are unique across the ACCOUNT, so two scripts cannot share a
+  parameter — and this was discovered the hard way.**
+
+  A script parameter is a custom field. Custom field IDs are account-unique, so
+  `customscript_opsync_ue_salesorder` could not be given `custscript_opsync_design_ok_statuses`:
+  NetSuite refused it as already in use. The six shared parameters therefore exist twice, under
+  `opsync_` and `sosync_` prefixes — see section 4 for the pairing table and the risk that
+  creates.
+
+  **This is a constraint, not a design choice**, and it is recorded here so nobody spends the
+  afternoon again trying to make one parameter serve both scripts. The consequence for the code
+  is `SCRIPT_PARAMETERS` in `opsync_lib_config.js`: an explicit map of script id → its parameter
+  IDs, resolved at call time. **Never derive one script's IDs from another's, and never fall
+  back from one to the other** — a derivation breaks silently when a third script arrives with a
+  different prefix, and a fallback reads the wrong script's value, which is the one outcome
+  worse than failing.
+
 - **There is NO supported API that identifies a save triggered by another user event, and the
   recursion guard is change detection alone.**
 
@@ -975,6 +1028,8 @@ drift between scripts.
 | `OPPSYNC_SO_SKIPPED` | debug | **Sales order script.** The order's Record Status is in the excluded list, so readiness is not applicable and nothing was evaluated or written. | Nothing. Same meaning as `OPPSYNC_ORDER_SKIPPED` on the opportunity side, and the **same** parameter — there is deliberately not a second definition of "done". |
 | `OPPSYNC_SO_NO_OPPORTUNITY` | debug | **Sales order script.** The order has no linked opportunity, so there is no context to evaluate readiness from. | Nothing. An order raised outside this process is not this script's business. If an order that *should* be linked shows this, check the native `opportunity` field — **not** `createdfrom`. |
 | `OPPSYNC_SO_FAILED` | error | **Sales order script.** Its entry point threw. **The sales order still saved**; its readiness fields may be out of step. | Read the logged error. Nothing in this feature may ever block a save, so a failure here is silent to the user. |
+| `OPPSYNC_SCRIPT_NOT_MAPPED` | error + **throws** | The executing script is not listed in `SCRIPT_PARAMETERS` in `opsync_lib_config.js`, so none of its parameter IDs can be resolved. Names the script id. | Add that script's row to the map, with its **own** parameter IDs — they cannot be shared with another script. Do not derive them and do not fall back to another script's. See section 4. |
+| `OPPSYNC_PARAMETER_NOT_ON_SCRIPT` | error + **throws** | An accessor was called for a parameter the executing script does not define — e.g. `getMappedStatus()` reached from the sales order script. Names both the accessor and the script, and lists what that script does define. | A coding error, not a configuration one: the accessor is being called from a script the parameter was never meant for. **Do not "fix" it on the deployment** — the field does not exist there. |
 | `OPPSYNC_FAILED` | error | The entry point threw outside the per-order loop. **The opportunity still saved**; its orders may be out of step. | Read the logged error. Nothing in this feature may ever block an opportunity save, so a failure here is always silent to the user. |
 
 > **Reserved — no script raises these.** Kept so a future session grepping for them finds this
@@ -1032,15 +1087,26 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    | BUS "No" Value | `custscript_opsync_bus_no_value` | Free-Form Text | The single `customlist92` option internal ID meaning **not intended for BUS**. **Not required — does not throw.** Unset, no value is recognised as *No*, so every heat pump order is held for a voucher: safe, but everything stops. |
    | No Ship Date Statuses | `custscript_opsync_no_shipdate_statuses` | Free-Form Text | Comma-separated Record Status internal IDs for which the **expected ship date is not written** — *Design Complete* and *Redraw Required*. The order keeps its own delivery date from that point. **Required — the script throws without it**, because an empty list suppresses nothing and the opportunity goes straight back to overwriting dates it should not. **Not the excluded list** — see section 4. |
 
-   **Then define SIX of them again on `customscript_opsync_ue_salesorder`**, with the **same
-   values**: `custscript_opsync_excluded_statuses`, `custscript_opsync_design_ok_statuses`,
-   `custscript_opsync_dno_ok_values`, `custscript_opsync_cust_qual_field`,
-   `custscript_opsync_cust_pl_field` and `custscript_opsync_bus_no_value`. Script parameters
-   belong to a script record, so there is no way to share them — see section 4 for why that
-   duplication was chosen over a configuration record, and what it costs.
+   **Then define SIX more on `customscript_opsync_ue_salesorder`, under `sosync_` names**, each
+   holding the **same value** as its `opsync_` twin:
 
-   ⚠️ **If the two sets ever diverge, the two scripts disagree about whether an order is ready
-   and each overwrites the other, silently.** Re-check both whenever either is changed.
+   | On the sales order script | Must equal |
+   |---|---|
+   | `custscript_sosync_excluded_statuses` | `custscript_opsync_excluded_statuses` |
+   | `custscript_sosync_design_ok_statuses` | `custscript_opsync_design_ok_statuses` |
+   | `custscript_sosync_dno_ok_values` | `custscript_opsync_dno_ok_values` |
+   | `custscript_sosync_cust_qual_field` | `custscript_opsync_cust_qual_field` |
+   | `custscript_sosync_cust_pl_field` | `custscript_opsync_cust_pl_field` |
+   | `custscript_sosync_bus_no_value` | `custscript_opsync_bus_no_value` |
+
+   **The IDs differ because they have to.** A script parameter is a custom field and custom
+   field IDs are account-unique, so the sales order script cannot reuse the opportunity
+   script's — NetSuite rejects them as already in use. See section 4.
+
+   ⚠️ **The differing prefix is what makes this dangerous.** The two columns above are meant to
+   hold identical values and nothing in NetSuite says so. **Re-check both whenever either is
+   changed** — if they diverge the scripts disagree about readiness and overwrite each other,
+   silently.
 
    **All seven must be populated at deployment time, in each environment separately.** Their values
    are internal IDs and therefore **differ between Sandbox and Production** — read them off the
@@ -1208,8 +1274,19 @@ match the opportunity script's. Grep for `OPPSYNC_SO_` after every one of these.
 | 96 | Installer **blank** on the opportunity, order saved | **No customer lookup performed.** `paths=…legacy` or `no installer` in `OPPSYNC_SO_READINESS` |
 | 97 | Any of the **six** sales-order-side parameters missing | Same behaviour as on the opportunity script — five throw and log `OPPSYNC_SO_FAILED`, `bus_no_value` fails closed. The **order still saves**. **Revert afterwards** |
 | 98 | The six parameters set to **different values** on the two script records — e.g. an extra design-ok status on one | The two scripts **disagree** and each overwrites the other on the next save of its own record. **There is no log line for this.** Run it once to see the failure mode, then put them back. This is the cost of the duplication in section 4 |
-| 99 | **Inline edit** a field on the sales order list view | Evaluated normally. This is the XEDIT path — a sparse `newRecord` must not read an untouched quote type as blank and skip the certificate gate |
-| 100 | **Full opportunity-side regression** — every scenario from 1 to 88 | **Unchanged.** The 1.8.0 refactor moved the evaluation into `lib/opsync_lib_readiness.js` and must not have altered a single verdict. Any scenario here that needs amending means the refactor changed something it should not have |
+| 105 | **Inline edit** a field on the sales order list view | Evaluated normally. This is the XEDIT path — a sparse `newRecord` must not read an untouched quote type as blank and skip the certificate gate |
+| 106 | **Full opportunity-side regression** — every scenario from 1 to 88 | **Unchanged.** The 1.8.0 refactor moved the evaluation into `lib/opsync_lib_readiness.js` and must not have altered a single verdict. Any scenario here that needs amending means the refactor changed something it should not have |
+
+### Per-script parameter resolution
+
+| # | Scenario | Expected |
+|---|---|---|
+| 99 | Save an **opportunity** and read the execution log | Every parameter read resolves a **`custscript_opsync_*`** ID. Confirm in `OPPSYNC_MAP_PARSED` and, if a parameter is unset, in the ID named by `OPPSYNC_PARAMETER_MISSING` |
+| 100 | Save a **sales order** and read the execution log | Every parameter read resolves a **`custscript_sosync_*`** ID. **Never** an `opsync_` one — there is deliberately no fallback |
+| 101 | Deploy the library to a script **not in `SCRIPT_PARAMETERS`** and save its record | **Throws once**, `OPPSYNC_SCRIPT_NOT_MAPPED` naming the script id. One clear error, not six confusing ones. **Revert afterwards** |
+| 102 | Reach `getMappedStatus()` from the **sales order** script | **Throws**, `OPPSYNC_PARAMETER_NOT_ON_SCRIPT` naming both the accessor and the script. It must **not** return empty — empty would look like an unset parameter and be "fixed" on a deployment where the field does not exist |
+| 103 | **Full opportunity regression** — every scenario 1 to 88 | **Unchanged.** Accessor names and return values did not change, so nothing on this side should move |
+| 104 | **Full sales order regression** — scenarios 89 to 98 | **Unchanged**, now reading the `sosync_` IDs |
 
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
@@ -1328,7 +1405,7 @@ Not code. These are account changes the scripts assume have been made.
 | 5 | Confirm `customrecord16`, `custbody38` and `customlist92` are those exact script IDs in **both** environments | Section 6. Auto-assigned ids carry no cross-account guarantee, and a wrong `custbody38` reads as blank — every order then reports *Awaiting DNO*. A wrong `customlist92` means the *No* option id in `custscript_opsync_bus_no_value` matches nothing and every heat pump order is held for a voucher. |
 | 8 | ✅ **DONE 2026-09-15** — confirm `custbody_application_date`'s Applies To includes Opportunity | Closed question 7. Confirmed **Opportunity, Date** from the field definition. Kept here rather than deleted so the check is visible as having happened: it was the only field in this project committed before that check, and §9 scenario 70 is now its standing regression test. |
 | 10 | **Create the `customscript_opsync_ue_salesorder` script record and deployment**, `afterSubmit` on Sales Order | Section 4. Without it readiness only ever refreshes when somebody saves the opportunity, which is the defect Phase 6 exists to fix. |
-| 11 | **Define the SIX shared parameters on the sales order script record with the same values as the opportunity script**, and re-check both whenever either changes | Section 4. Script parameters belong to a script record and cannot be shared. If the two sets diverge the scripts disagree about readiness and overwrite each other — **silently**, because neither can see the other's values. |
+| 11 | **Define the six `custscript_sosync_*` parameters on the sales order script record**, each holding the same value as its `custscript_opsync_*` twin — and re-check both whenever either changes | Section 4. A script parameter is a custom field and custom field IDs are account-unique, so they **cannot** be shared; the sales order script's are prefixed `sosync_`. The differing prefix is the risk: nobody comparing two deployments will spot that the pairs are meant to match. If they diverge the scripts disagree about readiness and overwrite each other — **silently**, because neither can see the other's values. |
 | 9 | **Define `custscript_opsync_no_shipdate_statuses` and populate it BEFORE uploading UE 1.7.0** — the *Design Complete* and *Redraw Required* Record Status ids, in each environment | Section 4. It **throws** when unset, so uploading the script first makes the whole sync inert — `OPPSYNC_PARAMETER_MISSING` and `OPPSYNC_FAILED` on every qualifying save, with nothing written. The parameter must exist before the code that reads it. |
 | 7 | Set `custscript_opsync_bus_no_value` to the `customlist92` **No** option id in each environment | Section 4. It is a list option internal id and differs by account. Unset, the BUS condition applies to every heat pump order — safe, but everything is held. |
 | 6 | Check `OPPSYNC_MAP_PARSED` in the log after the first save in each environment | Section 9, scenario 25. A hand-typed parameter of seven ID pairs is the most likely thing to be wrong, and this is the only place it becomes visible. |

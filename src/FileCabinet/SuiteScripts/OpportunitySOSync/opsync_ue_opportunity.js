@@ -24,7 +24,7 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.8.0
+ * @version 1.8.1
  */
 define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
     './lib/opsync_lib_values', './lib/opsync_lib_readiness'],
@@ -32,7 +32,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
 
     'use strict';
 
-    var VERSION = '1.8.0';
+    var VERSION = '1.8.1';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -269,7 +269,8 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
                         (currentShipDateKey || '(empty)') + ' rather than being set to ' +
                         (deliveryDateKey || '(empty)') + ', because its decided Record Status (' +
                         decidedStatus + ') is in ' +
-                        opsyncConfig.PARAMETERS.NO_SHIPDATE_STATUSES + '. The delivery date is ' +
+                        opsyncConfig.resolveParameterId('NO_SHIPDATE_STATUSES',
+                            'getNoShipDateStatuses') + '. The delivery date is ' +
                         'managed on the sales order at this status. Status and readiness were ' +
                         'still evaluated and written as normal.'
                 });
