@@ -107,10 +107,10 @@ so it is where the sync belongs.
 | Shared readiness library | 1.0.0 | `lib/opsync_lib_readiness.js` | **The one definition of delivery readiness.** Both user events call it; neither has a copy | Production — confirmed by the client 22 Sep 2026 |
 | Opportunity user event | 1.8.2 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Production — confirmed by the client 22 Sep 2026 |
 | Sales order user event | 1.0.0 | `opsync_ue_salesorder.js` | `afterSubmit` on Sales Order — re-evaluates readiness for that one order. Writes the two readiness fields and **nothing else** | Production, deployment status **Testing** — confirmed by the client 22 Sep 2026 |
-| Design Instruction config library | 1.2.0 | `lib/dsi_lib_config.js` | Every script ID and parameter of the Design Instruction feature. **Separate from `opsync_lib_config.js`** — see section 11. Also loaded by the client script | Not deployed |
+| Design Instruction config library | 1.3.0 | `lib/dsi_lib_config.js` | Every script ID and parameter of the Design Instruction feature. **Separate from `opsync_lib_config.js`** — see section 11. Also loaded by the client script | Not deployed |
 | Design Instruction opportunity user event | 1.2.0 | `dsi_ue_opportunity.js` | `beforeLoad` on Opportunity — the two buttons; `afterSubmit` — creates a Design Instruction row when the sub-status moves to a creating value | Not deployed |
 | Design Instruction opportunity client script | 1.1.0 | `dsi_cs_opportunity.js` | Request Design / Request Redraw — confirm, write the sub-status, land on the redraw row. **Attached by `beforeLoad`; no script record, no deployment** | Not deployed |
-| Design Instruction row user event | 1.1.0 | `dsi_ue_design_instruction.js` | `beforeSubmit` and `afterSubmit` on `customrecord_cad_worklist` — design start stamp, completion gate, completion write-back to the opportunity | Not deployed |
+| Design Instruction row user event | 1.2.0 | `dsi_ue_design_instruction.js` | `beforeSubmit` and `afterSubmit` on `customrecord_cad_worklist` — design start stamp, completion gate, completion write-back to the opportunity | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -1327,9 +1327,9 @@ section 11. Grep the execution log for `DSI_` as well as `OPPSYNC_` after every 
 | 118 | Set the map so a key equals the complete status, then move a sub-status to a creating value | No row; `DSI_CONFIG_OVERLAP` at error. **Every** creation is refused while the map overlaps. **Revert afterwards**. See also 134 |
 | 119 | Opportunity with all three name fields blank | Name = `<tranid> · <type>`. **Also confirm on any populated opportunity that the three parts read as their display text** — select or text alike, since 1.2.0 reads whichever shape `lookupFields` returns |
 | 120 | Name fields long enough to exceed the cap | Name truncated to `NAME_MAX_LENGTH`; save succeeds. **If the save fails, the cap is wrong** — it is unverified |
-| 121 | On a row, set the designer, save | `custrecord_cad_design_start` = **today** as the user sees it; nothing written to the opportunity. Run once before 08:00 UK time to catch a server-time-zone date |
-| 122 | Enter completed date with notes blank | Save **blocked** with *"To complete this design instruction, enter the designer, the area (m²) and designer notes."* `DSI_INCOMPLETE` at audit |
-| 123 | Enter completed date with area = **0**, designer and notes present | Save succeeds — zero is an area |
+| 121 | On a row, set **CAD completed by**, save | `custrecord_cad_design_start` = **today** as the user sees it; nothing written to the opportunity. Run once before 08:00 UK time to catch a server-time-zone date. Since 1.2.0 the stamp watches CAD completed by, not `custrecord_cad_designer` |
+| 122 | Enter completed date with **CAD completed by blank** | Save **blocked** with *"To complete this design instruction, enter who completed it (CAD completed by)."* `DSI_INCOMPLETE` at audit, naming `designer` as missing |
+| 123 | Enter completed date with **CAD completed by set**, **area blank**, **notes blank** | Save succeeds and the opportunity is **moved on** — `DSI_ROW_COMPLETED`. Area and notes are not required since 24 Sep 2026 |
 | 124 | Complete a *New design* row properly | Opportunity sub-status = *Post Design Check*; priority design **unticked**; `DSI_ROW_COMPLETED` at audit; **then the sync's `OPPSYNC_` lines for that opportunity**, and — for a Won opportunity whose map carries *Post Design Check* — the sales orders updated. This is the **confirming test** that a user event's write to the opportunity fires the opportunity's user events. Scenario 95 is the precedent: the same cross-record firing, already passed in this account |
 | 125 | Complete a *Redraw* row properly | Identical to 124 |
 | 126 | Set type to *Cancelled*, then enter completed date | No gate, nothing written to the opportunity; `DSI_CANCELLED_IGNORED` at audit |
@@ -1622,18 +1622,42 @@ created, without the type in its name, and `DSI_TYPE_TEXT_UNREADABLE` is logged 
 
 ### The row — `dsi_ue_design_instruction.js`
 
+#### The row fields, as the 2026 form carries them
+
+| Constant | Field | Label on the form | Read by a script |
+|---|---|---|---|
+| `ROW_FIELDS.DESIGNER` | `custrecord_cw_bom_completed_by` | *CAD completed by* | **Yes** — the completion gate and the design start stamp |
+| `ROW_FIELDS.NOTES` | `custrecord_ease_designer_notes` | *Designer Notes* | **No** — documentation only |
+| `ROW_FIELDS.AREA` | `custrecord_cad_area` | area (m²) | **No** — documentation only |
+| `ROW_FIELDS.COMPLETED` | `custrecord_cad_completed` | completed date | **Yes** — entering it completes the row |
+| `ROW_FIELDS.DESIGN_START` | `custrecord_cad_design_start` | design start | **Written** — the stamp |
+
+> **⚠️ Two field IDs do not describe what they hold, deliberately.** `custrecord_cw_bom_completed_by`
+> reads *"BoM completed by"* and holds the designer; `custrecord_ease_designer_notes` reads *"EASE
+> designer notes"* and holds the designer's notes. **The script follows the form in use** — the
+> client's decision. `custrecord_cad_designer` and `custrecord_cad_notes` still exist on the record,
+> are not on the 2026 form, and are **not read by this feature**. Do not "correct" the constants
+> back to them: that is the defect below.
+
+> **Changed 24 Sep 2026 (row UE 1.2.0, config 1.3.0).** Sandbox testing found every completion
+> refused with `DSI_INCOMPLETE` although the form was filled in: the script read
+> `custrecord_cad_designer` and `custrecord_cad_notes`, which the 2026 form does not carry. The
+> client decided the script follows the form, and that **only the designer is required** to
+> complete a row. The area and notes checks were **removed, not relaxed**.
+
 **`beforeSubmit`** — two steps, **two failure rules**, deliberately different:
 
-1. **Design start stamp — wrapped.** A designer present after the save, none before it, and no
-   start date → `custrecord_cad_design_start` = `new Date()`. A failure is logged as
+1. **Design start stamp — wrapped.** `ROW_FIELDS.DESIGNER` present after the save, empty before
+   it, and no start date → `custrecord_cad_design_start` = `new Date()`. A failure is logged as
    `DSI_STAMP_FAILED` and **the save goes on**: a missing start date must never stop a designer
-   saving.
-2. **Completion gate — not wrapped.** On the save that completes the row, the designer, the area
-   and the notes are all required. **Zero is an area** — the test is `isEmpty()`, never
-   falsiness. Notes must be non-blank after trimming. Otherwise `DSI_INCOMPLETE` at audit, then a
-   thrown `DSI_INCOMPLETE` error that shows the user *"To complete this design instruction, enter
-   the designer, the area (m²) and designer notes."* **Skipped for a cancelled row.** Its throw
-   is how it refuses the save, so it must reach NetSuite.
+   saving. The stamp follows the constant, so since 1.2.0 it watches *CAD completed by* — **if that
+   field is filled in only at the end of a design, the start date lands on that save.**
+2. **Completion gate — not wrapped.** On the save that completes the row, **`ROW_FIELDS.DESIGNER`
+   is the only requirement**. Area and notes are not checked — a row completes with its area empty
+   or zero and its notes empty. Otherwise `DSI_INCOMPLETE` at audit, naming `designer` as missing,
+   then a thrown `DSI_INCOMPLETE` error that shows the user *"To complete this design instruction,
+   enter who completed it (CAD completed by)."* **Skipped for a cancelled row.** Its throw is how
+   it refuses the save, so it must reach NetSuite.
 
 **`afterSubmit`** — wrapped whole; the row has already saved:
 
@@ -1713,7 +1737,7 @@ accessor its script does not define throws `DSI_PARAMETER_NOT_ON_SCRIPT`.
 | `DSI_BEFORELOAD_FAILED` | error | The buttons could not be added. **The record still displayed**, without them |
 | `DSI_TYPE_TEXT_UNREADABLE` | error | The design type's name could not be read. The row was created without it in its name |
 | `DSI_STAMP_FAILED` | error | The design start date could not be stamped. **The row still saved**, without it |
-| `DSI_INCOMPLETE` | audit, **and thrown** | A completion was refused for missing designer, area or notes. Names what was missing |
+| `DSI_INCOMPLETE` | audit, **and thrown** | A completion was refused because *CAD completed by* (`ROW_FIELDS.DESIGNER`) was empty. Names what was missing |
 | `DSI_CANCELLED_IGNORED` | audit | A cancelled row was completed; nothing was written |
 | `DSI_ROW_COMPLETED` | audit | A completion moved the opportunity on. Names the row, the opportunity and the status written |
 | `DSI_COMPLETE_FAILED` | error | The completion write-back threw, or the row had no opportunity. **The row still saved**; the opportunity was not moved on |

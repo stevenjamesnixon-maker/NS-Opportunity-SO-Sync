@@ -3,8 +3,8 @@
  *
  * User event on the Design Instruction row (customrecord_cad_worklist). Two jobs:
  *
- *   beforeSubmit  stamps the design start date when a designer is first assigned, and refuses to
- *                 let a row be completed without its designer, area and notes;
+ *   beforeSubmit  stamps the design start date when "CAD completed by" is first filled in, and
+ *                 refuses to let a row be completed without it;
  *   afterSubmit   when a row is completed, moves its opportunity on to be checked — writes the
  *                 completion sub-status (Post Design Check) and clears the priority design box.
  *
@@ -28,21 +28,21 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.1.0
+ * @version 1.2.0
  */
 define(['N/record', 'N/error', 'N/log', './lib/dsi_lib_config', './lib/opsync_lib_values'],
     function (record, error, log, dsiConfig, values) {
 
     'use strict';
 
-    var VERSION = '1.1.0';
+    var VERSION = '1.2.0';
 
     /**
      * The message the user sees when the completion gate refuses a save.
      * @type {string}
      */
-    var INCOMPLETE_MESSAGE = 'To complete this design instruction, enter the designer, the ' +
-        'area (m²) and designer notes.';
+    var INCOMPLETE_MESSAGE = 'To complete this design instruction, enter who completed it ' +
+        '(CAD completed by).';
 
     /**
      * True for the three event types both entry points handle.
@@ -91,8 +91,12 @@ define(['N/record', 'N/error', 'N/log', './lib/dsi_lib_config', './lib/opsync_li
     }
 
     /**
-     * Stamps the design start date with today when a designer is assigned for the first time and
-     * no start date is already recorded.
+     * Stamps the design start date with today when ROW_FIELDS.DESIGNER is filled in for the first
+     * time and no start date is already recorded.
+     *
+     * Since 1.2.0 ROW_FIELDS.DESIGNER is custrecord_cw_bom_completed_by — "CAD completed by" on
+     * the form. This function follows the constant and needed no change of its own. If that field
+     * is filled in only when the design is finished, the start date is stamped on that save.
      *
      * "Today" is new Date() in the SERVER's time zone, as the brief specifies. Near midnight UK
      * time the server's date can differ from the user's; Sandbox should confirm the stamped date
@@ -115,13 +119,12 @@ define(['N/record', 'N/error', 'N/log', './lib/dsi_lib_config', './lib/opsync_li
     }
 
     /**
-     * The completion gate. Throws DSI_INCOMPLETE when the row is being completed without its
-     * designer, area or notes. Skipped entirely for a cancelled row.
+     * The completion gate. Throws DSI_INCOMPLETE when the row is being completed without
+     * ROW_FIELDS.DESIGNER — "CAD completed by". Skipped entirely for a cancelled row.
      *
-     * AREA: present is enough, and ZERO IS PRESENT. The test is isEmpty(), never falsiness —
-     * a falsy test would refuse a legitimate area of 0.
-     *
-     * NOTES: must be non-blank after trimming. A note of spaces is not a note.
+     * THE DESIGNER IS THE ONLY REQUIREMENT, by the client's decision of 24 Sep 2026. The area and
+     * notes checks were REMOVED, not relaxed: a row completes with its area empty or zero and its
+     * notes empty. Do not add them back without the client.
      *
      * @param {Record} newRecord
      * @param {Record} oldRecord
@@ -129,25 +132,16 @@ define(['N/record', 'N/error', 'N/log', './lib/dsi_lib_config', './lib/opsync_li
      * @throws {Error} DSI_INCOMPLETE
      */
     function enforceCompletionGate(newRecord, oldRecord, sparse) {
-        var fields = dsiConfig.ROW_FIELDS;
         var missing = [];
-        var notes;
 
         if (values.contains(readType(newRecord, oldRecord, sparse),
                 dsiConfig.getCancelledTypes())) {
             return;
         }
 
-        if (values.asSelectId(values.effectiveValue(newRecord, oldRecord, fields.DESIGNER,
-                sparse)) === '') {
+        if (values.asSelectId(values.effectiveValue(newRecord, oldRecord,
+                dsiConfig.ROW_FIELDS.DESIGNER, sparse)) === '') {
             missing.push('designer');
-        }
-        if (values.isEmpty(values.effectiveValue(newRecord, oldRecord, fields.AREA, sparse))) {
-            missing.push('area');
-        }
-        notes = values.effectiveValue(newRecord, oldRecord, fields.NOTES, sparse);
-        if (values.isEmpty(notes) || String(notes).replace(/^\s+|\s+$/g, '') === '') {
-            missing.push('designer notes');
         }
 
         if (missing.length === 0) {

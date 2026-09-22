@@ -38,13 +38,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.2.0
+ * @version 1.3.0
  */
 define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search, error, log) {
 
     'use strict';
 
-    var VERSION = '1.2.0';
+    var VERSION = '1.3.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE FOR THIS FEATURE
@@ -160,14 +160,35 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
          * record XML, not yet verified in Sandbox.
          */
         NAME: 'name',
-        /** Date. Stamped with today when a designer is first assigned. */
+        /** Date. Stamped with today when DESIGNER is first filled in. */
         DESIGN_START: 'custrecord_cad_design_start',
-        /** Required before a row may be completed. */
-        DESIGNER: 'custrecord_cad_designer',
-        /** Area in m². Required before completion; ZERO IS A VALID AREA. */
+        /**
+         * WHO COMPLETED THE DESIGN — labelled "CAD completed by" on the 2026 form. The ONLY field
+         * the completion gate requires, and the field the design start stamp watches.
+         *
+         * ⚠️ THE ID DOES NOT DESCRIBE WHAT IT HOLDS. It reads "BoM completed by"; on this record it
+         * holds the designer. That is the client's decision (24 Sep 2026): the script follows the
+         * form in use, and the form carries this field, not custrecord_cad_designer. Do not
+         * "correct" it to custrecord_cad_designer — that field still exists on the record, is not
+         * on the form, and is NOT read by this feature. Reading it is the defect Sandbox found:
+         * every completion refused, with the form filled in.
+         */
+        DESIGNER: 'custrecord_cw_bom_completed_by',
+        /**
+         * Area in m². NOT READ BY ANY SCRIPT since 24 Sep 2026 — the client removed it from the
+         * completion gate. Listed as documentation of a field the form carries.
+         */
         AREA: 'custrecord_cad_area',
-        /** Designer notes. Required, non-blank after trimming, before completion. */
-        NOTES: 'custrecord_cad_notes',
+        /**
+         * Designer notes — labelled "Designer Notes" on the 2026 form. NOT READ BY ANY SCRIPT since
+         * 24 Sep 2026 — the client removed it from the completion gate. Listed as documentation.
+         *
+         * ⚠️ THE ID DOES NOT DESCRIBE WHAT IT HOLDS. It reads "EASE designer notes"; on this record
+         * it holds the designer's notes. The form carries this field, so it is the one recorded
+         * here — the client's decision to match the form in use. custrecord_cad_notes still exists
+         * on the record, is not on the form, and is NOT read by this feature.
+         */
+        NOTES: 'custrecord_ease_designer_notes',
         /** Date. Entering it is what completes the row — there is no status field or button. */
         COMPLETED: 'custrecord_cad_completed',
         /**
