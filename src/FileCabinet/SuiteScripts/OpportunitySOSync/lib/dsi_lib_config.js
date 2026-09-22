@@ -16,6 +16,12 @@
  * to the File Cabinet before any Design Instruction script, which will otherwise fail at load
  * time.
  *
+ * LOADED BY THE CLIENT SCRIPT TOO. dsi_cs_opportunity.js imports this module for its constants
+ * and for findRows(), so every module in the define() below must stay one that client scripts
+ * can load — N/runtime, N/search, N/error and N/log all are. The client script never calls a
+ * parameter accessor: parameters are read on the server in beforeLoad and handed over in hidden
+ * fields.
+ *
  * ⚠️ UNVERIFIED BEFORE DEPLOYMENT — the client must confirm both:
  *
  *   1. NAME_PARTS. Whether custbody_mi_opp_fc, custbody_comm_area_ufh and custbody_mi_heat_source
@@ -31,13 +37,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
 define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search, error, log) {
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE FOR THIS FEATURE
@@ -81,6 +87,21 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
          * turn a type id into its name for the row name — see the Design Instruction user event.
          */
         DESIGN_TYPE: 'customlist_runner_etc'
+    };
+
+    /**
+     * Hidden fields that beforeLoad adds to the opportunity's VIEW form, carrying the ids the
+     * client script needs. The client script contains no id: everything it writes arrives here.
+     * Shared by both sides so the two cannot disagree on a field id.
+     * @type {Object}
+     */
+    var HIDDEN_FIELDS = {
+        /** The sub-status Request Design writes — custscript_dsi_btn_design_target. */
+        STATUS_DESIGN: 'custpage_dsi_status_design',
+        /** The sub-status Request Redraw writes — custscript_dsi_btn_redraw_target. */
+        STATUS_REDRAW: 'custpage_dsi_status_redraw',
+        /** The design type of the row Request Redraw lands on — custscript_dsi_redraw_type. */
+        TYPE_REDRAW: 'custpage_dsi_type_redraw'
     };
 
     /**
@@ -132,7 +153,11 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
         DESIGN_TYPE: 'custrecord_cad_design_type',
         /** Checkbox, from the opportunity's priority design box. */
         URGENT: 'custrecord_urgent_design',
-        /** Native custom record name. Built by the opportunity user event. */
+        /**
+         * Native custom record name. Built by the opportunity user event, which MUST set it: the
+         * record definition has auto-numbering off and the name field included — read from the
+         * record XML, not yet verified in Sandbox.
+         */
         NAME: 'name',
         /** Date. Stamped with today when a designer is first assigned. */
         DESIGN_START: 'custrecord_cad_design_start',
@@ -188,10 +213,8 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
     /**
      * Entry-point script IDs that read parameters through this module.
      *
-     * NOT BUILT IN THIS PHASE: the Request Design / Request Redraw buttons — the opportunity
-     * script's beforeLoad, the client script dsi_cs_opportunity.js, and their three parameters.
-     * The brief gave the buttons' target sub-status ids no source; see docs/context.md
-     * section 11, open decision 1.
+     * The client script dsi_cs_opportunity.js is not here, and has no script record at all: it
+     * is attached by form.clientScriptModulePath and reads no parameters.
      * @type {Object}
      */
     var SCRIPTS = {
@@ -216,6 +239,11 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
      * reads its own copy only to refuse a creation map that would create a row at that same
      * status — the overlap check. If the two diverge, the check tests the wrong value.
      *
+     * THE PAIR HAS TWO LOGICAL KEYS, NOT ONE — OVERLAP_STATUS and COMPLETE_STATUS — because
+     * empty means different things on the two scripts: the overlap check throws, the write-back
+     * fails closed. With one key, either accessor would silently work from the wrong script;
+     * with two, calling the wrong one throws DSI_PARAMETER_NOT_ON_SCRIPT.
+     *
      * THE MAP IS EXPLICIT, as in opsync_lib_config.js: no derivation from the script id and no
      * fallback to another script's parameter. A new script means a new row here.
      * ------------------------------------------------------------------------------------------ */
@@ -223,12 +251,20 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
     /**
      * Logical parameter key -> the real parameter ID, per executing script.
      *
-     *   CREATE_MAP        sub-status id -> design type id pairs. Which sub-statuses create a row,
-     *                     and of which type. Empty: no rows are created (fails closed)
-     *   FORM_ID           internal id of the Design Instruction entry form. Empty: THROWS
-     *   COMPLETE_STATUS   the sub-status id a completed row moves the opportunity to. On the
-     *                     opportunity script, used only for the overlap check
-     *   CANCELLED_TYPES   design type ids treated as cancelled. Empty: none is (see accessor)
+     *   CREATE_MAP            sub-status id -> design type id pairs. Which sub-statuses create
+     *                         a row, and of which type
+     *   FORM_ID               internal id of the Design Instruction entry form
+     *   OVERLAP_STATUS        the completion sub-status, as the OPPORTUNITY script knows it —
+     *                         for the overlap check only
+     *   BTN_DESIGN_STATUSES   sub-statuses at which Request Design is shown
+     *   BTN_REDRAW_STATUSES   sub-statuses at which Request Redraw is shown
+     *   BTN_DESIGN_TARGET     the sub-status Request Design writes
+     *   BTN_REDRAW_TARGET     the sub-status Request Redraw writes
+     *   REDRAW_TYPE           the design type of the row Request Redraw lands the user on
+     *   COMPLETE_STATUS       the completion sub-status, as the ROW script writes it
+     *   CANCELLED_TYPES       design type ids treated as cancelled
+     *
+     * What each does when empty is in the accessor block below.
      *
      * All values are set on the DEPLOYMENT, so each environment carries its own and no internal
      * id appears in code.
@@ -238,7 +274,12 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
         'customscript_dsi_ue_opportunity': {
             CREATE_MAP: 'custscript_dsi_create_map',
             FORM_ID: 'custscript_dsi_form_id',
-            COMPLETE_STATUS: 'custscript_dsi_complete_status'
+            OVERLAP_STATUS: 'custscript_dsi_complete_status',
+            BTN_DESIGN_STATUSES: 'custscript_dsi_btn_design_statuses',
+            BTN_REDRAW_STATUSES: 'custscript_dsi_btn_redraw_statuses',
+            BTN_DESIGN_TARGET: 'custscript_dsi_btn_design_target',
+            BTN_REDRAW_TARGET: 'custscript_dsi_btn_redraw_target',
+            REDRAW_TYPE: 'custscript_dsi_redraw_type'
         },
         'customscript_dsi_ue_design_instruction': {
             COMPLETE_STATUS: 'custscript_dsirow_complete_status',
@@ -360,13 +401,18 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
     }
 
     /**
-     * Logs an unset or unusable parameter at error, naming what the emptiness means.
+     * Logs an unset or unusable parameter, naming what the emptiness means.
+     *
+     * At ERROR unless the caller says otherwise. The one exception is a button's target: an
+     * absent button is visible to every user, so it does not need the error level to be noticed,
+     * and at error it would fill the log on every view of every opportunity.
      *
      * @param {string} parameterId
      * @param {string} consequence - what the script does, or does not do, as a result
+     * @param {string} [level] - 'debug' or 'error'; defaults to 'error'
      */
-    function logMissing(parameterId, consequence) {
-        log.error({
+    function logMissing(parameterId, consequence, level) {
+        (level === 'debug' ? log.debug : log.error)({
             title: logKey('PARAMETER_MISSING'),
             details: 'Script parameter ' + parameterId + ' is not set or holds nothing usable. ' +
                 consequence + ' Populate it on the deployment in this account — its value is ' +
@@ -516,27 +562,64 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
         return raw;
     }
 
+    /**
+     * Reads a parameter holding ONE internal id that MUST be present.
+     *
+     * @param {string} parameterId
+     * @param {string} consequence - what cannot happen without it, for the log
+     * @returns {string}
+     * @throws {Error} DSI_PARAMETER_MISSING when unset or not a whole number
+     */
+    function requiredSingleId(parameterId, consequence) {
+        var id = parseSingleId(parameterId);
+
+        if (id === '') {
+            logMissing(parameterId, consequence);
+            throw error.create({
+                name: logKey('PARAMETER_MISSING'),
+                message: 'Required script parameter ' + parameterId + ' is not set.',
+                notifyOff: true
+            });
+        }
+
+        return id;
+    }
+
     /* ------------------------------------------------------------------------------------------
      * THE ACCESSORS — AND WHAT EMPTY MEANS FOR EACH
      *
      * The test is the one in docs/context.md section 5: not "how important is this parameter",
      * but WHAT DOES EMPTY MEAN — does the script do less, or more?
      *
-     *   getCreateMap()        empty: no rows are created. Less. Fails closed: logs, returns {}.
-     *   getFormId()           empty: a row would be created on no form, which is unusable. The
-     *                         creation cannot go ahead without it. THROWS.
-     *   getCompleteStatus()   on the ROW script, empty: completion writes nothing. Less. Fails
-     *                         closed: logs, returns ''.
-     *                         On the OPPORTUNITY script, empty: the overlap check is skipped and
-     *                         creation proceeds. ⚠️ By the section 5 test that is MORE — a safety
-     *                         check removed — yet it does not throw, because the brief specifies
-     *                         "empty skips the check". Recorded as an open decision in
-     *                         docs/context.md section 11. It still logs at error.
-     *   getCancelledTypes()   empty: no type is treated as cancelled. In beforeSubmit that is
-     *                         MORE restriction (the completion gate applies to every row); in
-     *                         afterSubmit it is MORE writing (a cancelled row's completion moves
-     *                         the opportunity). ⚠️ Mixed, and it does not throw, as specified.
-     *                         Recorded as an open decision in docs/context.md section 11.
+     * Opportunity script, afterSubmit:
+     *
+     *   getCreateMap()          empty: no rows are created. Less. Fails closed: logs, returns {}.
+     *   getFormId()             empty: a row would be created on no form, which is unusable.
+     *                           THROWS.
+     *   getOverlapStatus()      empty: the overlap check cannot run, and creating without it is
+     *                           a safety check removed — MORE. THROWS, so no row is created
+     *                           until the parameter is set.
+     *
+     * Opportunity script, beforeLoad — which must never stop the record displaying, so nothing
+     * here throws:
+     *
+     *   getBtnDesignStatuses()  empty: Request Design is never shown. Less. Fails closed: logs at
+     *   getBtnRedrawStatuses()  error, returns [].
+     *   getBtnDesignTarget()    empty: that button is never shown. Less. Fails closed, and logs
+     *   getBtnRedrawTarget()    at DEBUG — see logMissing().
+     *   getRedrawType()         empty: Request Redraw still writes its status, but cannot find
+     *                           the new row, so it reloads the page instead of landing on it.
+     *                           Less. Fails closed: logs at error, returns ''.
+     *
+     * Row script:
+     *
+     *   getCompleteStatus()     empty: completion writes nothing. Less. Fails closed: logs,
+     *                           returns ''. Not a throw — the row has already saved.
+     *   getCancelledTypes()     empty: no type is treated as cancelled. In beforeSubmit that is
+     *                           MORE restriction (the gate applies to every row); in afterSubmit
+     *                           it is MORE writing (a cancelled row's completion moves the
+     *                           opportunity). Left as a logged configuration error by the
+     *                           client's decision, now that the value has been supplied.
      * ------------------------------------------------------------------------------------------ */
 
     /**
@@ -566,27 +649,118 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
      * @throws {Error} DSI_PARAMETER_MISSING
      */
     function getFormId() {
-        var parameterId = resolveParameterId('FORM_ID', 'getFormId');
-        var formId = parseSingleId(parameterId);
-
-        if (formId === '') {
-            logMissing(parameterId, 'A Design Instruction cannot be created without its form, ' +
-                'so none was.');
-            throw error.create({
-                name: logKey('PARAMETER_MISSING'),
-                message: 'Required script parameter ' + parameterId + ' is not set.',
-                notifyOff: true
-            });
-        }
-
-        return formId;
+        return requiredSingleId(resolveParameterId('FORM_ID', 'getFormId'),
+            'A Design Instruction cannot be created without its form, so none was.');
     }
 
     /**
-     * The sub-status a completed row moves the opportunity to — Post Design Check.
+     * The completion sub-status, as the OPPORTUNITY script holds it — for the overlap check
+     * only. Must equal custscript_dsirow_complete_status.
      *
-     * Resolves to custscript_dsi_complete_status on the opportunity script and
-     * custscript_dsirow_complete_status on the row script. The two must hold the same value.
+     * REQUIRED — throws when unset. Without it the overlap check cannot run, and creating rows
+     * with a safety check silently removed is the fail-open case section 5 forbids.
+     *
+     * @returns {string}
+     * @throws {Error} DSI_PARAMETER_MISSING
+     */
+    function getOverlapStatus() {
+        return requiredSingleId(resolveParameterId('OVERLAP_STATUS', 'getOverlapStatus'),
+            'The check that the creation map never creates a row at the completion status ' +
+            'cannot run, so no Design Instruction was created.');
+    }
+
+    /**
+     * Reads a button's visibility list.
+     *
+     * @param {string} key
+     * @param {string} accessor
+     * @param {string} label - the button's label, for the log
+     * @returns {string[]} [] when unset — the button is never shown
+     */
+    function buttonStatuses(key, accessor, label) {
+        var parameterId = resolveParameterId(key, accessor);
+        var ids = parseIdList(parameterId);
+
+        if (ids.length === 0) {
+            logMissing(parameterId, 'The ' + label + ' button is never shown.');
+        }
+
+        return ids;
+    }
+
+    /**
+     * Reads a button's target sub-status.
+     *
+     * @param {string} key
+     * @param {string} accessor
+     * @param {string} label - the button's label, for the log
+     * @returns {string} '' when unset — the button is never shown. Logged at DEBUG
+     */
+    function buttonTarget(key, accessor, label) {
+        var parameterId = resolveParameterId(key, accessor);
+        var id = parseSingleId(parameterId);
+
+        if (id === '') {
+            logMissing(parameterId, 'The ' + label + ' button has no sub-status to write, so it ' +
+                'is not shown.', 'debug');
+        }
+
+        return id;
+    }
+
+    /**
+     * Sub-statuses at which the Request Design button is shown.
+     * @returns {string[]} [] when unset
+     */
+    function getBtnDesignStatuses() {
+        return buttonStatuses('BTN_DESIGN_STATUSES', 'getBtnDesignStatuses', 'Request Design');
+    }
+
+    /**
+     * Sub-statuses at which the Request Redraw button is shown.
+     * @returns {string[]} [] when unset
+     */
+    function getBtnRedrawStatuses() {
+        return buttonStatuses('BTN_REDRAW_STATUSES', 'getBtnRedrawStatuses', 'Request Redraw');
+    }
+
+    /**
+     * The sub-status the Request Design button writes — Design Required.
+     * @returns {string} '' when unset
+     */
+    function getBtnDesignTarget() {
+        return buttonTarget('BTN_DESIGN_TARGET', 'getBtnDesignTarget', 'Request Design');
+    }
+
+    /**
+     * The sub-status the Request Redraw button writes — Redraw Required.
+     * @returns {string} '' when unset
+     */
+    function getBtnRedrawTarget() {
+        return buttonTarget('BTN_REDRAW_TARGET', 'getBtnRedrawTarget', 'Request Redraw');
+    }
+
+    /**
+     * The design type of the row Request Redraw lands the user on — Redraw.
+     *
+     * @returns {string} '' when unset — the button still writes its status, and the client
+     *          script reloads the page rather than landing on the row
+     */
+    function getRedrawType() {
+        var parameterId = resolveParameterId('REDRAW_TYPE', 'getRedrawType');
+        var id = parseSingleId(parameterId);
+
+        if (id === '') {
+            logMissing(parameterId, 'Request Redraw still writes its sub-status, but cannot find ' +
+                'the new row, so it reloads the page instead of opening the row.');
+        }
+
+        return id;
+    }
+
+    /**
+     * The sub-status a completed row moves the opportunity to — Post Design Check — as the ROW
+     * script holds it. Must equal custscript_dsi_complete_status.
      *
      * @returns {string} the id, or '' when unset — never throws
      */
@@ -595,9 +769,8 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
         var status = parseSingleId(parameterId);
 
         if (status === '') {
-            logMissing(parameterId, 'On the row script, a completed Design Instruction writes ' +
-                'nothing to its opportunity. On the opportunity script, the check that the ' +
-                'creation map never creates a row at this status is skipped.');
+            logMissing(parameterId, 'A completed Design Instruction writes nothing to its ' +
+                'opportunity.');
         }
 
         return status;
@@ -660,6 +833,7 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
         LOG_PREFIX: LOG_PREFIX,
         RECORD_TYPES: RECORD_TYPES,
         LISTS: LISTS,
+        HIDDEN_FIELDS: HIDDEN_FIELDS,
         OPPORTUNITY_FIELDS: OPPORTUNITY_FIELDS,
         ROW_FIELDS: ROW_FIELDS,
         NAME_PARTS: NAME_PARTS,
@@ -670,6 +844,12 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
         resolveParameterId: resolveParameterId,
         getCreateMap: getCreateMap,
         getFormId: getFormId,
+        getOverlapStatus: getOverlapStatus,
+        getBtnDesignStatuses: getBtnDesignStatuses,
+        getBtnRedrawStatuses: getBtnRedrawStatuses,
+        getBtnDesignTarget: getBtnDesignTarget,
+        getBtnRedrawTarget: getBtnRedrawTarget,
+        getRedrawType: getRedrawType,
         getCompleteStatus: getCompleteStatus,
         getCancelledTypes: getCancelledTypes,
         findRows: findRows

@@ -11,8 +11,8 @@ that is being retired. The two must never run at the same time.
 The repo also carries a second, separate feature: **Design Instruction**. The CAD Worklist record,
 `customrecord_cad_worklist`, is repurposed as a Design Instruction — one row per design or redraw,
 a child of the opportunity. A row is created when the opportunity's sub-status moves to a creating
-value, and completing it (entering its completed date) moves the opportunity on to *Post Design
-Check*. It has its own config module, its own parameters and its own `DSI_` log prefix, shares only
+value — by hand, or with the Request Design / Request Redraw buttons on the opportunity — and
+completing it (entering its completed date) moves the opportunity on to *Post Design Check*. It has its own config module, its own parameters and its own `DSI_` log prefix, shares only
 the value-shape module with the sync, and modifies none of the sync's files. See
 [`docs/context.md` §11](docs/context.md).
 
@@ -31,7 +31,8 @@ the code, the code wins — and the document gets fixed in the same PR.
 src/FileCabinet/SuiteScripts/OpportunitySOSync/
     opsync_ue_opportunity.js         sync — afterSubmit on Opportunity
     opsync_ue_salesorder.js          sync — afterSubmit on Sales Order
-    dsi_ue_opportunity.js            Design Instruction — creates rows, afterSubmit on Opportunity
+    dsi_ue_opportunity.js            Design Instruction — buttons (beforeLoad), creates rows (afterSubmit)
+    dsi_cs_opportunity.js            Design Instruction — the buttons' client script; no script record
     dsi_ue_design_instruction.js     Design Instruction — gate and completion, on the row
     lib/                             shared modules — uploaded, but no script record needed
         opsync_lib_config.js         sync configuration

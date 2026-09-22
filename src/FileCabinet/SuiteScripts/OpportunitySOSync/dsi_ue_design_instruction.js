@@ -13,29 +13,29 @@
  * sub-status: one parameter, no per-type mapping. A row whose design type is Cancelled is ignored
  * by both jobs.
  *
- * beforeSubmit MAY throw, and that is the point of the completion gate: a throw there blocks the
- * row's save and shows the user what is missing. afterSubmit must NOT block anything — the row
- * has already saved — so its entry point is wrapped whole.
+ * beforeSubmit throws in ONE place, deliberately: the completion gate, whose throw blocks the
+ * row's save and shows the user what is missing. The design start stamp is wrapped so that it
+ * can never block a designer's save. afterSubmit must not block anything — the row has already
+ * saved — so its entry point is wrapped whole.
  *
- * ⚠️ THE OPPORTUNITY WRITE MAY NOT RE-RUN THE OPPORTUNITY'S OWN USER EVENTS. NetSuite documents
- * that user event scripts cannot be executed by other user event scripts. If that holds, the
- * submitFields below changes the sub-status WITHOUT opsync_ue_opportunity.js running, so Post
- * Design Check does not reach the sales orders on this save. Sandbox scenario 124 decides it. See
- * docs/context.md section 11, open decision 2.
+ * The completion write re-runs the opportunity's user events, including the sync, which carries
+ * Post Design Check on to the sales orders. A user event's write to a DIFFERENT record type does
+ * fire that record's user events in this account: the sync's own scenario 95 depends on it and
+ * has passed. Scenario 124 confirms it for this write. See docs/context.md section 11.
  *
  * House style is ES5 throughout — var, function, 'use strict'. Deliberate. Do not modernise.
  *
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
 define(['N/record', 'N/error', 'N/log', './lib/dsi_lib_config', './lib/opsync_lib_values'],
     function (record, error, log, dsiConfig, values) {
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
 
     /**
      * The message the user sees when the completion gate refuses a save.
@@ -170,8 +170,12 @@ define(['N/record', 'N/error', 'N/log', './lib/dsi_lib_config', './lib/opsync_li
      * Entry point. Runs before the row is written, so it may change newRecord and may refuse the
      * save. See docs/context.md section 11.
      *
-     * NOT wrapped in a catch-all, unlike afterSubmit: a throw here is how the completion gate
-     * works. The consequence is that any other failure here also refuses the row's save.
+     * TWO STEPS, TWO FAILURE RULES — do not unify them:
+     *
+     *   1. The design start stamp is WRAPPED. A stamping failure is logged as DSI_STAMP_FAILED
+     *      and the save goes on: a missing start date must never stop a designer saving.
+     *   2. The completion gate is NOT wrapped. Its throw is how it refuses an incomplete
+     *      completion, so it must reach NetSuite.
      *
      * @param {Object} context
      * @throws {Error} DSI_INCOMPLETE
@@ -185,8 +189,19 @@ define(['N/record', 'N/error', 'N/log', './lib/dsi_lib_config', './lib/opsync_li
 
         sparse = (context.type === context.UserEventType.XEDIT);
 
-        stampDesignStart(context.newRecord, context.oldRecord, sparse);
+        // 1. Wrapped — must not block the save.
+        try {
+            stampDesignStart(context.newRecord, context.oldRecord, sparse);
+        } catch (e) {
+            log.error({
+                title: dsiConfig.logKey('STAMP_FAILED'),
+                details: 'The design start date could not be stamped on Design Instruction ' +
+                    (context.newRecord && context.newRecord.id ? context.newRecord.id : '(new)') +
+                    '. The row was saved without it. ' + e
+            });
+        }
 
+        // 2. Not wrapped — a throw here is the gate refusing the save.
         if (isCompletion(context.newRecord, context.oldRecord, sparse)) {
             enforceCompletionGate(context.newRecord, context.oldRecord, sparse);
         }
@@ -254,6 +269,10 @@ define(['N/record', 'N/error', 'N/log', './lib/dsi_lib_config', './lib/opsync_li
 
             // 4. The write-back. The priority design box is cleared on EVERY completion, not
             //    only the last — the client's decision.
+            //
+            //    This write fires the opportunity's user events, the sync included: a user
+            //    event's write to another record type fires that record's user events here —
+            //    the sync's scenario 95 depends on it and has passed. Scenario 124 confirms it.
             fieldValues[dsiConfig.OPPORTUNITY_FIELDS.SUB_STATUS] = completeStatus;
             fieldValues[dsiConfig.OPPORTUNITY_FIELDS.PRIORITY_DESIGN] = false;
 

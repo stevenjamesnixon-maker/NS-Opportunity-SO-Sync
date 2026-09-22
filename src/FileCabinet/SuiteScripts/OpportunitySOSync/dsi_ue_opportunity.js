@@ -1,20 +1,25 @@
 /**
  * dsi_ue_opportunity.js
  *
- * Creates a Design Instruction row (customrecord_cad_worklist) when an opportunity's sub-status
- * moves to one of the values in custscript_dsi_create_map — Design Required creates a New design
- * row, Redraw Required a Redraw row, in the client's configuration.
+ * Two jobs on the Opportunity:
+ *
+ *   beforeLoad   on VIEW, adds the Request Design and Request Redraw buttons, each shown by the
+ *                sub-status alone, and attaches dsi_cs_opportunity.js to act on them;
+ *   afterSubmit  creates a Design Instruction row (customrecord_cad_worklist) when the sub-status
+ *                moves to one of the values in custscript_dsi_create_map — Design Required
+ *                creates a New design row, Redraw Required a Redraw row, in the client's
+ *                configuration.
+ *
+ * The buttons only write the sub-status. The row is created here, in afterSubmit, by the save
+ * that write causes — exactly as for a sub-status changed by hand.
  *
  * SEPARATE FROM opsync_ue_opportunity.js, DELIBERATELY. Both fire on the same saves, and neither
  * touches the other's fields: the sync writes only to sales orders, this script only creates
  * rows. Neither file imports the other, and this one does not load opsync_lib_config.js, which
  * would refuse to resolve parameters for this script. See docs/context.md section 11.
  *
- * afterSubmit only, in this phase. The brief also specifies a beforeLoad adding Request Design
- * and Request Redraw buttons; it is NOT BUILT, because the buttons' target sub-status ids have no
- * defined source. See docs/context.md section 11, open decision 1.
- *
- * Nothing here may block the opportunity save. The entry point is wrapped whole.
+ * Nothing here may stop the opportunity displaying or block its save. Both entry points are
+ * wrapped whole, and nothing read in beforeLoad throws.
  *
  * Every script ID this file uses comes from dsi_lib_config. No internal id is written out here.
  *
@@ -23,14 +28,41 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
-define(['N/record', 'N/search', 'N/log', './lib/dsi_lib_config', './lib/opsync_lib_values'],
-    function (record, search, log, dsiConfig, values) {
+define(['N/record', 'N/search', 'N/log', 'N/ui/serverWidget', './lib/dsi_lib_config',
+    './lib/opsync_lib_values'],
+    function (record, search, log, serverWidget, dsiConfig, values) {
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
+
+    /**
+     * The client script the buttons call, relative to this file. Attached per form by beforeLoad:
+     * it needs no script record and no deployment.
+     * @type {string}
+     */
+    var CLIENT_SCRIPT_PATH = './dsi_cs_opportunity.js';
+
+    /**
+     * The two buttons. functionName is a BARE function name exported by the client script —
+     * NetSuite appends the parentheses. No arguments are passed in the string; the values the
+     * functions need arrive in hidden fields.
+     * @type {Object}
+     */
+    var BUTTONS = {
+        DESIGN: {
+            id: 'custpage_dsi_request_design',
+            label: 'Request Design',
+            functionName: 'dsiRequestDesign'
+        },
+        REDRAW: {
+            id: 'custpage_dsi_request_redraw',
+            label: 'Request Redraw',
+            functionName: 'dsiRequestRedraw'
+        }
+    };
 
     /**
      * Separator between the name's main segments. U+00B7, the middle dot, written literally: the
@@ -251,6 +283,118 @@ define(['N/record', 'N/search', 'N/log', './lib/dsi_lib_config', './lib/opsync_l
     }
 
     /**
+     * Adds one hidden field carrying a value for the client script.
+     *
+     * @param {serverWidget.Form} form
+     * @param {string} fieldId - from dsiConfig.HIDDEN_FIELDS
+     * @param {string} value
+     */
+    function addHiddenField(form, fieldId, value) {
+        var field = form.addField({
+            id: fieldId,
+            type: serverWidget.FieldType.TEXT,
+            label: fieldId
+        });
+
+        field.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+        field.defaultValue = value;
+    }
+
+    /**
+     * The configuration consistency check: a button's target should be a key of the creation
+     * map. A button whose status creates nothing still works — it writes the status — so this
+     * is logged at error and otherwise ignored. It must not hide the button or break the page.
+     *
+     * @param {Object} createMap
+     * @param {string} target
+     * @param {string} label
+     * @param {string} opportunityId
+     */
+    function checkTarget(createMap, target, label, opportunityId) {
+        if (!createMap.hasOwnProperty(target)) {
+            log.error({
+                title: dsiConfig.logKey('CONFIG_MISMATCH'),
+                details: 'The ' + label + ' button writes sub-status ' + target + ', which is ' +
+                    'not a key of custscript_dsi_create_map, so pressing it creates no Design ' +
+                    'Instruction. The button is still shown and still writes the status. Seen ' +
+                    'on opportunity ' + opportunityId + '.'
+            });
+        }
+    }
+
+    /**
+     * Entry point. On VIEW, adds the Request Design and Request Redraw buttons.
+     *
+     * Visibility is by sub-status ALONE — no search runs here, by the client's decision. A
+     * button is shown when the sub-status is in its visibility list AND its target parameter is
+     * set; a button with nothing to write is not shown.
+     *
+     * Each button's hidden fields are added only with that button, so a parameter belonging to a
+     * button that is not shown is never read and never logged.
+     *
+     * Wrapped whole. Nothing here may stop the record displaying: every parameter read in this
+     * entry point fails closed, and anything that does throw is logged as DSI_BEFORELOAD_FAILED.
+     *
+     * @param {Object} context
+     */
+    function beforeLoad(context) {
+        var form;
+        var opportunityId;
+        var subStatus;
+        var designTarget = '';
+        var redrawTarget = '';
+        var createMap;
+
+        try {
+            if (context.type !== context.UserEventType.VIEW) {
+                return;
+            }
+
+            form = context.form;
+            opportunityId = context.newRecord ? String(context.newRecord.id) : '';
+            subStatus = values.asId(values.readField(context.newRecord,
+                dsiConfig.OPPORTUNITY_FIELDS.SUB_STATUS));
+
+            if (values.contains(subStatus, dsiConfig.getBtnDesignStatuses())) {
+                designTarget = dsiConfig.getBtnDesignTarget();
+            }
+            if (values.contains(subStatus, dsiConfig.getBtnRedrawStatuses())) {
+                redrawTarget = dsiConfig.getBtnRedrawTarget();
+            }
+
+            if (designTarget === '' && redrawTarget === '') {
+                return;
+            }
+
+            form.clientScriptModulePath = CLIENT_SCRIPT_PATH;
+            createMap = dsiConfig.getCreateMap();
+
+            if (designTarget !== '') {
+                form.addButton(BUTTONS.DESIGN);
+                addHiddenField(form, dsiConfig.HIDDEN_FIELDS.STATUS_DESIGN, designTarget);
+                checkTarget(createMap, designTarget, BUTTONS.DESIGN.label, opportunityId);
+            }
+
+            if (redrawTarget !== '') {
+                form.addButton(BUTTONS.REDRAW);
+                addHiddenField(form, dsiConfig.HIDDEN_FIELDS.STATUS_REDRAW, redrawTarget);
+                addHiddenField(form, dsiConfig.HIDDEN_FIELDS.TYPE_REDRAW,
+                    dsiConfig.getRedrawType());
+                checkTarget(createMap, redrawTarget, BUTTONS.REDRAW.label, opportunityId);
+            }
+
+        } catch (e) {
+            // The record must still display. Without the buttons, if need be.
+            log.error({
+                title: dsiConfig.logKey('BEFORELOAD_FAILED'),
+                details: 'Design Instruction buttons could not be added to opportunity ' +
+                    (context && context.newRecord ? context.newRecord.id : 'unknown') +
+                    '. The record displayed normally, without them. ' + e
+            });
+        }
+    }
+
+    /**
      * Entry point. See docs/context.md section 11.
      *
      * @param {Object} context
@@ -319,10 +463,15 @@ define(['N/record', 'N/search', 'N/log', './lib/dsi_lib_config', './lib/opsync_l
             typeId = createMap[newStatus];
 
             // 5. The overlap check. A creation map that creates a row at the completion status
-            //    would turn every completion into a new row. Refuse the whole map rather than
-            //    guess which entry is wrong.
-            completeStatus = dsiConfig.getCompleteStatus();
-            if (completeStatus !== '' && createMap.hasOwnProperty(completeStatus)) {
+            //    would give every completion one extra open row. Not an endless loop — the new
+            //    row waits for a person — but one unwanted row per completion. Refuse the whole
+            //    map rather than guess which entry is wrong.
+            //
+            //    getOverlapStatus() THROWS when unset (caught below as DSI_CREATE_FAILED): a
+            //    creation with this check silently skipped is the fail-open case section 5
+            //    forbids, so no row is created until the parameter is set.
+            completeStatus = dsiConfig.getOverlapStatus();
+            if (createMap.hasOwnProperty(completeStatus)) {
                 log.error({
                     title: dsiConfig.logKey('CONFIG_OVERLAP'),
                     details: 'custscript_dsi_create_map has an entry for sub-status ' +
@@ -364,6 +513,7 @@ define(['N/record', 'N/search', 'N/log', './lib/dsi_lib_config', './lib/opsync_l
 
     return {
         VERSION: VERSION,
+        beforeLoad: beforeLoad,
         afterSubmit: afterSubmit
     };
 });
