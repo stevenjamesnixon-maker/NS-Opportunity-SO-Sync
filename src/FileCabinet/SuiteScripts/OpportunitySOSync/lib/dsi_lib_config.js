@@ -24,11 +24,12 @@
  *
  * ⚠️ UNVERIFIED BEFORE DEPLOYMENT — the client must confirm both:
  *
- *   1. NAME_PARTS. Whether custbody_mi_opp_fc, custbody_comm_area_ufh and custbody_mi_heat_source
- *      are text or select fields, and that all three apply to the Opportunity. All three are set
- *      to isSelect: false below. A select read with getValue() yields an internal id, not its
- *      text, so a wrong flag puts numbers in the row name — and a field that does not apply to
- *      the Opportunity reads as blank rather than erroring. See docs/context.md section 0, trap 6.
+ *   1. NAME_PARTS. That custbody_mi_opp_fc, custbody_comm_area_ufh and custbody_mi_heat_source
+ *      exist and apply to the Opportunity. Their TYPE no longer matters: the name is built from a
+ *      search.lookupFields result, which returns a select as [{value, text}] and a text field as
+ *      a string, and the builder reads whichever shape arrives. But a field that does not apply
+ *      to the Opportunity reads as blank rather than erroring (docs/context.md section 0, trap
+ *      6), and a field id that does not exist at all fails the lookup — and with it the row.
  *   2. NAME_MAX_LENGTH. The maximum length of the custom record's name field. 83 is assumed.
  *
  * House style is ES5 throughout — var, function, 'use strict'. Deliberate. Do not modernise.
@@ -37,13 +38,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.1.0
+ * @version 1.2.0
  */
 define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search, error, log) {
 
     'use strict';
 
-    var VERSION = '1.1.0';
+    var VERSION = '1.2.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE FOR THIS FEATURE
@@ -127,11 +128,11 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
         PRIORITY_DESIGN: 'custbody_priority_design_box',
         /** Native. The opportunity number. First segment of the row name. */
         TRAN_ID: 'tranid',
-        /** Row name part 1. Type UNCONFIRMED — see NAME_PARTS. */
+        /** Row name part 1. Existence on the Opportunity UNCONFIRMED — see NAME_PARTS. */
         MI_OPP_FC: 'custbody_mi_opp_fc',
-        /** Row name part 2. Type UNCONFIRMED — see NAME_PARTS. */
+        /** Row name part 2. Existence on the Opportunity UNCONFIRMED — see NAME_PARTS. */
         COMM_AREA_UFH: 'custbody_comm_area_ufh',
-        /** Row name part 3. Type UNCONFIRMED — see NAME_PARTS. */
+        /** Row name part 3. Existence on the Opportunity UNCONFIRMED — see NAME_PARTS. */
         MI_HEAT_SOURCE: 'custbody_mi_heat_source'
     };
 
@@ -181,16 +182,16 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
     /**
      * The three opportunity fields that make up the tail of the row name, in order.
      *
-     * isSelect decides how each is read: true reads the display text with getText(), false reads
-     * the stored value with getValue(). ⚠️ ALL THREE ARE isSelect: false AND UNCONFIRMED — see
-     * the file header. Correct them here, and nowhere else, once the client has confirmed.
+     * Field ids only. There is no per-field type flag: they are read through search.lookupFields,
+     * and the name builder uses a select's text or a text field's value according to the shape
+     * that arrives. ⚠️ Their existence on the Opportunity is UNCONFIRMED — see the file header.
      *
-     * @type {Array.<{fieldId: string, isSelect: boolean}>}
+     * @type {string[]}
      */
     var NAME_PARTS = [
-        { fieldId: OPPORTUNITY_FIELDS.MI_OPP_FC, isSelect: false },
-        { fieldId: OPPORTUNITY_FIELDS.COMM_AREA_UFH, isSelect: false },
-        { fieldId: OPPORTUNITY_FIELDS.MI_HEAT_SOURCE, isSelect: false }
+        OPPORTUNITY_FIELDS.MI_OPP_FC,
+        OPPORTUNITY_FIELDS.COMM_AREA_UFH,
+        OPPORTUNITY_FIELDS.MI_HEAT_SOURCE
     ];
 
     /**
@@ -412,12 +413,20 @@ define(['N/runtime', 'N/search', 'N/error', 'N/log'], function (runtime, search,
      * @param {string} [level] - 'debug' or 'error'; defaults to 'error'
      */
     function logMissing(parameterId, consequence, level) {
-        (level === 'debug' ? log.debug : log.error)({
+        var entry = {
             title: logKey('PARAMETER_MISSING'),
             details: 'Script parameter ' + parameterId + ' is not set or holds nothing usable. ' +
                 consequence + ' Populate it on the deployment in this account — its value is ' +
                 'an internal id and differs by environment. See docs/context.md section 11.'
-        });
+        };
+
+        // Called as methods of log, never detached from it: a throw here would land inside the
+        // path that reports missing configuration, and hide the very message it exists to give.
+        if (level === 'debug') {
+            log.debug(entry);
+        } else {
+            log.error(entry);
+        }
     }
 
     /**

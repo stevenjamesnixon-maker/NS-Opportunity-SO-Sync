@@ -28,7 +28,7 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.1.0
+ * @version 1.2.0
  */
 define(['N/record', 'N/search', 'N/log', 'N/ui/serverWidget', './lib/dsi_lib_config',
     './lib/opsync_lib_values'],
@@ -36,7 +36,7 @@ define(['N/record', 'N/search', 'N/log', 'N/ui/serverWidget', './lib/dsi_lib_con
 
     'use strict';
 
-    var VERSION = '1.1.0';
+    var VERSION = '1.2.0';
 
     /**
      * The client script the buttons call, relative to this file. Attached per form by beforeLoad:
@@ -79,59 +79,72 @@ define(['N/record', 'N/search', 'N/log', 'N/ui/serverWidget', './lib/dsi_lib_con
     var PART_SEPARATOR = ' / ';
 
     /**
-     * Reads a field's display text, tolerating an absent record or a field it does not carry.
-     * The getText() counterpart of opsync_lib_values.readField().
+     * Renders one value from a search.lookupFields result as trimmed text for the name, whatever
+     * its shape:
      *
-     * @param {Record} rec
-     * @param {string} fieldId
-     * @returns {*} the text, or null
-     */
-    function readText(rec, fieldId) {
-        if (!rec) {
-            return null;
-        }
-        try {
-            return rec.getText({ fieldId: fieldId });
-        } catch (e) {
-            return null;
-        }
-    }
-
-    /**
-     * The getText() counterpart of opsync_lib_values.effectiveValue(): on a sparse XEDIT
-     * newRecord an untouched field reads as empty, so fall back to oldRecord — and only then.
+     *   select / multi-select   an ARRAY of {value, text} — the texts, joined for a multi-select;
+     *                           an empty select is [] and renders as ''
+     *   text, number, date      a STRING — used as it is
      *
-     * @param {Record} newRecord
-     * @param {Record} oldRecord
-     * @param {string} fieldId
-     * @param {boolean} sparse
-     * @returns {*}
-     */
-    function effectiveText(newRecord, oldRecord, fieldId, sparse) {
-        var text = readText(newRecord, fieldId);
-
-        if (sparse && values.isEmpty(text)) {
-            return readText(oldRecord, fieldId);
-        }
-
-        return text;
-    }
-
-    /**
-     * Renders a field value as trimmed text for the name. A multi-select's getText() returns an
-     * array, which is joined.
+     * This is what makes the name parts' field types irrelevant: the shape that arrives says
+     * which it is.
      *
      * @param {*} value
      * @returns {string} '' when empty
      */
-    function asNameText(value) {
+    function lookupText(value) {
+        var texts = [];
+
+        if (Object.prototype.toString.call(value) === '[object Array]') {
+            value.forEach(function (option) {
+                var text = (option && !values.isEmpty(option.text)) ?
+                    String(option.text).replace(/^\s+|\s+$/g, '') : '';
+                if (text !== '') {
+                    texts.push(text);
+                }
+            });
+            return texts.join(', ');
+        }
+
         if (values.isEmpty(value)) {
             return '';
         }
-        if (Object.prototype.toString.call(value) === '[object Array]') {
-            return value.join(', ').replace(/^\s+|\s+$/g, '');
-        }
+
         return String(value).replace(/^\s+|\s+$/g, '');
+    }
+
+    /**
+     * Reads every value the row copies from the opportunity, in ONE search.lookupFields.
+     *
+     * NOT off the event's newRecord. A button press writes the sub-status with submitFields, so
+     * this script runs as XEDIT and newRecord is sparse — and a sparse checkbox reads as false,
+     * which is not empty, so effectiveValue() never fell back to oldRecord and the priority box
+     * was copied as unticked on every button-created row. Rather than reason field by field about
+     * what a sparse newRecord returns, the copied values come from the record as STORED:
+     * afterSubmit runs after the opportunity has saved, on CREATE included, so tranid is the real
+     * number too.
+     *
+     * One lookup for every column: a column id that does not exist at all fails the whole lookup,
+     * and the row with it (DSI_CREATE_FAILED). A field that exists but does not apply to the
+     * Opportunity reads as blank — docs/context.md section 0, trap 6.
+     *
+     * @param {string} opportunityId
+     * @returns {Object} the lookupFields result
+     */
+    function readOpportunity(opportunityId) {
+        var opp = dsiConfig.OPPORTUNITY_FIELDS;
+
+        return search.lookupFields({
+            type: dsiConfig.RECORD_TYPES.OPPORTUNITY,
+            id: opportunityId,
+            columns: [
+                opp.CUSTOMER,
+                opp.SALES_REP,
+                opp.PROJECT_ENGINEER,
+                opp.PRIORITY_DESIGN,
+                opp.TRAN_ID
+            ].concat(dsiConfig.NAME_PARTS)
+        });
     }
 
     /**
@@ -157,7 +170,7 @@ define(['N/record', 'N/search', 'N/log', 'N/ui/serverWidget', './lib/dsi_lib_con
                 id: typeId,
                 columns: ['name']
             });
-            return asNameText(lookup.name);
+            return lookupText(lookup.name);
         } catch (e) {
             log.error({
                 title: dsiConfig.logKey('TYPE_TEXT_UNREADABLE'),
@@ -179,23 +192,18 @@ define(['N/record', 'N/search', 'N/log', 'N/ui/serverWidget', './lib/dsi_lib_con
      * or type text is left out the same way, so the name never starts or ends with a separator.
      * The result is truncated to NAME_MAX_LENGTH — itself unverified, see dsi_lib_config.js.
      *
-     * @param {Record} newRecord
-     * @param {Record} oldRecord
-     * @param {boolean} sparse
+     * @param {Object} opportunity - the readOpportunity() lookup
      * @param {string} typeText
      * @returns {string}
      */
-    function buildName(newRecord, oldRecord, sparse, typeText) {
+    function buildName(opportunity, typeText) {
         var segments = [];
         var parts = [];
         var name;
-        var tranId = asNameText(values.effectiveValue(newRecord, oldRecord,
-            dsiConfig.OPPORTUNITY_FIELDS.TRAN_ID, sparse));
+        var tranId = lookupText(opportunity[dsiConfig.OPPORTUNITY_FIELDS.TRAN_ID]);
 
-        dsiConfig.NAME_PARTS.forEach(function (part) {
-            var text = asNameText(part.isSelect ?
-                effectiveText(newRecord, oldRecord, part.fieldId, sparse) :
-                values.effectiveValue(newRecord, oldRecord, part.fieldId, sparse));
+        dsiConfig.NAME_PARTS.forEach(function (fieldId) {
+            var text = lookupText(opportunity[fieldId]);
             if (text !== '') {
                 parts.push(text);
             }
@@ -220,23 +228,22 @@ define(['N/record', 'N/search', 'N/log', 'N/ui/serverWidget', './lib/dsi_lib_con
     /**
      * Creates the Design Instruction row.
      *
-     * Every opportunity value is read through effectiveValue(), so an inline edit that changed
-     * only the sub-status still sees the rest of the record rather than a sparse newRecord's
-     * blanks.
+     * Every copied value comes from ONE lookup of the opportunity as stored — see
+     * readOpportunity() for why the event records are not used. Selects go through asSelectId(),
+     * which reads the [{value, text}] shape and treats [] as blank; the priority box through
+     * isTicked(), which accepts the boolean lookupFields returns and the 'T' / 'true' strings.
      *
-     * @param {Record} newRecord
-     * @param {Record} oldRecord
-     * @param {boolean} sparse
      * @param {string} opportunityId
      * @param {string} typeId
      * @param {string} formId
      * @returns {{id: string, name: string}}
      */
-    function createRow(newRecord, oldRecord, sparse, opportunityId, typeId, formId) {
+    function createRow(opportunityId, typeId, formId) {
         var opp = dsiConfig.OPPORTUNITY_FIELDS;
         var fields = dsiConfig.ROW_FIELDS;
         var defaultValues = {};
-        var name = buildName(newRecord, oldRecord, sparse, readTypeText(typeId));
+        var opportunity = readOpportunity(opportunityId);
+        var name = buildName(opportunity, readTypeText(typeId));
         var row;
 
         defaultValues[fields.CUSTOM_FORM] = formId;
@@ -252,24 +259,20 @@ define(['N/record', 'N/search', 'N/log', 'N/ui/serverWidget', './lib/dsi_lib_con
         row.setValue({ fieldId: fields.OPPORTUNITY, value: opportunityId });
         row.setValue({
             fieldId: fields.CUSTOMER,
-            value: values.asSelectId(values.effectiveValue(newRecord, oldRecord,
-                opp.CUSTOMER, sparse))
+            value: values.asSelectId(opportunity[opp.CUSTOMER])
         });
         row.setValue({
             fieldId: fields.SALES_REP,
-            value: values.asSelectId(values.effectiveValue(newRecord, oldRecord,
-                opp.SALES_REP, sparse))
+            value: values.asSelectId(opportunity[opp.SALES_REP])
         });
         row.setValue({
             fieldId: fields.PROJECT_ENGINEER,
-            value: values.asSelectId(values.effectiveValue(newRecord, oldRecord,
-                opp.PROJECT_ENGINEER, sparse))
+            value: values.asSelectId(opportunity[opp.PROJECT_ENGINEER])
         });
         row.setValue({ fieldId: fields.DESIGN_TYPE, value: typeId });
         row.setValue({
             fieldId: fields.URGENT,
-            value: values.isTicked(values.effectiveValue(newRecord, oldRecord,
-                opp.PRIORITY_DESIGN, sparse))
+            value: values.isTicked(opportunity[opp.PRIORITY_DESIGN])
         });
         row.setValue({ fieldId: fields.NAME, value: name });
 
@@ -427,7 +430,9 @@ define(['N/record', 'N/search', 'N/log', 'N/ui/serverWidget', './lib/dsi_lib_con
 
             // 2. The sub-status before and after. On CREATE there is no oldRecord and the old
             //    value is empty. On XEDIT newRecord carries only the edited fields, so an inline
-            //    edit of something else falls back to oldRecord and compares equal below.
+            //    edit of something else falls back to oldRecord and compares equal below. This is
+            //    the ONLY value this script reads off the event records — everything the row
+            //    copies comes from readOpportunity().
             newStatus = values.asId(values.effectiveValue(newRecord, oldRecord,
                 dsiConfig.OPPORTUNITY_FIELDS.SUB_STATUS, sparse));
             oldStatus = values.asId(values.readField(oldRecord,
@@ -490,7 +495,7 @@ define(['N/record', 'N/search', 'N/log', 'N/ui/serverWidget', './lib/dsi_lib_con
 
             // 7. NO DUPLICATE GUARD, by the client's decision (22-23 Sep): a sub-status set to a
             //    creating value twice creates two rows. A saved search is the safety net.
-            created = createRow(newRecord, oldRecord, sparse, opportunityId, typeId, formId);
+            created = createRow(opportunityId, typeId, formId);
 
             log.audit({
                 title: dsiConfig.logKey('ROW_CREATED'),
