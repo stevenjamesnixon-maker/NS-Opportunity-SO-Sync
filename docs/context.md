@@ -107,6 +107,9 @@ so it is where the sync belongs.
 | Shared readiness library | 1.0.0 | `lib/opsync_lib_readiness.js` | **The one definition of delivery readiness.** Both user events call it; neither has a copy | Not deployed |
 | Opportunity user event | 1.8.2 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Not deployed |
 | Sales order user event | 1.0.0 | `opsync_ue_salesorder.js` | `afterSubmit` on Sales Order — re-evaluates readiness for that one order. Writes the two readiness fields and **nothing else** | Not deployed |
+| Design Instruction config library | 1.0.0 | `lib/dsi_lib_config.js` | Every script ID and parameter of the Design Instruction feature. **Separate from `opsync_lib_config.js`** — see section 11 | Not deployed |
+| Design Instruction opportunity user event | 1.0.0 | `dsi_ue_opportunity.js` | `afterSubmit` on Opportunity — creates a Design Instruction row when the sub-status moves to a creating value | Not deployed |
+| Design Instruction row user event | 1.0.0 | `dsi_ue_design_instruction.js` | `beforeSubmit` and `afterSubmit` on `customrecord_cad_worklist` — design start stamp, completion gate, completion write-back to the opportunity | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/OpportunitySOSync/`.
 
@@ -482,6 +485,16 @@ So the six the readiness evaluation needs exist twice, with **different prefixes
 Three exist **only** on the opportunity script, because only it uses them:
 `custscript_opsync_qualifying_statuses`, `custscript_opsync_status_map` and
 `custscript_opsync_no_shipdate_statuses`.
+
+**The Design Instruction feature has one pair of its own**, under the same constraint and with the
+same risk — see section 11:
+
+| Purpose | `customscript_dsi_ue_opportunity` | `customscript_dsi_ue_design_instruction` |
+|---|---|---|
+| Completion sub-status (*Post Design Check*) | `custscript_dsi_complete_status` | `custscript_dsirow_complete_status` |
+
+The row script **writes** its value to the opportunity on completion; the opportunity script
+reads its copy only for the overlap check. If the two diverge, that check tests the wrong value.
 
 > **The differing prefix makes the duplication risk worse than a plain copy would be.**
 > `custscript_opsync_design_ok_statuses` and `custscript_sosync_design_ok_statuses` are meant to
@@ -1005,6 +1018,9 @@ Every `log.audit`, `log.error` and `log.debug` title begins `OPPSYNC_`, so the e
 be filtered on one string. Every title is built by `opsyncConfig.logKey()`, so the prefix cannot
 drift between scripts.
 
+> The Design Instruction scripts use **`DSI_`** instead, built by `dsiConfig.logKey()`, so the two
+> features filter apart. Their keys are listed in section 11, not in the table below.
+
 | Key | Level | Meaning | What to do if it fires |
 |---|---|---|---|
 | `OPPSYNC_ORDER_UPDATED` | audit | A sales order's Record Status, ship date, or both were written. Names the order, the opportunity and the before/after of each value. Normal operation. | Nothing. Use it to confirm the sync reached the orders you expected. |
@@ -1288,6 +1304,43 @@ match the opportunity script's. Grep for `OPPSYNC_SO_` after every one of these.
 | 103 | **Full opportunity regression** — every scenario 1 to 88 | **Unchanged.** Accessor names and return values did not change, so nothing on this side should move |
 | 104 | **Full sales order regression** — scenarios 89 to 98 | **Unchanged**, now reading the `sosync_` IDs |
 
+### Design Instruction
+
+Requires `customscript_dsi_ue_opportunity` and `customscript_dsi_ue_design_instruction` deployed
+with their parameters populated — see section 11. Grep the execution log for `DSI_` as well as
+`OPPSYNC_` after every one of these. Scenarios **107–111 are blocked**: they exercise the Request
+Design / Request Redraw buttons, which are not built in this phase (section 11, open decision 1).
+They keep their numbers so the amendment that builds the buttons can run them as written.
+
+| # | Scenario | Expected |
+|---|---|---|
+| 107 | ⛔ **Blocked.** Opportunity at *Awaiting Design Info*, view | Request Design button visible; Request Redraw not |
+| 108 | ⛔ **Blocked.** Opportunity at *Design Complete*, view | Request Redraw visible; Request Design not |
+| 109 | ⛔ **Blocked.** Any other sub-status, view | Neither button |
+| 110 | ⛔ **Blocked.** Press Request Design, confirm | Sub-status = *Design Required*; one row as in 112; the sync's own log lines appear **only if the opportunity is at a qualifying `entitystatus`** — its gate exits silently otherwise |
+| 111 | ⛔ **Blocked.** Press Request Redraw, confirm | Sub-status = *Redraw Required*; one row, type *Redraw*; browser lands on that row in edit mode |
+| 112 | Set sub-status to *Design Required* by hand in edit mode | **One** row: type *New design*, on the 2026 form, name per section 11, customer / sales rep / project engineer / urgent copied from the opportunity. `DSI_ROW_CREATED` at audit naming the row, type and name |
+| 113 | **Inline-edit** (XEDIT) the sub-status to *Design Required*, on an opportunity with **priority design ticked** and all three name fields populated | Row created with **every** copied field populated **and urgent ticked**. This proves the sparse-`newRecord` fallback — an unticked urgent box here means a sparse checkbox read as `false` rather than falling back to `oldRecord` |
+| 114 | Set sub-status *Design Required* → *Design Complete* → *Design Required* | **Two** rows. There is no duplicate guard, by design |
+| 115 | Set sub-status to a non-creating value | No row. `DSI_NO_CREATE` at debug with both values |
+| 116 | `custscript_dsi_create_map` empty | No row; `DSI_PARAMETER_MISSING` at error; **no** `DSI_CREATE_FAILED`; the opportunity saves normally. **Revert afterwards** |
+| 117 | `custscript_dsi_form_id` empty | No row; `DSI_PARAMETER_MISSING` **and** `DSI_CREATE_FAILED` at error; the opportunity saves normally. **Revert afterwards** |
+| 118 | Set the map so a key equals the complete status, then move a sub-status to a creating value | No row; `DSI_CONFIG_OVERLAP` at error. **Every** creation is refused while the map overlaps. **Revert afterwards** |
+| 119 | Opportunity with all three name fields blank | Name = `<tranid> · <type>`. **Also confirm on any populated opportunity that the three parts read as text, not as numbers** — numbers mean a field is a select and its `NAME_PARTS` entry needs `isSelect: true` |
+| 120 | Name fields long enough to exceed the cap | Name truncated to `NAME_MAX_LENGTH`; save succeeds. **If the save fails, the cap is wrong** — it is unverified |
+| 121 | On a row, set the designer, save | `custrecord_cad_design_start` = **today** as the user sees it; nothing written to the opportunity. Run once before 08:00 UK time to catch a server-time-zone date |
+| 122 | Enter completed date with notes blank | Save **blocked** with *"To complete this design instruction, enter the designer, the area (m²) and designer notes."* `DSI_INCOMPLETE` at audit |
+| 123 | Enter completed date with area = **0**, designer and notes present | Save succeeds — zero is an area |
+| 124 | Complete a *New design* row properly | Opportunity sub-status = *Post Design Check*; priority design **unticked**; `DSI_ROW_COMPLETED` at audit. **Then record whether `OPPSYNC_` lines follow for that opportunity** — this is the test that settles open decision 2 in section 11. The brief expects the sync to run and update the sales orders (for a Won opportunity whose map carries *Post Design Check*); NetSuite documents that a user event cannot trigger another, in which case the sync does **not** run and the orders are **not** updated on this save |
+| 125 | Complete a *Redraw* row properly | Identical to 124 |
+| 126 | Set type to *Cancelled*, then enter completed date | No gate, nothing written to the opportunity; `DSI_CANCELLED_IGNORED` at audit |
+| 127 | Clear a completed date on a completed row and save | Nothing happens — no gate, no write, no log |
+| 128 | `custscript_dsirow_complete_status` empty, complete a row | Row saves; `DSI_PARAMETER_MISSING` at error; opportunity untouched; **no** `DSI_COMPLETE_FAILED`. **Revert afterwards** |
+| 129 | Row UE deployment set to a role without Opportunity edit | Completion logs `DSI_COMPLETE_FAILED` with a permission error — which is why execute-as matters. **Revert afterwards** |
+| 130 | **Full regression** — every scenario from 1 to 106 | **Unchanged.** No sync file was modified |
+| 131 | **Create** a new opportunity directly at *Design Required* | Row created, and its name begins with the **real opportunity number** — not blank and not *To Be Generated*. Confirms `tranid` is readable in `afterSubmit` on CREATE |
+| 132 | Complete a row whose type is *New design* while `custscript_dsirow_cancelled_type` is **empty** | Gate applies and the completion **writes** — no type is treated as cancelled. `DSI_PARAMETER_MISSING` at error. Shows the behaviour behind open decision 4. **Revert afterwards** |
+
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
 ---
@@ -1409,3 +1462,266 @@ Not code. These are account changes the scripts assume have been made.
 | 9 | **Define `custscript_opsync_no_shipdate_statuses` and populate it BEFORE uploading UE 1.7.0** — the *Design Complete* and *Redraw Required* Record Status ids, in each environment | Section 4. It **throws** when unset, so uploading the script first makes the whole sync inert — `OPPSYNC_PARAMETER_MISSING` and `OPPSYNC_FAILED` on every qualifying save, with nothing written. The parameter must exist before the code that reads it. |
 | 7 | Set `custscript_opsync_bus_no_value` to the `customlist92` **No** option id in each environment | Section 4. It is a list option internal id and differs by account. Unset, the BUS condition applies to every heat pump order — safe, but everything is held. |
 | 6 | Check `OPPSYNC_MAP_PARSED` in the log after the first save in each environment | Section 9, scenario 25. A hand-typed parameter of seven ID pairs is the most likely thing to be wrong, and this is the only place it becomes visible. |
+
+---
+
+## 11. Design Instruction
+
+The design team records every design and redraw as a row on the custom record
+`customrecord_cad_worklist` — *Design Instruction* — a child of the opportunity, shown as a sublist
+on it. **A row is created by a change of the opportunity's sub-status, and completed by the
+designer entering a completed date on the row**, which moves the opportunity on to be checked.
+
+**Phase 1 builds the creation and completion paths. It does not build the two buttons** — see
+open decision 1.
+
+### A separate feature beside the sync, deliberately
+
+| | The sync (sections 1–10) | Design Instruction (this section) |
+|---|---|---|
+| Config module | `lib/opsync_lib_config.js` | `lib/dsi_lib_config.js` |
+| Value-shape module | `lib/opsync_lib_values.js` | **the same file**, imported, never changed |
+| Writes | Sales orders only | Design Instruction rows; the opportunity's sub-status and priority design box |
+| Log prefix | `OPPSYNC_` | `DSI_` |
+
+**Neither feature modifies the other's files.** The Design Instruction scripts cannot load
+`opsync_lib_config.js`: its `resolveParameterId()` knows only the sync's two scripts and would
+throw `OPPSYNC_SCRIPT_NOT_MAPPED`. They do import `opsync_lib_values.js`, so there is one
+definition of what a select, a date or a sparse-XEDIT read means — the helpers whose subtleties
+have already cost this project real defects (section 5).
+
+**Both opportunity user events fire on the same saves.** `opsync_ue_opportunity.js` and
+`dsi_ue_opportunity.js` touch no field in common, and neither depends on running before the other.
+
+### Components
+
+All in `src/FileCabinet/SuiteScripts/OpportunitySOSync/`, beside the sync, so the relative
+`./lib/` imports resolve.
+
+| File | Type | Script ID | Deployment |
+|---|---|---|---|
+| `lib/dsi_lib_config.js` | Shared AMD module | — | **None.** File Cabinet upload only |
+| `dsi_ue_opportunity.js` | User Event on Opportunity — `afterSubmit` | `customscript_dsi_ue_opportunity` | `customdeploy_dsi_ue_opportunity` |
+| `dsi_ue_design_instruction.js` | User Event on `customrecord_cad_worklist` — `beforeSubmit`, `afterSubmit` | `customscript_dsi_ue_design_instruction` | `customdeploy_dsi_ue_design_instruction` |
+| ~~`dsi_cs_opportunity.js`~~ | Client Script, attached by `beforeLoad` | — | **Not built** — open decision 1 |
+
+### Creation — `dsi_ue_opportunity.js`, `afterSubmit`
+
+1. CREATE, EDIT or XEDIT only.
+2. Read the sub-status after the save through `effectiveValue()`, and before it off `oldRecord`
+   (empty on CREATE).
+3. **Unchanged → return.** This *"has the sub-status changed"* exit is **required here** and is
+   commented so in the code. The prohibition on that exit in `opsync_ue_opportunity.js`
+   (section 5) exists because readiness has inputs the sub-status knows nothing about. This
+   script's only input **is** the sub-status, and without the exit every save of an opportunity
+   sitting at *Design Required* would create another row.
+4. Look the new sub-status up in `custscript_dsi_create_map`. Not a key → `DSI_NO_CREATE` at debug,
+   return.
+5. **Overlap check.** If any key of the map equals `custscript_dsi_complete_status` →
+   `DSI_CONFIG_OVERLAP` at error, return, create nothing.
+6. Read `custscript_dsi_form_id` — **throws** when unset.
+7. `record.create` in **standard** mode with the form in `defaultValues`, set the fields below,
+   save with `ignoreMandatoryFields: true`. `DSI_ROW_CREATED` at audit.
+
+| Row field | From the opportunity |
+|---|---|
+| `custrecord_cad_opportunity` | its internal id — **a sourced field**, set directly; see *unverified* |
+| `custrecord_cad_customer` | `entity` |
+| `custrecord_sales_rep` | `salesrep` |
+| `custrecord_cad_proj_eng` | `custbody_pe` |
+| `custrecord_cad_design_type` | the type the map gives the new sub-status |
+| `custrecord_urgent_design` | `custbody_priority_design_box`, through `isTicked()` |
+| `name` | built as below |
+
+Every opportunity value is read through `effectiveValue()`, so an inline edit of only the
+sub-status still sees the rest of the record.
+
+**`ignoreMandatoryFields: true` is belt and braces, not the fix.** The record carries a
+mandatory multi-select that the client is un-mandating on the record definition; that is what
+makes the save valid.
+
+#### The name
+
+```
+<tranid> · <type text> · <part 1> / <part 2> / <part 3>
+```
+
+The parts are `custbody_mi_opp_fc`, `custbody_comm_area_ufh` and `custbody_mi_heat_source`, in
+that order — `NAME_PARTS` in `dsi_lib_config.js`. Each is included only when non-empty after
+trimming; ` / ` falls only between parts that are present; with none the name is
+`<tranid> · <type text>`. An empty `tranid` or type text is left out the same way. The result is
+truncated to `NAME_MAX_LENGTH`. The separator is U+00B7, the middle dot, written literally — the
+repository is UTF-8 and the existing scripts already log non-ASCII text.
+
+**The type text comes from `search.lookupFields` on `customlist_runner_etc`, not from `getText()`
+on the new row.** The row is built in standard mode, and in standard mode `getText()` on a field
+populated by `setValue()` throws `SSS_INVALID_API_USAGE`. If the lookup fails the row is still
+created, without the type in its name, and `DSI_TYPE_TEXT_UNREADABLE` is logged at error.
+
+### The row — `dsi_ue_design_instruction.js`
+
+**`beforeSubmit`** — may write to the row, and may refuse its save:
+
+- **Design start stamp.** A designer present after the save, none before it, and no start date →
+  `custrecord_cad_design_start` = `new Date()`.
+- **Completion gate**, on the save that completes the row: the designer, the area and the notes
+  are all required. **Zero is an area** — the test is `isEmpty()`, never falsiness. Notes must be
+  non-blank after trimming. Otherwise `DSI_INCOMPLETE` at audit, then a thrown `DSI_INCOMPLETE`
+  error that shows the user *"To complete this design instruction, enter the designer, the area
+  (m²) and designer notes."* **Skipped for a cancelled row.**
+
+Not wrapped in a catch-all: a throw here is how the gate works. **The consequence is that any other
+failure in `beforeSubmit` also refuses the row's save.**
+
+**`afterSubmit`** — wrapped whole; the row has already saved:
+
+1. Only the save that **completes** the row — completed date present after, empty before. Clearing
+   a completed date is never a completion.
+2. Cancelled type → `DSI_CANCELLED_IGNORED` at audit, return.
+3. `custscript_dsirow_complete_status` unset → `DSI_PARAMETER_MISSING` at error, return.
+4. `record.submitFields` on the opportunity: the sub-status to the completion status, and
+   `custbody_priority_design_box` to false — `enableSourcing: false`, `ignoreMandatoryFields:
+   true`. `DSI_ROW_COMPLETED` at audit.
+
+A row with no opportunity logs `DSI_COMPLETE_FAILED` and writes nothing.
+
+### Parameters
+
+All Free-Form Text, defined on the script record named, valued **on the deployment**. Every value
+is an internal id and differs by environment. The *what does empty mean* test is section 5's.
+
+| Script | Parameter | Holds | Empty means | Behaviour |
+|---|---|---|---|---|
+| `customscript_dsi_ue_opportunity` | `custscript_dsi_create_map` | `subStatusId:typeId` pairs — *Design Required* → *New design*, *Redraw Required* → *Redraw* | No row is ever created | **Fails closed** — logs, returns `{}` |
+| | `custscript_dsi_form_id` | The internal id of the *NH CAD Worklist (2026)* form | A row on no form is unusable | **Throws** in `afterSubmit` → `DSI_CREATE_FAILED` |
+| | `custscript_dsi_complete_status` | The *Post Design Check* sub-status id. **Must equal** `custscript_dsirow_complete_status` | The overlap check is skipped; creation proceeds | **Does not throw** — logs at error. ⚠️ Open decision 3 |
+| `customscript_dsi_ue_design_instruction` | `custscript_dsirow_complete_status` | The *Post Design Check* sub-status id | A completion writes nothing to the opportunity | **Fails closed** — logs at error, returns. Not a throw: the row has already saved |
+| | `custscript_dsirow_cancelled_type` | The *Cancelled* design type id(s), comma-separated | No type is treated as cancelled — the gate applies to every row and **every completion writes** | **Does not throw** — logs at error, returns `[]`. ⚠️ Open decision 4 |
+
+**Not defined in this phase**, because the buttons are not built: `custscript_dsi_btn_design_statuses`,
+`custscript_dsi_btn_redraw_statuses`, `custscript_dsi_redraw_type`.
+
+**The parsers keep the status map's contract** (section 4): whitespace trimmed, empty entries
+ignored, a malformed entry logged as `DSI_INVALID_ENTRY` and skipped while the rest applies,
+whole numbers only. In the creation map a **duplicate key** is logged as `DSI_MAP_AMBIGUOUS` and
+**dropped entirely**. In a plain id list a repeated id means the same thing twice and is kept once.
+
+**Resolution is by executing script**, from an explicit table in `dsi_lib_config.js` — no
+derivation, no fallback, as in section 4. A script with no row throws `DSI_SCRIPT_NOT_MAPPED`; an
+accessor its script does not define throws `DSI_PARAMETER_NOT_ON_SCRIPT`.
+
+### Log keys
+
+| Key | Level | Meaning |
+|---|---|---|
+| `DSI_ROW_CREATED` | audit | A row was created. Names the opportunity, the sub-status move, the type, the row and its name |
+| `DSI_NO_CREATE` | debug | The sub-status moved to a value that creates nothing. Names both values |
+| `DSI_CONFIG_OVERLAP` | error | The creation map has a key equal to the completion status. **No row is created for any sub-status** until it is fixed |
+| `DSI_CREATE_FAILED` | error | Creation threw. **The opportunity still saved**; no row was created |
+| `DSI_TYPE_TEXT_UNREADABLE` | error | The design type's name could not be read. The row was created without it in its name |
+| `DSI_INCOMPLETE` | audit, **and thrown** | A completion was refused for missing designer, area or notes. Names what was missing |
+| `DSI_CANCELLED_IGNORED` | audit | A cancelled row was completed; nothing was written |
+| `DSI_ROW_COMPLETED` | audit | A completion moved the opportunity on. Names the row, the opportunity and the status written |
+| `DSI_COMPLETE_FAILED` | error | The completion write-back threw, or the row had no opportunity. **The row still saved**; the opportunity was not moved on |
+| `DSI_PARAMETER_MISSING` | error — **and thrown** for `custscript_dsi_form_id` | A parameter is unset or holds nothing usable. Names it and what that means |
+| `DSI_INVALID_ENTRY` | error | One entry in a parameter is not the required shape. Skipped; the rest applies |
+| `DSI_MAP_AMBIGUOUS` | error | A key appears twice in the creation map. Dropped entirely |
+| `DSI_SCRIPT_NOT_MAPPED` | error + **throws** | The executing script has no row in `dsi_lib_config.js`'s parameter table |
+| `DSI_PARAMETER_NOT_ON_SCRIPT` | error + **throws** | An accessor was called from a script that does not define its parameter. A coding error |
+
+> **Reserved — no script raises it in this phase:** `DSI_BEFORELOAD_FAILED`, for the buttons'
+> `beforeLoad` when it is built.
+
+### Deliberate decisions — do not reverse
+
+- **No duplicate-row guard and no "open row" guard on the opportunity.** The client's decision
+  (22–23 Sep); a safety-net saved search covers it. A sub-status set to a creating value twice
+  creates two rows.
+- **Completion is the completed date being entered** — not a status field, not a button.
+- **Every completion writes the same status**, *Post Design Check*, new design or redraw alike.
+  One parameter, no per-type mapping, no Outcome field.
+- **A cancelled row is one whose type the user sets to *Cancelled*.** The scripts ignore it.
+  Nothing else happens.
+- **`custbody_priority_design_box` is cleared on every completion**, not only the last.
+- **The redraw reason, `custrecord_redraw_info`, is entered by hand.** No script reads or writes
+  it.
+- **Button visibility by sub-status only, no search in `beforeLoad`** — for when the buttons are
+  built.
+- **Both user events are separate from the sync and do not touch its files.**
+
+### Open decisions — for the client
+
+1. **The buttons' target sub-statuses have no source.** The brief's `beforeLoad` passes the client
+   script the *Design Required* and *Redraw Required* ids *"from parameters createMap and
+   redrawType"*. `custscript_dsi_create_map` holds those ids only as **keys**, with nothing to say
+   which key is which: the *Redraw Required* key could be found as the one whose type is
+   `custscript_dsi_redraw_type`, but no parameter names the *New design* type, so the *Design
+   Required* key cannot be found at all. And the brief's own table says an empty
+   `custscript_dsi_redraw_type` should only stop the redirect, **not** the sub-status write —
+   which rules out deriving the redraw status from it too. Picking a key by elimination is the
+   kind of derivation section 4 rejects: it breaks silently the day a third creating sub-status
+   is added. **The buttons, the client script and their three parameters are therefore not built.**
+   To unblock, choose one:
+   - **(a)** two more parameters on `customscript_dsi_ue_opportunity` holding the two target
+     sub-status ids directly — explicit, and consistent with how every other id in this repo
+     arrives; **or**
+   - **(b)** name each button's target as a *type*, and find its sub-status as the single map key
+     carrying that type, failing closed on none or several — which needs a new-design-type
+     parameter as well.
+2. **The completion write may not re-run the opportunity's user events.** NetSuite documents that
+   user event scripts cannot be executed by other user event scripts — *"you cannot chain user
+   event scripts"*. `dsi_ue_design_instruction.js` writes the opportunity from its `afterSubmit`.
+   If the documented rule holds, neither `opsync_ue_opportunity.js` nor `dsi_ue_opportunity.js`
+   runs on that write: the sub-status changes, but **Post Design Check does not reach the sales
+   orders until somebody next saves the opportunity**. The brief assumed the sync runs. Scenario
+   124 settles it. The same rule bears on the sync's own recursion analysis in section 5 and on
+   scenario 95.
+3. **`custscript_dsi_complete_status` empty skips a safety check without throwing.** By the
+   section 5 test that removes a restriction and should throw. Built as the brief specifies — it
+   logs at error and creation proceeds. Making it throw is a one-line change in `getCompleteStatus()`
+   for the opportunity script only.
+4. **`custscript_dsirow_cancelled_type` empty makes every completion write.** In `afterSubmit` that
+   is more writing, so by section 5 it fails open; in `beforeSubmit` it is more gating, so it fails
+   closed. Built as the brief specifies — it logs at error and returns `[]`. The client has yet to
+   supply the *Cancelled* value, so throwing now would stop every completion.
+
+### Unverified in the account
+
+| Item | Risk if wrong | Where it shows |
+|---|---|---|
+| The **types** of `custbody_mi_opp_fc`, `custbody_comm_area_ufh`, `custbody_mi_heat_source`, and that they apply to the **Opportunity** | A select read as a value puts an id in the name; a field not on the opportunity reads blank (section 0, trap 6) | Scenario 119. Fix in `NAME_PARTS` |
+| The name field's **maximum length** — 83 assumed | Too high: saves fail on long names | Scenario 120. Fix `NAME_MAX_LENGTH` |
+| **`custrecord_cad_opportunity` is a sourced field**, set directly with `setValue` | The link may not survive the save — an orphan row | Scenario 112: check the row appears on the opportunity's sublist |
+| The **form's internal id** | A wrong id creates rows on the wrong form, or fails | Scenario 112 |
+| The ***Cancelled*** **type id** | Not yet supplied | Scenario 126 |
+| `customform` accepted in `record.create`'s `defaultValues` for this custom record | Rows land on the default form, or creation fails | Scenario 112 |
+| `search.lookupFields` on a **custom list**, column `name` | The type is missing from every name | Scenario 112; `DSI_TYPE_TEXT_UNREADABLE` |
+| A **checkbox** not carried by a sparse XEDIT `newRecord` reads as empty, not `false` | Urgent copied as unticked on an inline edit of the sub-status | Scenario 113 |
+| `tranid` is populated in `afterSubmit` on **CREATE** | The name starts without the opportunity number | Scenario 131 |
+| `setValue` on a **sparse XEDIT** `newRecord` in `beforeSubmit` persists | Design start not stamped on an inline edit of the designer | Scenario 121, by inline edit |
+| `new Date()` is the **server's** date, not the user's | Design start a day early before 08:00 UK | Scenario 121 |
+| Whether the custom record **auto-generates its name** | The built name is ignored or refused | Scenario 112 |
+
+### Deployment
+
+**The client deploys. Nobody else.** Sequence:
+
+1. Upload `lib/dsi_lib_config.js` **first** — every Design Instruction script fails at load time
+   without it. `lib/opsync_lib_values.js` must already be present, as for the sync.
+2. Upload `dsi_ue_opportunity.js` and `dsi_ue_design_instruction.js` into the **same folder** as the
+   sync's scripts.
+3. Create the two script records and deployments in the *Components* table.
+4. **Define the five parameters on their script records and set them on the deployments before
+   releasing.** `custscript_dsi_form_id` throws when unset. Check that the two complete-status
+   parameters hold the **same** value.
+5. Confirm the *unverified* items above before release.
+
+**Deployment settings are the client's**, and are recorded here only as *to be set*:
+
+| Deployment | Status | Log level | Execute as |
+|---|---|---|---|
+| `customdeploy_dsi_ue_opportunity` | to be set by the client | to be set by the client — Debug shows `DSI_NO_CREATE` | to be set by the client |
+| `customdeploy_dsi_ue_design_instruction` | to be set by the client | to be set by the client | **A role with Opportunity edit permission** — it writes to the opportunity. *Administrator* assumed until the client says otherwise. Scenario 129 shows why |
+
+When the buttons are built, the client script attached through `form.clientScriptModulePath`
+needs **no script record and no deployment** — only the File Cabinet file.
