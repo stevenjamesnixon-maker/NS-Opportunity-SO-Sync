@@ -24,7 +24,7 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.8.1
+ * @version 1.8.2
  */
 define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
     './lib/opsync_lib_values', './lib/opsync_lib_readiness'],
@@ -32,7 +32,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
 
     'use strict';
 
-    var VERSION = '1.8.1';
+    var VERSION = '1.8.2';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -175,7 +175,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
         var targetExcluded;
         var shipDateSuppressed;
         var gates;
-        var values = {};
+        var fieldValues = {};
         var changes = [];
 
         lookup = search.lookupFields({
@@ -223,7 +223,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
         // itself would be a no-op anyway, but the guard says so explicitly rather than relying
         // on that.
         if (mappedStatusId !== null && values.asId(currentStatus) !== values.asId(mappedStatusId)) {
-            values[opsyncConfig.SALES_ORDER_FIELDS.RECORD_STATUS] = mappedStatusId;
+            fieldValues[opsyncConfig.SALES_ORDER_FIELDS.RECORD_STATUS] = mappedStatusId;
             changes.push('Record Status ' + (currentStatus || '(empty)') + ' -> ' + mappedStatusId);
         }
 
@@ -275,7 +275,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
                         'still evaluated and written as normal.'
                 });
             } else {
-                values[opsyncConfig.SALES_ORDER_FIELDS.SHIP_DATE] = deliveryDateValue;
+                fieldValues[opsyncConfig.SALES_ORDER_FIELDS.SHIP_DATE] = deliveryDateValue;
                 changes.push('ship date ' + (currentShipDateKey || '(empty)') + ' -> ' +
                     (deliveryDateKey || '(empty)'));
             }
@@ -341,8 +341,8 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
             // Both fields are written together or not at all: a reason without its checkbox, or
             // a checkbox without its reason, reads as a contradiction on the record.
             if (verdict.ready !== currentReady || verdict.reason !== currentReason) {
-                values[opsyncConfig.SALES_ORDER_FIELDS.READY_FOR_DELIVERY] = verdict.ready;
-                values[opsyncConfig.SALES_ORDER_FIELDS.DELIVERY_HOLD_REASON] = verdict.reason;
+                fieldValues[opsyncConfig.SALES_ORDER_FIELDS.READY_FOR_DELIVERY] = verdict.ready;
+                fieldValues[opsyncConfig.SALES_ORDER_FIELDS.DELIVERY_HOLD_REASON] = verdict.reason;
                 changes.push('ready ' + currentReady + ' -> ' + verdict.ready +
                     ' (' + (verdict.reason || 'no hold') + ')');
             }
@@ -362,7 +362,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
         record.submitFields({
             type: opsyncConfig.RECORD_TYPES.SALES_ORDER,
             id: orderId,
-            values: values
+            values: fieldValues
         });
 
         log.audit({
