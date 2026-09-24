@@ -8,6 +8,14 @@ NetSuite, and the delivery date is copied across.
 It replaces `acs_ue_update_so.js`, which drove the same updates from a CAD Worklist custom record
 that is being retired. The two must never run at the same time.
 
+The repo also carries a second, separate feature: **Design Instruction**. The CAD Worklist record,
+`customrecord_cad_worklist`, is repurposed as a Design Instruction — one row per design or redraw,
+a child of the opportunity. A row is created when the opportunity's sub-status moves to a creating
+value — by hand, or with the Request Design / Request Redraw buttons on the opportunity — and
+completing it (entering its completed date) moves the opportunity on to *Post Design Check*. It has its own config module, its own parameters and its own `DSI_` log prefix, shares only
+the value-shape module with the sync, and modifies none of the sync's files. See
+[`docs/context.md` §11](docs/context.md).
+
 ## Canonical reference
 
 **[`docs/context.md`](docs/context.md) is the single source of truth for this project.** Read it
@@ -21,8 +29,17 @@ the code, the code wins — and the document gets fixed in the same PR.
 
 ```
 src/FileCabinet/SuiteScripts/OpportunitySOSync/
-    lib/                 shared modules — uploaded, but no script record needed
-docs/context.md          canonical project context
+    opsync_ue_opportunity.js         sync — afterSubmit on Opportunity
+    opsync_ue_salesorder.js          sync — afterSubmit on Sales Order
+    dsi_ue_opportunity.js            Design Instruction — buttons (beforeLoad), creates rows (afterSubmit)
+    dsi_cs_opportunity.js            Design Instruction — the buttons' client script; no script record
+    dsi_ue_design_instruction.js     Design Instruction — gate and completion, on the row
+    lib/                             shared modules — uploaded, but no script record needed
+        opsync_lib_config.js         sync configuration
+        opsync_lib_values.js         value-shape layer — used by both features
+        opsync_lib_readiness.js      delivery readiness
+        dsi_lib_config.js            Design Instruction configuration
+docs/context.md                      canonical project context
 ```
 
 The `src/FileCabinet/...` path mirrors the NetSuite File Cabinet exactly. There is no SDF project;
@@ -42,7 +59,7 @@ Script records use `customscript_opsync_<type>_<purpose>` and deployments
 `customdeploy_opsync_<type>_<purpose>`.
 
 Every `log.audit`, `log.error` and `log.debug` title begins `OPPSYNC_` — one string to grep the
-execution log for.
+execution log for. The Design Instruction scripts use `DSI_` instead, so the two features filter apart.
 
 Each script carries a `VERSION` constant and a matching JSDoc `@version` header. Semver.
 
