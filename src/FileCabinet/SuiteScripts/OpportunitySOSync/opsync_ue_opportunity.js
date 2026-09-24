@@ -24,7 +24,7 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.8.2
+ * @version 1.9.0
  */
 define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
     './lib/opsync_lib_values', './lib/opsync_lib_readiness'],
@@ -32,7 +32,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
 
     'use strict';
 
-    var VERSION = '1.8.2';
+    var VERSION = '1.9.0';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -157,13 +157,15 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
      *        case the order keeps its own status and that becomes the decided status
      * @param {string} deliveryDateKey - comparison key. Compared, never written
      * @param {Date|string} deliveryDateValue - the original Date. Written, never compared
+     * @param {*} deliveryDateRaw - the opportunity's delivery date exactly as read. Tested for
+     *        emptiness only — an empty one never clears the order's ship date
      * @param {string[]} excludedStatuses
      * @param {string} opportunityId - for the log only
      * @param {Object} ctx - the per-opportunity readiness context
      * @returns {string} 'updated', 'skipped' or 'unchanged'
      */
     function syncSalesOrder(orderId, mappedStatusId, deliveryDateKey, deliveryDateValue,
-        excludedStatuses, opportunityId, ctx) {
+        deliveryDateRaw, excludedStatuses, opportunityId, ctx) {
         var lookup;
         var currentStatus;
         var currentShipDateKey;
@@ -257,7 +259,32 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
         // the note on the alternative in docs/context.md section 4.
         shipDateSuppressed = values.contains(decidedStatus, ctx.noShipDateStatuses);
 
-        if (currentShipDateKey !== deliveryDateKey) {
+        // AN EMPTY OPPORTUNITY DELIVERY DATE MEANS "NOTHING TO SAY", NEVER "CLEAR THE ORDER"
+        // (1.9.0, PR "shipdate-empty-guard"). Do not turn this into a return: only the ship date
+        // is skipped — the Record Status and readiness below are still evaluated on this save.
+        //
+        // Before 1.9.0 an empty date compared unequal to the order's date and was written,
+        // wiping it. Creating a sales order marks the opportunity Won, and that system save ran
+        // the sync on opportunities with no delivery date yet, clearing every linked order's
+        // date. It is the section 5 "what does empty mean" test applied to a record value:
+        // empty must make the script do less.
+        //
+        // Tested on the RAW value, not the derived key or write value. Checked BEFORE the status
+        // suppression, so when both apply this is the one that logs: an empty date would not be
+        // written at any status, so suppression has nothing to suppress. Logged only when the
+        // order has a date to protect, by the same rule as SHIPDATE_SUPPRESSED below — a log
+        // where nothing would have been written anyway is noise.
+        if (values.isEmpty(deliveryDateRaw)) {
+            if (currentShipDateKey !== '') {
+                log.debug({
+                    title: opsyncConfig.logKey('SHIPDATE_EMPTY'),
+                    details: 'Sales order ' + orderId + ': expected ship date left at ' +
+                        currentShipDateKey + ', because opportunity ' + opportunityId + ' has ' +
+                        'no delivery date. An empty delivery date never clears an order\'s ' +
+                        'date. Status and readiness were still evaluated as normal.'
+                });
+            }
+        } else if (currentShipDateKey !== deliveryDateKey) {
             if (shipDateSuppressed) {
                 // Logged because a ship date silently NOT updating looks identical on the record
                 // to one that did not need updating. Only logged when the write would actually
@@ -663,7 +690,8 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
 
                 try {
                     outcome = syncSalesOrder(orderIds[i], mappedStatusId, deliveryDateKey,
-                        deliveryDateValue, excludedStatuses, opportunityId, readinessContext);
+                        deliveryDateValue, deliveryDateRaw, excludedStatuses, opportunityId,
+                        readinessContext);
                     processed += 1;
                     if (outcome === 'updated') {
                         updated += 1;
