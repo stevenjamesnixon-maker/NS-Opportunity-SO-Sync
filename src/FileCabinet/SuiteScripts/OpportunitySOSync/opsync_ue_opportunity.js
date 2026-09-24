@@ -260,7 +260,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
         shipDateSuppressed = values.contains(decidedStatus, ctx.noShipDateStatuses);
 
         // AN EMPTY OPPORTUNITY DELIVERY DATE MEANS "NOTHING TO SAY", NEVER "CLEAR THE ORDER"
-        // (1.9.0, PR "shipdate-empty-guard"). Do not turn this into a return: only the ship date
+        // (1.9.0, PR #7). Do not turn this into a return: only the ship date
         // is skipped — the Record Status and readiness below are still evaluated on this save.
         //
         // Before 1.9.0 an empty date compared unequal to the order's date and was written,
