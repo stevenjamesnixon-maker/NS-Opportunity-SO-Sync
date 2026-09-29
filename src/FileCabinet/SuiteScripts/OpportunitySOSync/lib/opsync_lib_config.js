@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.10.0
+ * @version 1.11.0
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.10.0';
+    var VERSION = '1.11.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -277,7 +277,8 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      */
     var SCRIPTS = {
         UE_OPPORTUNITY: 'customscript_opsync_ue_opportunity',
-        UE_SALESORDER: 'customscript_opsync_ue_salesorder'
+        UE_SALESORDER: 'customscript_opsync_ue_salesorder',
+        MR_READINESS: 'customscript_opsync_mr_readiness'
     };
 
     /* ------------------------------------------------------------------------------------------
@@ -288,27 +289,38 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
      * script's parameter IDs: NetSuite rejects them as already in use. This was tried in the
      * account and refused — it is not a theory, and it is the reason for everything below.
      *
-     * So the six parameters the readiness evaluation needs exist TWICE, under DIFFERENT NAMES:
+     * So the six parameters the readiness evaluation needs exist THREE TIMES, under DIFFERENT
+     * NAMES — once per script that evaluates readiness:
      *
-     *   customscript_opsync_ue_opportunity      customscript_opsync_ue_salesorder
-     *   -------------------------------------   -------------------------------------
-     *   custscript_opsync_excluded_statuses     custscript_sosync_excluded_statuses
-     *   custscript_opsync_design_ok_statuses    custscript_sosync_design_ok_statuses
-     *   custscript_opsync_dno_ok_values         custscript_sosync_dno_ok_values
-     *   custscript_opsync_cust_qual_field       custscript_sosync_cust_qual_field
-     *   custscript_opsync_cust_pl_field         custscript_sosync_cust_pl_field
-     *   custscript_opsync_bus_no_value          custscript_sosync_bus_no_value
+     *   customscript_opsync_ue_opportunity    customscript_opsync_ue_salesorder
+     *   -----------------------------------   -----------------------------------
+     *   custscript_opsync_excluded_statuses   custscript_sosync_excluded_statuses
+     *   custscript_opsync_design_ok_statuses  custscript_sosync_design_ok_statuses
+     *   custscript_opsync_dno_ok_values       custscript_sosync_dno_ok_values
+     *   custscript_opsync_cust_qual_field     custscript_sosync_cust_qual_field
+     *   custscript_opsync_cust_pl_field       custscript_sosync_cust_pl_field
+     *   custscript_opsync_bus_no_value        custscript_sosync_bus_no_value
      *
-     * ⚠️ THE PREFIXES DIFFER — opsync_ against sosync_ — WHICH MAKES THE RISK WORSE THAN A
-     * PLAIN COPY WOULD. Nobody comparing the two deployments side by side will notice
-     * that custscript_opsync_design_ok_statuses and custscript_sosync_design_ok_statuses are
-     * meant to hold the SAME VALUE. They do not sort together, they do not grep together, and
-     * nothing in NetSuite relates them. If they diverge the two scripts disagree about whether
-     * an order is ready and each overwrites the other, silently. See docs/context.md section 4.
+     *   customscript_opsync_mr_readiness (the nightly Map/Reduce, config 1.11.0)
+     *   ------------------------------------------------------------------------
+     *   custscript_opsyncmr_excluded_statuses
+     *   custscript_opsyncmr_design_ok_statuses
+     *   custscript_opsyncmr_dno_ok_values
+     *   custscript_opsyncmr_cust_qual_field
+     *   custscript_opsyncmr_cust_pl_field
+     *   custscript_opsyncmr_bus_no_value
+     *
+     * ⚠️ THE PREFIXES DIFFER — opsync_, sosync_ and opsyncmr_ — WHICH MAKES THE RISK WORSE
+     * THAN A PLAIN COPY WOULD. Nobody comparing the deployments side by side will notice that
+     * custscript_opsync_design_ok_statuses, custscript_sosync_design_ok_statuses and
+     * custscript_opsyncmr_design_ok_statuses are meant to hold the SAME VALUE. They do not sort
+     * together, and nothing in NetSuite relates them. If they diverge the scripts disagree about
+     * whether an order is ready and each overwrites the other, silently — the Map/Reduce every
+     * night. See docs/context.md section 4.
      *
      * Three exist only on the opportunity script, because only it uses them: QUALIFYING_STATUSES,
-     * STATUS_MAP and NO_SHIPDATE_STATUSES. Asking for one of those from the sales order script
-     * throws — see parameterId().
+     * STATUS_MAP and NO_SHIPDATE_STATUSES. Asking for one of those from the sales order script or
+     * the Map/Reduce throws — see resolveParameterId().
      *
      * THE MAP IS EXPLICIT ON PURPOSE. It is not derived from the script id by string
      * manipulation, and there is no "try one, fall back to the other":
@@ -367,6 +379,14 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
             CUSTOMER_QUAL_FIELD: 'custscript_sosync_cust_qual_field',
             CUSTOMER_PL_FIELD: 'custscript_sosync_cust_pl_field',
             BUS_NO_VALUE: 'custscript_sosync_bus_no_value'
+        },
+        'customscript_opsync_mr_readiness': {
+            EXCLUDED_STATUSES: 'custscript_opsyncmr_excluded_statuses',
+            DESIGN_OK_STATUSES: 'custscript_opsyncmr_design_ok_statuses',
+            DNO_OK_VALUES: 'custscript_opsyncmr_dno_ok_values',
+            CUSTOMER_QUAL_FIELD: 'custscript_opsyncmr_cust_qual_field',
+            CUSTOMER_PL_FIELD: 'custscript_opsyncmr_cust_pl_field',
+            BUS_NO_VALUE: 'custscript_opsyncmr_bus_no_value'
         }
     };
 
