@@ -11,11 +11,19 @@
  * offer "Arrange delivery" only on a ready order, so readiness has to be current every morning
  * whether or not anybody touched the order.
  *
- * "OPEN" MEANS WHAT THE SALES ORDER SCRIPT ALREADY MEANS BY IT, and nothing else: a linked
- * opportunity, and a Record Status that is not in the excluded list — a blank status counts as
- * open. NEVER the native transaction status. Two definitions of done are two answers to one
- * question, and the drift shows up as an order one script thinks is live and another thinks is
- * finished. See docs/context.md section 4.
+ * "OPEN" MEANS WHAT THE SALES ORDER SCRIPT ALREADY MEANS BY IT: a linked opportunity, and a
+ * Record Status that is not in the excluded list — a blank status counts as open. Two definitions
+ * of done are two answers to one question, and the drift shows up as an order one script thinks
+ * is live and another thinks is finished. See docs/context.md section 4.
+ *
+ * ONE DELIBERATE, INPUT-ONLY EXCEPTION: the native status. The search also requires the native
+ * sales order status to be one that can still ship — SHIPPABLE_STATUSES below. An order that has
+ * shipped, been billed, closed or cancelled has nothing left to deliver, but if its Record Status
+ * was never moved on (blank, or stuck at an early value) the Record Status alone would read it as
+ * open, and every night — above all the first run, the backfill — would evaluate and stamp it.
+ * This is a cheap pre-filter for "can still ship", NOT a second definition of done: it narrows
+ * what this script reads and nothing else. The user events, the rule and the excluded list are
+ * unchanged, and a user event save of such an order still evaluates it exactly as before.
  *
  * NO QUOTE TYPE FILTER. Parts and FOC orders are evaluated like any other, on purpose — their
  * quote type's two checkboxes decide which gates apply, exactly as they do on a save.
@@ -57,6 +65,33 @@ define(['N/search', 'N/runtime', 'N/log', './lib/opsync_lib_config',
     'use strict';
 
     var VERSION = '1.0.0';
+
+    /**
+     * The native sales order statuses that can still ship — the input search's pre-filter. See the
+     * header: input-only, not a definition of done.
+     *
+     * These are NetSuite's standard transaction status codes, the same in every account — not
+     * account internal ids, so they belong in the code rather than in a parameter.
+     *
+     *   SalesOrd:A  Pending Approval
+     *   SalesOrd:B  Pending Fulfillment
+     *   SalesOrd:D  Partially Fulfilled
+     *   SalesOrd:E  Pending Billing/Partially Fulfilled
+     *
+     * Left out, deliberately: SalesOrd:C Cancelled, SalesOrd:F Pending Billing (fully fulfilled),
+     * SalesOrd:G Billed, SalesOrd:H Closed.
+     *
+     * @type {string[]}
+     */
+    var SHIPPABLE_STATUSES = ['SalesOrd:A', 'SalesOrd:B', 'SalesOrd:D', 'SalesOrd:E'];
+
+    /**
+     * The native status filter as the logs state it, so the summary says which orders the run read.
+     * @type {string}
+     */
+    var SHIPPABLE_STATUSES_TEXT = 'native status any of Pending Approval, Pending Fulfillment, ' +
+        'Partially Fulfilled, Pending Billing/Partially Fulfilled (' +
+        SHIPPABLE_STATUSES.join(', ') + ')';
 
     /**
      * The keys map() writes, one per order, which summarize() counts. Skips are written as
@@ -102,6 +137,9 @@ define(['N/search', 'N/runtime', 'N/log', './lib/opsync_lib_config',
      * spelt out rather than trusted to noneof: a blank Record Status is an open order, and
      * whether noneof returns empty values is not something this script should depend on.
      *
+     * AND the native status is one that can still ship — SHIPPABLE_STATUSES. An input-only
+     * pre-filter, not a second definition of done; see the header.
+     *
      * @returns {search.Search}
      */
     function getInputData() {
@@ -120,6 +158,8 @@ define(['N/search', 'N/runtime', 'N/log', './lib/opsync_lib_config',
                 [so.MAINLINE, 'is', 'T'],
                 'AND',
                 [so.OPPORTUNITY_LINK, 'noneof', '@NONE@'],
+                'AND',
+                ['status', 'anyof', SHIPPABLE_STATUSES],
                 'AND',
                 [
                     [so.RECORD_STATUS, 'noneof', cfg.excludedStatuses],
@@ -240,7 +280,8 @@ define(['N/search', 'N/runtime', 'N/log', './lib/opsync_lib_config',
 
         log.audit({
             title: opsyncConfig.logKey('MR_SUMMARY'),
-            details: 'Readiness Map/Reduce ' + VERSION + ': evaluated ' + evaluated +
+            details: 'Readiness Map/Reduce ' + VERSION + ' (input: ' + SHIPPABLE_STATUSES_TEXT +
+                '): evaluated ' + evaluated +
                 (lines.length === 0 ? '' : ' (' + lines.join(', ') + ')') +
                 ', errors ' + errors +
                 '. Usage ' + summary.usage + ' units over ' + summary.seconds + 's, ' +

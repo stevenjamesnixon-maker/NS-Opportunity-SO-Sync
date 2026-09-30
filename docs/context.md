@@ -472,6 +472,14 @@ native transaction status. That list already means *"past the delivery gate or d
 first, and the drift would show up as an order the opportunity thinks is live and the sales
 order thinks is finished.
 
+**One deliberate, input-only exception: the Map/Reduce's native-status pre-filter.** The nightly
+Map/Reduce's input search also requires the native sales order status to be one that can still
+ship. That is a cheap pre-filter for *"can still ship"*, **not a second definition of done**: it
+narrows which orders the Map/Reduce reads and nothing else. The excluded Record Status list still
+decides what the user events evaluate, and the readiness rule, the excluded list, the sales order
+script and the opportunity script are all unchanged by it. See *the nightly Map/Reduce* below.
+Decided 30 Sep 2026 (Steve): orders that have shipped don't need reviewing.
+
 #### ⚠️ Six parameters exist THREE times, under DIFFERENT NAMES
 
 **A script parameter is a custom field, and custom field IDs are unique across the NetSuite
@@ -573,8 +581,10 @@ offers *Arrange delivery* only on a ready order, so readiness has to be current 
 
 1. `getInputData` reads **all six** of its parameters first — a missing one that throws stops the
    run before a single order is touched — then returns a search: `mainline` is T, the native
-   `opportunity` is not empty, and `custbody_finance_status` is **none of the excluded list, or
-   empty**. The empty branch is spelt out rather than trusted to `noneof`.
+   `opportunity` is not empty, the native `status` is **any of** `SalesOrd:A` *Pending Approval*,
+   `SalesOrd:B` *Pending Fulfillment*, `SalesOrd:D` *Partially Fulfilled* or `SalesOrd:E`
+   *Pending Billing/Partially Fulfilled*, and `custbody_finance_status` is **none of the
+   excluded list, or empty**. The empty branch is spelt out rather than trusted to `noneof`.
 2. `map`, one order per invocation: `evaluateOrder()` with the order's facts taken from the search
    columns, so no order costs a lookup of its own. `OPPSYNC_MR_CHANGED` at audit when readiness
    changed; **nothing** logged for an unchanged order — it is counted.
@@ -582,9 +592,26 @@ offers *Arrange delivery* only on a ready order, so readiness has to be current 
    ready, changed reason only, skipped by reason, errors, usage — and one
    `OPPSYNC_MR_ORDER_FAILED` per order that threw, naming it.
 
-**"Open" is the sales order script's definition and nothing else**: a linked opportunity, and a
-Record Status not in the excluded list — blank counts as open. **Never the native transaction
-status**; see *the excluded list is reused, deliberately*, above.
+**"Open" is the sales order script's definition**: a linked opportunity, and a Record Status not
+in the excluded list — blank counts as open; see *the excluded list is reused, deliberately*,
+above.
+
+**Plus a native-status pre-filter, on the input only.** Old orders whose Record Status is blank
+or was never moved on, but which have already shipped or been billed, would otherwise be read
+as open and evaluated and stamped every night — most of all on the first run, the backfill. So
+the input search reads only orders whose native status can still ship (A, B, D, E above), and
+leaves out `SalesOrd:F` *Pending Billing* (fully fulfilled), `SalesOrd:G` *Billed*, `SalesOrd:H`
+*Closed* and `SalesOrd:C` *Cancelled*. This is **not** a second definition of done:
+
+- it narrows what the Map/Reduce **reads**; it never decides a verdict;
+- the sales order script does **not** apply it — a save of a Billed order with a blank Record
+  Status is evaluated exactly as before;
+- an order it leaves out keeps whatever readiness it last had. It has nothing left to ship, so
+  nothing acts on it.
+
+The codes are NetSuite's standard transaction status codes, the same in every account — not
+account internal IDs — so they are in the code (`SHIPPABLE_STATUSES` in `opsync_mr_readiness.js`),
+not a parameter. `OPPSYNC_MR_SUMMARY` states the filter in force on every run.
 
 **No quote type filter.** Parts and FOC orders are evaluated like any other, on purpose — their
 quote type's two checkboxes decide which gates apply, as they do on a save.
@@ -1093,7 +1120,7 @@ widening it is a field edit rather than a code change.
 | **Clearing a date by inline edit does not propagate** | On XEDIT a field absent from `newRecord` is indistinguishable from a field cleared to empty. The script resolves the ambiguity in favour of *absent* and falls back to `oldRecord` — so inline-clearing the delivery date leaves the orders' ship dates as they were. The safe failure was chosen deliberately: the alternative silently wipes ship dates on every unrelated inline edit. Clearing the date on the **full form** works normally. |
 | **Governance stops are silent to the user** | If an opportunity has enough sales orders to exhaust the user event's governance, the loop stops cleanly and logs `OPPSYNC_GOVERNANCE_STOP` naming the orders it did not reach. The user who saved the opportunity sees nothing. Re-saving picks up the rest. Not expected in practice — an opportunity has a handful of orders, not hundreds. |
 | **Two script IDs are auto-assigned and must be confirmed per account** | `customrecord16` (the Quote Type record) and `custbody38` (the DNO status) are **script IDs**, not internal IDs — NetSuite names an object `customrecordN` / `custbodyN` when the developer does not choose an id, so they are committable. But unlike a hand-chosen id they carry no guarantee of being the same in another account: they are only stable if the object travelled between accounts rather than being built separately in each. **Confirm both in Sandbox and Production before go-live.** A wrong one fails silently — `custbody38` reads as blank, which the DNO check reports as *Awaiting DNO* on every order. |
-| **Readiness is as current as the last evaluation** | Since the readiness Map/Reduce, a certificate expiry is picked up by the next nightly run without anyone saving anything — before it, an order stayed *ready* until somebody saved it or its opportunity. What remains: a certificate is valid all of its expiry day (UK), and reads expired from the first run after UK midnight, so an order can read *ready* between midnight and the 02:00 run. Orders at an **excluded** status are never re-evaluated by any of the three scripts — deliberately, see *readiness freezes* above. Observed 29 Sep 2026, MR 1.0.0. |
+| **Readiness is as current as the last evaluation** | Since the readiness Map/Reduce, a certificate expiry is picked up by the next nightly run without anyone saving anything — before it, an order stayed *ready* until somebody saved it or its opportunity. What remains: a certificate is valid all of its expiry day (UK), and reads expired from the first run after UK midnight, so an order can read *ready* between midnight and the 02:00 run. Orders at an **excluded** status are never re-evaluated by any of the three scripts — deliberately, see *readiness freezes* above. Nor does the Map/Reduce read an order whose native status can no longer ship (*Pending Billing* fully fulfilled, *Billed*, *Closed*, *Cancelled*) — its readiness stays as last evaluated, until a save re-evaluates it; section 4. Observed 29 Sep 2026, MR 1.0.0. |
 | **The sync does not run for anyone who bypasses user events** | CSV import with *Run Server SuiteScript and Trigger Workflows* unticked, and any integration that suppresses user events, write the opportunity without this script running. The orders are then out of step until the opportunity is saved again. This is a NetSuite setting on each import, not something the script can detect or force. |
 
 Add further entries as they are found, with the date and the script version they were observed on.
@@ -1134,7 +1161,7 @@ drift between scripts.
 | `OPPSYNC_SO_FAILED` | error | **Sales order script.** Its entry point threw. **The sales order still saved**; its readiness fields may be out of step. | Read the logged error. Nothing in this feature may ever block a save, so a failure here is silent to the user. |
 | `OPPSYNC_MR_START` | audit | **Map/Reduce.** The run began and its parameters all resolved. Names the excluded Record Statuses the input search uses. | Nothing. |
 | `OPPSYNC_MR_CHANGED` | audit | **Map/Reduce.** One order's readiness changed and was written. Names the order, the opportunity, the status and the before/after of both fields. Normal operation — on a night after a certificate expired, this is the feature working. | Nothing. On the first run (the backfill) expect many; spot-check a few against the order. |
-| `OPPSYNC_MR_SUMMARY` | audit | **Map/Reduce.** One line per run: orders evaluated, changed to ready, changed to not ready, changed reason only, skipped by reason, errors, and the usage. Normal operation. | Read it after every run you care about. A sudden jump in *changed* on an ordinary night means something moved — a parameter, a quote type checkbox, or the three parameter sets drifting apart (section 4). |
+| `OPPSYNC_MR_SUMMARY` | audit | **Map/Reduce.** One line per run: the native-status input filter in force (e.g. `input: native status any of Pending Approval, … (SalesOrd:A, SalesOrd:B, SalesOrd:D, SalesOrd:E)`), orders evaluated, changed to ready, changed to not ready, changed reason only, skipped by reason, errors, and the usage. Normal operation. | Read it after every run you care about. A sudden jump in *changed* on an ordinary night means something moved — a parameter, a quote type checkbox, or the three parameter sets drifting apart (section 4). |
 | `OPPSYNC_MR_ORDER_FAILED` | error | **Map/Reduce.** One order threw. Names it and the error. **Its readiness fields are as they were; every other order was still processed.** | Read the error against the named order — usually a deleted or locked record, or a permission problem on the deployment's role. |
 | `OPPSYNC_MR_INPUT_FAILED` | error | **Map/Reduce.** The run stopped before any order was evaluated — nearly always a parameter that throws when unset, named in the text. **Nothing was written.** | Populate the named parameter on the Map/Reduce deployment, with the same value as its `opsync_` and `sosync_` twins. |
 | `OPPSYNC_TODAY_FALLBACK` | error | Today's date in Europe/London could not be worked out, so the **UTC** date was used for certificate expiry. Logs the raw formatted value. Raised from `opsync_lib_values.js`, the one title not built by `logKey()`. | Should never fire. If it does, send the logged values — the date format preference of the executing user is the first suspect. |
@@ -1489,6 +1516,10 @@ Requires `customscript_opsync_mr_readiness` with its six `opsyncmr_` parameters 
 | 153 | Order with a **blank** Record Status and a linked opportunity | In the input search — blank is open — and evaluated |
 | 154 | Save a sales order at 01:00 UK with a certificate that expired yesterday (UK) | Not ready. The user events use the same UK *today* as the Map/Reduce since values 1.1.0 |
 | 155 | Read the execution log after any user event save, and after a run | **No `OPPSYNC_TODAY_FALLBACK`.** If it appears, today was taken from UTC — send the logged values |
+| 156 | **Billed** order (native status *Billed*) with a **blank** Record Status and a linked opportunity; run | **Not read** — not in the input search, not counted, no write, no system note. Its readiness is as it was |
+| 157 | **Pending Fulfillment** order, Record Status not excluded; run | **Read and evaluated**, as 144 |
+| 158 | **Partially Fulfilled** order, Record Status not excluded; run | **Read and evaluated** — it can still ship |
+| 159 | **Pending Billing** order (fully fulfilled, not yet billed), Record Status blank; run | **Not read** — it has shipped. `OPPSYNC_MR_SUMMARY` names the native-status filter in force |
 
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
