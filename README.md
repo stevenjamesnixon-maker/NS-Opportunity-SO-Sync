@@ -31,13 +31,15 @@ the code, the code wins — and the document gets fixed in the same PR.
 src/FileCabinet/SuiteScripts/OpportunitySOSync/
     opsync_ue_opportunity.js         sync — afterSubmit on Opportunity
     opsync_ue_salesorder.js          sync — afterSubmit on Sales Order
+    opsync_mr_readiness.js           sync — nightly Map/Reduce re-evaluating readiness on open orders
     dsi_ue_opportunity.js            Design Instruction — buttons (beforeLoad), creates rows (afterSubmit)
     dsi_cs_opportunity.js            Design Instruction — the buttons' client script; no script record
     dsi_ue_design_instruction.js     Design Instruction — gate and completion, on the row
     lib/                             shared modules — uploaded, but no script record needed
         opsync_lib_config.js         sync configuration
         opsync_lib_values.js         value-shape layer — used by both features
-        opsync_lib_readiness.js      delivery readiness
+        opsync_lib_readiness.js      delivery readiness — the rule
+        opsync_lib_so_readiness.js   delivery readiness — one sales order: read, evaluate, write if changed
         dsi_lib_config.js            Design Instruction configuration
 docs/context.md                      canonical project context
 ```
@@ -53,6 +55,7 @@ Script file names carry the entry-point type, so it shows up in PR file lists:
 | Pattern | Example |
 |---|---|
 | `opsync_ue_<purpose>.js` | `opsync_ue_opportunity_sync.js` |
+| `opsync_mr_<purpose>.js` | `opsync_mr_readiness.js` |
 | `lib/opsync_lib_<purpose>.js` | `lib/opsync_lib_config.js` |
 
 Script records use `customscript_opsync_<type>_<purpose>` and deployments

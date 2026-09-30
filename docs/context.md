@@ -102,11 +102,13 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.10.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the nine script parameters — including the status mapping | Production — confirmed by the client 22 Sep 2026 |
-| Shared value library | 1.0.0 | `lib/opsync_lib_values.js` | The value-shape layer — one definition of what a select, a date or a presence flag *means*, whichever API returned it | Production — confirmed by the client 22 Sep 2026 |
-| Shared readiness library | 1.0.0 | `lib/opsync_lib_readiness.js` | **The one definition of delivery readiness.** Both user events call it; neither has a copy | Production — confirmed by the client 22 Sep 2026 |
+| Shared config library | 1.11.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the nine script parameters — including the status mapping. 1.11.0 adds the Map/Reduce's row of six | **1.11.0 not deployed.** Production carries 1.10.0 — confirmed by the client 22 Sep 2026 |
+| Shared value library | 1.1.0 | `lib/opsync_lib_values.js` | The value-shape layer — one definition of what a select, a date or a presence flag *means*, whichever API returned it. 1.1.0: *today* is the UK's today — section 5 | **1.1.0 not deployed.** Production carries 1.0.0 — confirmed by the client 22 Sep 2026 |
+| Shared readiness library | 1.0.0 | `lib/opsync_lib_readiness.js` | **The one definition of delivery readiness.** All three callers use it; none has a copy | Production — confirmed by the client 22 Sep 2026 |
+| Shared single-order readiness library | 1.0.0 | `lib/opsync_lib_so_readiness.js` | `evaluateOrder()` — reads one sales order's facts, evaluates, writes the two readiness fields **only if the verdict changed**. Moved out of the sales order user event; the Map/Reduce calls it too | Not deployed |
 | Opportunity user event | 1.8.2 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Production — confirmed by the client 22 Sep 2026 |
-| Sales order user event | 1.0.0 | `opsync_ue_salesorder.js` | `afterSubmit` on Sales Order — re-evaluates readiness for that one order. Writes the two readiness fields and **nothing else** | Production, deployment status **Testing** — confirmed by the client 22 Sep 2026 |
+| Sales order user event | 1.1.0 | `opsync_ue_salesorder.js` | `afterSubmit` on Sales Order — re-evaluates readiness for that one order, through `lib/opsync_lib_so_readiness.js` since 1.1.0. Writes the two readiness fields and **nothing else** | **1.1.0 not deployed.** Production carries 1.0.0, deployment status **Testing** — confirmed by the client 22 Sep 2026. It stays at Testing until the Map/Reduce's first run has backfilled the open orders — section 8 |
+| Readiness Map/Reduce | 1.0.0 | `opsync_mr_readiness.js` | Nightly. Re-evaluates readiness for **every open sales order** and writes the two readiness fields where they changed, so a certificate that expires overnight is picked up without anyone saving anything. Its first run is the backfill | Not deployed |
 | Design Instruction config library | 1.3.0 | `lib/dsi_lib_config.js` | Every script ID and parameter of the Design Instruction feature. **Separate from `opsync_lib_config.js`** — see section 11. Also loaded by the client script | Not deployed |
 | Design Instruction opportunity user event | 1.2.0 | `dsi_ue_opportunity.js` | `beforeLoad` on Opportunity — the two buttons; `afterSubmit` — creates a Design Instruction row when the sub-status moves to a creating value | Not deployed |
 | Design Instruction opportunity client script | 1.1.0 | `dsi_cs_opportunity.js` | Request Design / Request Redraw — confirm, write the sub-status, land on the redraw row. **Attached by `beforeLoad`; no script record, no deployment** | Not deployed |
@@ -434,6 +436,11 @@ order was in active use, and a stale *ready* ships goods.
 opportunity-driven. Adding a third field to that write is how the two scripts start fighting
 over one record.
 
+**Since 1.1.0 steps 2 to 6 live in `lib/opsync_lib_so_readiness.js`**, as `evaluateOrder(cfg,
+orderId, soFacts)`. The sales order script reads its own fields off the record being saved, hands
+them over, and logs `OPPSYNC_SO_READINESS_UPDATED` when the result says it wrote. The code was
+moved, not rewritten, and its behaviour is unchanged — see *Parameters are read lazily* below.
+
 **The order's own fields come from `newRecord` through `effectiveValue()`**, the same XEDIT-aware
 fallback the opportunity script uses. An inline edit gives a sparse `newRecord` where an
 untouched field reads as *empty* rather than as *unchanged* — reading the quote type straight off
@@ -465,23 +472,37 @@ native transaction status. That list already means *"past the delivery gate or d
 first, and the drift would show up as an order the opportunity thinks is live and the sales
 order thinks is finished.
 
-#### ⚠️ Six parameters exist twice, under DIFFERENT NAMES
+**One deliberate, input-only exception: the Map/Reduce's native-status pre-filter.** The nightly
+Map/Reduce's input search also requires the native sales order status to be one that can still
+ship. That is a cheap pre-filter for *"can still ship"*, **not a second definition of done**: it
+narrows which orders the Map/Reduce reads and nothing else. The excluded Record Status list still
+decides what the user events evaluate, and the readiness rule, the excluded list, the sales order
+script and the opportunity script are all unchanged by it. See *the nightly Map/Reduce* below.
+Decided 30 Sep 2026 (Steve): orders that have shipped don't need reviewing.
+
+#### ⚠️ Six parameters exist THREE times, under DIFFERENT NAMES
 
 **A script parameter is a custom field, and custom field IDs are unique across the NetSuite
 account.** A second script consuming the same configuration therefore **cannot** reuse the first
 script's parameter IDs — NetSuite rejects them as already in use. This was tried in the account
 and refused. It is not a theory, and it is the reason for everything in this section.
 
-So the six the readiness evaluation needs exist twice, with **different prefixes**:
+So the six the readiness evaluation needs exist once per script that evaluates readiness — three
+times since the Map/Reduce — with **different prefixes**:
 
-| Purpose | `customscript_opsync_ue_opportunity` | `customscript_opsync_ue_salesorder` |
-|---|---|---|
-| Excluded statuses | `custscript_opsync_excluded_statuses` | `custscript_sosync_excluded_statuses` |
-| Design OK statuses | `custscript_opsync_design_ok_statuses` | `custscript_sosync_design_ok_statuses` |
-| DNO OK values | `custscript_opsync_dno_ok_values` | `custscript_sosync_dno_ok_values` |
-| Customer qualification field | `custscript_opsync_cust_qual_field` | `custscript_sosync_cust_qual_field` |
-| Customer PL field | `custscript_opsync_cust_pl_field` | `custscript_sosync_cust_pl_field` |
-| BUS "No" value | `custscript_opsync_bus_no_value` | `custscript_sosync_bus_no_value` |
+| Purpose | `customscript_opsync_ue_opportunity` | `customscript_opsync_ue_salesorder` | `customscript_opsync_mr_readiness` |
+|---|---|---|---|
+| Excluded statuses | `custscript_opsync_excluded_statuses` | `custscript_sosync_excluded_statuses` | `custscript_opsyncmr_excluded_statuses` |
+| Design OK statuses | `custscript_opsync_design_ok_statuses` | `custscript_sosync_design_ok_statuses` | `custscript_opsyncmr_design_ok_statuses` |
+| DNO OK values | `custscript_opsync_dno_ok_values` | `custscript_sosync_dno_ok_values` | `custscript_opsyncmr_dno_ok_values` |
+| Customer qualification field | `custscript_opsync_cust_qual_field` | `custscript_sosync_cust_qual_field` | `custscript_opsyncmr_cust_qual_field` |
+| Customer PL field | `custscript_opsync_cust_pl_field` | `custscript_sosync_cust_pl_field` | `custscript_opsyncmr_cust_pl_field` |
+| BUS "No" value | `custscript_opsync_bus_no_value` | `custscript_sosync_bus_no_value` | `custscript_opsyncmr_bus_no_value` |
+
+**Each row must hold the same value in all three columns, kept in step by hand.** The third set
+makes the drift risk below worse, not different: a Map/Reduce that disagrees with the user events
+overwrites their verdict on every open order **every night**, and they overwrite it back on the
+next save.
 
 Three exist **only** on the opportunity script, because only it uses them:
 `custscript_opsync_qualifying_statuses`, `custscript_opsync_status_map` and
@@ -548,6 +569,79 @@ order**, which is far more often than the opportunity script runs, and a configu
 that path is a cost paid forever to avoid a copy-paste that happens twice. The risk is real and
 is why it is flagged here, in the config library and in the deployment checklist — but a search
 per save is a worse permanent trade than a checklist item.
+
+### The nightly Map/Reduce — the third caller
+
+Both user events only re-evaluate when somebody **saves** something. A certificate that expires
+overnight changes nothing on the opportunity or the order, so the order kept reading *ready* until
+somebody happened to save one of them — and a stale *ready* ships goods. The customer dashboard
+offers *Arrange delivery* only on a ready order, so readiness has to be current every morning.
+
+`opsync_mr_readiness.js` runs every night and re-evaluates **every open sales order**:
+
+1. `getInputData` reads **all six** of its parameters first — a missing one that throws stops the
+   run before a single order is touched — then returns a search: `mainline` is T, the native
+   `opportunity` is not empty, the native `status` is **any of** `SalesOrd:A` *Pending Approval*,
+   `SalesOrd:B` *Pending Fulfillment*, `SalesOrd:D` *Partially Fulfilled* or `SalesOrd:E`
+   *Pending Billing/Partially Fulfilled*, and `custbody_finance_status` is **none of the
+   excluded list, or empty**. The empty branch is spelt out rather than trusted to `noneof`.
+2. `map`, one order per invocation: `evaluateOrder()` with the order's facts taken from the search
+   columns, so no order costs a lookup of its own. `OPPSYNC_MR_CHANGED` at audit when readiness
+   changed; **nothing** logged for an unchanged order — it is counted.
+3. `summarize`: one `OPPSYNC_MR_SUMMARY` line — evaluated, changed to ready, changed to not
+   ready, changed reason only, skipped by reason, errors, usage — and one
+   `OPPSYNC_MR_ORDER_FAILED` per order that threw, naming it.
+
+**"Open" is the sales order script's definition**: a linked opportunity, and a Record Status not
+in the excluded list — blank counts as open; see *the excluded list is reused, deliberately*,
+above.
+
+**Plus a native-status pre-filter, on the input only.** Old orders whose Record Status is blank
+or was never moved on, but which have already shipped or been billed, would otherwise be read
+as open and evaluated and stamped every night — most of all on the first run, the backfill. So
+the input search reads only orders whose native status can still ship (A, B, D, E above), and
+leaves out `SalesOrd:F` *Pending Billing* (fully fulfilled), `SalesOrd:G` *Billed*, `SalesOrd:H`
+*Closed* and `SalesOrd:C` *Cancelled*. This is **not** a second definition of done:
+
+- it narrows what the Map/Reduce **reads**; it never decides a verdict;
+- the sales order script does **not** apply it — a save of a Billed order with a blank Record
+  Status is evaluated exactly as before;
+- an order it leaves out keeps whatever readiness it last had. It has nothing left to ship, so
+  nothing acts on it.
+
+The codes are NetSuite's standard transaction status codes, the same in every account — not
+account internal IDs — so they are in the code (`SHIPPABLE_STATUSES` in `opsync_mr_readiness.js`),
+not a parameter. `OPPSYNC_MR_SUMMARY` states the filter in force on every run.
+
+**No quote type filter.** Parts and FOC orders are evaluated like any other, on purpose — their
+quote type's two checkboxes decide which gates apply, as they do on a save.
+
+**Its first run is the backfill.** Run by hand once, before it is scheduled, it evaluates every
+open order that has never been evaluated. That backfill is why `customdeploy_opsync_ue_salesorder`
+has stayed at **Testing**; it moves to Released afterwards. See section 8.
+
+**Its write fires the sales order script** where that is deployed to run. The sales order script
+evaluates the same order through the same module, finds nothing to change and stops — the
+recursion guard in section 5, unchanged.
+
+**Cost per order**: one `lookupFields` on the opportunity, one on the installer's customer record
+(skipped when the installer is blank), one on the quote type (skipped when blank), and one
+`submitFields` **only** when the verdict changed. Nothing is cached across map invocations, and
+one invocation is one order, so there is nothing to cache within one.
+
+#### Parameters are read lazily — how the sales order script stays equivalent
+
+`evaluateOrder()` takes a `cfg` of parameter values the caller has already read. A value the
+caller leaves out is read through its `opsync_lib_config` accessor **at the point the sales order
+script always read it**. The sales order script passes an empty `cfg`, so an order with no linked
+opportunity still exits before any parameter is read, and an excluded order still exits before the
+four readiness parameters are — the same reads, in the same order, with the same failures. The
+Map/Reduce reads everything up front instead, because it wants to fail before its first order.
+
+The per-order debug lines — `OPPSYNC_SO_NO_OPPORTUNITY`, `OPPSYNC_SO_SKIPPED`,
+`OPPSYNC_SO_READINESS` — are raised inside `evaluateOrder()` so they stay in the same place
+relative to the write. `cfg.quiet` suppresses them for the Map/Reduce, which counts instead. The
+audit line for a write is the **caller's**, because only the caller knows what caused it.
 
 ### Suppressing the ship date by status
 
@@ -846,6 +940,25 @@ Agreed mapping, seven rows, **by name**:
   parts also discard any time component, so **a certificate expiring today is valid** rather than
   failing on a stray timestamp — the case that would appear to work for every other date.
 
+- **"Today" is the UK's today, not the data centre's.** Since values 1.1.0. Server-side,
+  `new Date()` is the data centre's clock and calendar, and until then `todayDayNumber()` was
+  `asDayNumber(new Date())` — so between UK midnight and the data centre's midnight, *today* was
+  still yesterday, and a certificate that expired yesterday in the UK still read as valid, in the
+  ship-the-goods direction. The nightly Map/Reduce runs in exactly that window.
+
+  It now renders the current moment with `format.format()` as a datetime in
+  `format.Timezone.EUROPE_LONDON`, strips the time, and reads the date back with `format.parse()`
+  as a DATE — the same call that reads the certificate expiry strings, so both sides of the
+  comparison are built the same way. **"On or after today passes" is unchanged**: a certificate
+  expiring today, UK, is still valid all of today.
+
+  If that fails it logs `OPPSYNC_TODAY_FALLBACK` at error with the raw values and uses the **UTC**
+  date — never more than an hour behind the UK — rather than the data centre's. It does not fail
+  quietly, because a quiet fallback would bring back exactly the lag this removes.
+
+  It applies to **all three** readiness callers, the two user events included. That is intended:
+  a UK certificate date means a UK day wherever the evaluation runs.
+
 - **A failed lookup holds the order rather than shipping it.** An unreadable quote type is
   treated as design-required; an unreadable installer leaves both certificate dates blank, so
   they read as missing. Both directions are chosen so a lookup failure can never let an order
@@ -1007,6 +1120,7 @@ widening it is a field edit rather than a code change.
 | **Clearing a date by inline edit does not propagate** | On XEDIT a field absent from `newRecord` is indistinguishable from a field cleared to empty. The script resolves the ambiguity in favour of *absent* and falls back to `oldRecord` — so inline-clearing the delivery date leaves the orders' ship dates as they were. The safe failure was chosen deliberately: the alternative silently wipes ship dates on every unrelated inline edit. Clearing the date on the **full form** works normally. |
 | **Governance stops are silent to the user** | If an opportunity has enough sales orders to exhaust the user event's governance, the loop stops cleanly and logs `OPPSYNC_GOVERNANCE_STOP` naming the orders it did not reach. The user who saved the opportunity sees nothing. Re-saving picks up the rest. Not expected in practice — an opportunity has a handful of orders, not hundreds. |
 | **Two script IDs are auto-assigned and must be confirmed per account** | `customrecord16` (the Quote Type record) and `custbody38` (the DNO status) are **script IDs**, not internal IDs — NetSuite names an object `customrecordN` / `custbodyN` when the developer does not choose an id, so they are committable. But unlike a hand-chosen id they carry no guarantee of being the same in another account: they are only stable if the object travelled between accounts rather than being built separately in each. **Confirm both in Sandbox and Production before go-live.** A wrong one fails silently — `custbody38` reads as blank, which the DNO check reports as *Awaiting DNO* on every order. |
+| **Readiness is as current as the last evaluation** | Since the readiness Map/Reduce, a certificate expiry is picked up by the next nightly run without anyone saving anything — before it, an order stayed *ready* until somebody saved it or its opportunity. What remains: a certificate is valid all of its expiry day (UK), and reads expired from the first run after UK midnight, so an order can read *ready* between midnight and the 02:00 run. Orders at an **excluded** status are never re-evaluated by any of the three scripts — deliberately, see *readiness freezes* above. Nor does the Map/Reduce read an order whose native status can no longer ship (*Pending Billing* fully fulfilled, *Billed*, *Closed*, *Cancelled*) — its readiness stays as last evaluated, until a save re-evaluates it; section 4. Observed 29 Sep 2026, MR 1.0.0. |
 | **The sync does not run for anyone who bypasses user events** | CSV import with *Run Server SuiteScript and Trigger Workflows* unticked, and any integration that suppresses user events, write the opportunity without this script running. The orders are then out of step until the opportunity is saved again. This is a NetSuite setting on each import, not something the script can detect or force. |
 
 Add further entries as they are found, with the date and the script version they were observed on.
@@ -1045,6 +1159,12 @@ drift between scripts.
 | `OPPSYNC_SO_SKIPPED` | debug | **Sales order script.** The order's Record Status is in the excluded list, so readiness is not applicable and nothing was evaluated or written. | Nothing. Same meaning as `OPPSYNC_ORDER_SKIPPED` on the opportunity side, and the **same** parameter — there is deliberately not a second definition of "done". |
 | `OPPSYNC_SO_NO_OPPORTUNITY` | debug | **Sales order script.** The order has no linked opportunity, so there is no context to evaluate readiness from. | Nothing. An order raised outside this process is not this script's business. If an order that *should* be linked shows this, check the native `opportunity` field — **not** `createdfrom`. |
 | `OPPSYNC_SO_FAILED` | error | **Sales order script.** Its entry point threw. **The sales order still saved**; its readiness fields may be out of step. | Read the logged error. Nothing in this feature may ever block a save, so a failure here is silent to the user. |
+| `OPPSYNC_MR_START` | audit | **Map/Reduce.** The run began and its parameters all resolved. Names the excluded Record Statuses the input search uses. | Nothing. |
+| `OPPSYNC_MR_CHANGED` | audit | **Map/Reduce.** One order's readiness changed and was written. Names the order, the opportunity, the status and the before/after of both fields. Normal operation — on a night after a certificate expired, this is the feature working. | Nothing. On the first run (the backfill) expect many; spot-check a few against the order. |
+| `OPPSYNC_MR_SUMMARY` | audit | **Map/Reduce.** One line per run: the native-status input filter in force (e.g. `input: native status any of Pending Approval, … (SalesOrd:A, SalesOrd:B, SalesOrd:D, SalesOrd:E)`), orders evaluated, changed to ready, changed to not ready, changed reason only, skipped by reason, errors, and the usage. Normal operation. | Read it after every run you care about. A sudden jump in *changed* on an ordinary night means something moved — a parameter, a quote type checkbox, or the three parameter sets drifting apart (section 4). |
+| `OPPSYNC_MR_ORDER_FAILED` | error | **Map/Reduce.** One order threw. Names it and the error. **Its readiness fields are as they were; every other order was still processed.** | Read the error against the named order — usually a deleted or locked record, or a permission problem on the deployment's role. |
+| `OPPSYNC_MR_INPUT_FAILED` | error | **Map/Reduce.** The run stopped before any order was evaluated — nearly always a parameter that throws when unset, named in the text. **Nothing was written.** | Populate the named parameter on the Map/Reduce deployment, with the same value as its `opsync_` and `sosync_` twins. |
+| `OPPSYNC_TODAY_FALLBACK` | error | Today's date in Europe/London could not be worked out, so the **UTC** date was used for certificate expiry. Logs the raw formatted value. Raised from `opsync_lib_values.js`, the one title not built by `logKey()`. | Should never fire. If it does, send the logged values — the date format preference of the executing user is the first suspect. |
 | `OPPSYNC_SCRIPT_NOT_MAPPED` | error + **throws** | The executing script is not listed in `SCRIPT_PARAMETERS` in `opsync_lib_config.js`, so none of its parameter IDs can be resolved. Names the script id. | Add that script's row to the map, with its **own** parameter IDs — they cannot be shared with another script. Do not derive them and do not fall back to another script's. See section 4. |
 | `OPPSYNC_PARAMETER_NOT_ON_SCRIPT` | error + **throws** | An accessor was called for a parameter the executing script does not define — e.g. `getMappedStatus()` reached from the sales order script. Names both the accessor and the script, and lists what that script does define. | A coding error, not a configuration one: the accessor is being called from a script the parameter was never meant for. **Do not "fix" it on the deployment** — the field does not exist there. |
 | `OPPSYNC_FAILED` | error | The entry point threw outside the per-order loop. **The opportunity still saved**; its orders may be out of step. | Read the logged error. Nothing in this feature may ever block an opportunity save, so a failure here is always silent to the user. |
@@ -1067,26 +1187,30 @@ rather than silently doing nothing — particularly for anything that fell throu
 Deployment is **manual File Cabinet upload**. There is no SDF project and no automated deploy.
 **Steve deploys. Claude never deploys.**
 
-1. **Upload the three `lib/` modules to the File Cabinet first**, in this order — each imports
-   the one before it by relative path and fails *at load time* if it is absent, and the failure
-   looks like a broken script record rather than a missing file:
+1. **Upload the four `lib/` modules to the File Cabinet first**, in this order — a module that
+   imports one not yet uploaded fails *at load time*, and the failure looks like a broken script
+   record rather than a missing file:
 
    1. `lib/opsync_lib_config.js`
    2. `lib/opsync_lib_values.js`
    3. `lib/opsync_lib_readiness.js` — imports `opsync_lib_values`
+   4. `lib/opsync_lib_so_readiness.js` — imports all three above
 
-2. Upload **both** entry points, `opsync_ue_opportunity.js` and `opsync_ue_salesorder.js`. They
-   must sit in the **same folder** as `lib/`, with the libraries beneath them — the imports are
-   relative paths.
+2. Upload the entry points **in this order**: `opsync_ue_opportunity.js`, then
+   `opsync_ue_salesorder.js` (1.1.0 imports `opsync_lib_so_readiness`), then
+   `opsync_mr_readiness.js`. They must sit in the **same folder** as `lib/`, with the libraries
+   beneath them — the imports are relative paths.
 3. Create or update the script record and deployment:
 
    | Script | Script ID | Deployment | Applies to |
    |---|---|---|---|
    | `opsync_ue_opportunity.js` | `customscript_opsync_ue_opportunity` | `customdeploy_opsync_ue_opportunity` | Opportunity. `afterSubmit` only |
    | `opsync_ue_salesorder.js` | `customscript_opsync_ue_salesorder` | `customdeploy_opsync_ue_salesorder` | **Sales Order. `afterSubmit` only** |
+   | `opsync_mr_readiness.js` | `customscript_opsync_mr_readiness` | `customdeploy_opsync_mr_readiness` | **Map/Reduce.** Not Scheduled at first — see step 8 |
    | `lib/opsync_lib_config.js` | — | **None.** Shared AMD module — File Cabinet upload only. Creating a script record for it is wrong | — |
    | `lib/opsync_lib_values.js` | — | **None.** As above | — |
    | `lib/opsync_lib_readiness.js` | — | **None.** As above | — |
+   | `lib/opsync_lib_so_readiness.js` | — | **None.** As above | — |
 
 4. **Define the nine script parameters on the script record, and set their values on the
    deployment — BEFORE uploading the scripts that read them.** Six of the nine throw when unset
@@ -1143,6 +1267,33 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    reads as blank, which silently removes the legacy path and holds every legacy order.
 7. **Disable the old `acs_ue_update_so.js` deployment.** The two must not both run. Two writers
    of `custbody_finance_status` means an ordering question nobody can answer from the logs.
+
+8. **The readiness Map/Reduce, and the backfill.** In this order:
+
+   1. Create the script record for `opsync_mr_readiness.js` with **six** parameters, all
+      Free-Form Text, each holding the **same value as its `sosync_` twin**:
+
+      | On the Map/Reduce | Must equal |
+      |---|---|
+      | `custscript_opsyncmr_excluded_statuses` | `custscript_sosync_excluded_statuses` |
+      | `custscript_opsyncmr_design_ok_statuses` | `custscript_sosync_design_ok_statuses` |
+      | `custscript_opsyncmr_dno_ok_values` | `custscript_sosync_dno_ok_values` |
+      | `custscript_opsyncmr_cust_qual_field` | `custscript_sosync_cust_qual_field` |
+      | `custscript_opsyncmr_cust_pl_field` | `custscript_sosync_cust_pl_field` |
+      | `custscript_opsyncmr_bus_no_value` | `custscript_sosync_bus_no_value` |
+
+      Five throw when unset and stop the run at the start (`OPPSYNC_MR_INPUT_FAILED`);
+      `bus_no_value` fails closed, as on the other two scripts.
+   2. Create `customdeploy_opsync_mr_readiness`: status **Not Scheduled**, log level **Audit**.
+      The executing role must be able to read opportunities, customers and the Quote Type record,
+      and edit sales orders.
+   3. **Run it once by hand. This is the backfill** of the open orders that have never been
+      evaluated. Read `OPPSYNC_MR_SUMMARY`: the counts should be plausible for the number of open
+      orders, and `errors` should be 0. Spot-check five orders named by `OPPSYNC_MR_CHANGED`
+      against their hold reasons.
+   4. Then **schedule it daily at 02:00 UK**. The deployment's schedule is in the time zone of
+      the account's preferences — check which that is before choosing the hour.
+   5. Then move `customdeploy_opsync_ue_salesorder` to **Released**.
 
 Shared AMD modules need no script record and no deployment record — a File Cabinet upload is
 sufficient. But **all files must sit in the same folder tree**, because the imports are relative
@@ -1344,6 +1495,32 @@ section 11. Grep the execution log for `DSI_` as well as `OPPSYNC_` after every 
 | 135 | Complete a row whose type is *New design* while `custscript_dsirow_cancelled_type` is **empty** | Gate applies and the completion **writes** — no type is treated as cancelled. `DSI_PARAMETER_MISSING` at error. A configuration error now the value is known. **Revert afterwards** |
 | 136 | View an opportunity at *Design Complete* with `custscript_dsi_redraw_type` **empty**, press Request Redraw | Status written and row created, but the user is **told the row could not be found** and the page reloads — no redirect. `DSI_PARAMETER_MISSING` at error on view. **Revert afterwards** |
 
+### Readiness Map/Reduce and the shared single-order path (so_readiness 1.0.0, MR 1.0.0)
+
+Numbered from 143: 137–142 are taken by the empty-delivery-date scenarios on a parallel branch.
+Requires `customscript_opsync_mr_readiness` with its six `opsyncmr_` parameters set to match the
+`sosync_` ones. Run the Map/Reduce by hand from its deployment and read `OPPSYNC_MR_SUMMARY`.
+
+| # | Scenario | Expected |
+|---|---|---|
+| 143 | **Sales order script regression** — every scenario 89 to 98 and 105 | **Identical** writes and log lines to before. The single-order path moved into `lib/opsync_lib_so_readiness.js` unchanged; any difference here is a defect in the move |
+| 144 | Heat pump order, **ready**; set the installer's PL expiry to **yesterday**; run the Map/Reduce | Order **not ready**, reason `Public Liability certificate expired`; `OPPSYNC_MR_CHANGED` at audit naming it. **Nobody saved the order or the opportunity** — that is the point |
+| 145 | Run it again with nothing changed | Summary shows **0 changed**; no write, no system note on any order |
+| 146 | Order at an **excluded** status (e.g. *Release to Warehouse*) | Not in the input search, so not counted at all; untouched |
+| 147 | **Parts** order — quote type with *Can ship without design* ticked, certificates not required — at a status **not** in the design-ok list | **Evaluated like any other**, and ready. There is no quote-type filter |
+| 148 | **First full run** — the backfill | Summary counts plausible for the number of open orders; `errors 0`. Spot-check five orders named by `OPPSYNC_MR_CHANGED` |
+| 149 | Installer PL expiry **yesterday (UK)**; run the Map/Reduce at **02:00 UK** | **Expired.** Before values 1.1.0 the data centre's *today* could still be yesterday at 02:00 UK, and the certificate read as valid |
+| 150 | Installer PL expiry **today (UK)**; run at 02:00 UK | **Still valid** — *on or after today passes* is unchanged. It reads expired from tomorrow's run |
+| 151 | Clear one of the five throwing `opsyncmr_` parameters; run | `OPPSYNC_PARAMETER_MISSING` naming it, then `OPPSYNC_MR_INPUT_FAILED`. **No order written.** **Revert afterwards** |
+| 152 | Clear `custscript_opsyncmr_bus_no_value`; run | `OPPSYNC_PARAMETER_MISSING` at error, **the run continues** and holds every heat pump order for a voucher — fails closed like its twins. **Revert afterwards** |
+| 153 | Order with a **blank** Record Status and a linked opportunity | In the input search — blank is open — and evaluated |
+| 154 | Save a sales order at 01:00 UK with a certificate that expired yesterday (UK) | Not ready. The user events use the same UK *today* as the Map/Reduce since values 1.1.0 |
+| 155 | Read the execution log after any user event save, and after a run | **No `OPPSYNC_TODAY_FALLBACK`.** If it appears, today was taken from UTC — send the logged values |
+| 156 | **Billed** order (native status *Billed*) with a **blank** Record Status and a linked opportunity; run | **Not read** — not in the input search, not counted, no write, no system note. Its readiness is as it was |
+| 157 | **Pending Fulfillment** order, Record Status not excluded; run | **Read and evaluated**, as 144 |
+| 158 | **Partially Fulfilled** order, Record Status not excluded; run | **Read and evaluated** — it can still ship |
+| 159 | **Pending Billing** order (fully fulfilled, not yet billed), Record Status blank; run | **Not read** — it has shipped. `OPPSYNC_MR_SUMMARY` names the native-status filter in force |
+
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
 ---
@@ -1464,6 +1641,8 @@ Not code. These are account changes the scripts assume have been made.
 | 11 | **Define the six `custscript_sosync_*` parameters on the sales order script record**, each holding the same value as its `custscript_opsync_*` twin — and re-check both whenever either changes | Section 4. A script parameter is a custom field and custom field IDs are account-unique, so they **cannot** be shared; the sales order script's are prefixed `sosync_`. The differing prefix is the risk: nobody comparing two deployments will spot that the pairs are meant to match. If they diverge the scripts disagree about readiness and overwrite each other — **silently**, because neither can see the other's values. |
 | 9 | **Define `custscript_opsync_no_shipdate_statuses` and populate it BEFORE uploading UE 1.7.0** — the *Design Complete* and *Redraw Required* Record Status ids, in each environment | Section 4. It **throws** when unset, so uploading the script first makes the whole sync inert — `OPPSYNC_PARAMETER_MISSING` and `OPPSYNC_FAILED` on every qualifying save, with nothing written. The parameter must exist before the code that reads it. |
 | 7 | Set `custscript_opsync_bus_no_value` to the `customlist92` **No** option id in each environment | Section 4. It is a list option internal id and differs by account. Unset, the BUS condition applies to every heat pump order — safe, but everything is held. |
+| 12 | **Create the readiness Map/Reduce**, its six `custscript_opsyncmr_*` parameters (each equal to its `sosync_` twin), and `customdeploy_opsync_mr_readiness` **Not Scheduled**, log level Audit | Section 8, step 8. The third copy of the six: if it drifts from the other two, the Map/Reduce and the user events overwrite each other's verdict — the Map/Reduce every night |
+| 13 | **Run it once by hand — the backfill** — and read `OPPSYNC_MR_SUMMARY`; then schedule it daily at 02:00 UK; then move `customdeploy_opsync_ue_salesorder` to **Released** | Section 8, step 8. The order matters: the sales order script stays at Testing until the open orders have been evaluated once |
 | 6 | Check `OPPSYNC_MAP_PARSED` in the log after the first save in each environment | Section 9, scenario 25. A hand-typed parameter of seven ID pairs is the most likely thing to be wrong, and this is the only place it becomes visible. |
 
 ---
