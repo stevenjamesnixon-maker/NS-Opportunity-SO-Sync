@@ -145,8 +145,8 @@ define(['./opsync_lib_values'], function (values) {
      *
      * @param {Object} oppContext - everything that comes from the OPPORTUNITY and the
      *        parameters: installerId, qualExpiry, plExpiry, dnoStatus, subcontractReceived,
-     *        subcontractLegacy, qualLegacy, plLegacy, busRhiIntended, voucherApprovalDate, applicationDate,
-     *        busNoValue, designOkStatuses, dnoOkValues, today
+     *        subcontractLegacy, qualLegacy, plLegacy, busRhiIntended, voucherApprovalDate,
+     *        applicationDate, busNoValue, designOkStatuses, dnoOkValues, today
      * @param {Object} orderFacts - everything that comes from the ORDER: quoteTypeId,
      *        noDesignRequired, requiresCerts, decidedStatus
      * @returns {Object} { ready: boolean, reason: string, paths: Object }
