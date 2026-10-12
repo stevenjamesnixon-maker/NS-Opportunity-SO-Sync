@@ -18,7 +18,8 @@
  * know about XEDIT's sparse newRecord. That is not readiness, and the same rule applies.
  *
  * Every function in this file was MOVED here unchanged from opsync_ue_opportunity.js 1.7.0. The
- * comments came with them, because they record failures this project actually had.
+ * comments came with them, because they record failures this project actually had. One has
+ * changed since: todayDayNumber() works out today in Europe/London from 1.1.0 — see its note.
  *
  * Shared AMD module: no script record and no deployment record is required. It must be uploaded
  * to the File Cabinet before any entry-point script, which will otherwise fail at load time.
@@ -27,13 +28,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
-define(['N/format'], function (format) {
+define(['N/format', 'N/log'], function (format, log) {
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
 
     /**
      * True when the value is absent, null, or the empty string.
@@ -281,12 +282,83 @@ define(['N/format'], function (format) {
     }
 
     /**
-     * Today, as a YYYYMMDD number.
+     * The clock-time tail of a formatted datetime — " 2:05:00 am", " 14:05", " 02:05:00" — in
+     * whichever 12- or 24-hour form the user's preference produces. Stripped to leave the date,
+     * in the user's DATE format, for format.parse(). Anchored to the end so a date format with
+     * spaces in it ("29 September 2026") is left whole.
+     * @type {RegExp}
+     */
+    var TIME_SUFFIX = /\s+\d{1,2}:\d{2}(:\d{2})?(\s*[ap]\.?m\.?)?\s*$/i;
+
+    /**
+     * Today IN THE UK, as a YYYYMMDD number.
+     *
+     * WHY NOT new Date(). Server-side, new Date() is the DATA CENTRE's clock and calendar, not
+     * the UK's. Until 1.1.0 this function was asDayNumber(new Date()), so between UK midnight and
+     * the data centre's midnight "today" was still yesterday: a certificate that expired
+     * yesterday in the UK still read as valid, in the ship-the-goods direction. The nightly
+     * Map/Reduce runs in exactly that window. A certificate expiry is a UK date, so today has to
+     * be the UK's today.
+     *
+     * HOW. format.format() renders the current moment as a datetime in Europe/London, in the
+     * user's date and time format. The time is stripped (TIME_SUFFIX) and the date is read back
+     * with format.parse() as a DATE — the SAME call parseLookupDate() uses on the certificate
+     * expiry strings, so both sides of the comparison are built the same way, and asDayNumber()
+     * reads the calendar date straight off the result.
+     *
+     * IF THAT FAILS it logs OPPSYNC_TODAY_FALLBACK at error, with the raw values, and falls back
+     * to the UTC calendar date. Never silently: a quiet fallback would bring back exactly the
+     * lag this function exists to remove. UTC rather than the data centre's clock because UTC is
+     * never more than an hour behind the UK, where the data centre can be most of a day behind.
      *
      * @returns {number}
      */
     function todayDayNumber() {
-        return asDayNumber(new Date());
+        var now = new Date();
+        var text = '';
+        var datePart = '';
+        var day = null;
+        var failure = '';
+
+        try {
+            if (!format.Timezone || !format.Timezone.EUROPE_LONDON) {
+                // Without this check a missing enum would pass timezone: undefined, which
+                // formats in the USER's time zone — no error, and the wrong answer.
+                failure = 'format.Timezone.EUROPE_LONDON is not available';
+            } else {
+                text = format.format({
+                    value: now,
+                    type: format.Type.DATETIME,
+                    timezone: format.Timezone.EUROPE_LONDON
+                });
+                datePart = String(text).replace(TIME_SUFFIX, '');
+                day = asDayNumber(format.parse({ value: datePart, type: format.Type.DATE }));
+                if (day === null) {
+                    failure = 'the date part did not parse as a date';
+                }
+            }
+        } catch (e) {
+            failure = String(e);
+        }
+
+        if (day !== null) {
+            return day;
+        }
+
+        // The one log title in the project not built by opsyncConfig.logKey(). This module does
+        // not import the config — the Design Instruction scripts load it too, and a value-shape
+        // helper should not drag the sync's configuration in with it — so the prefix is written
+        // out. Only the sync's readiness callers reach this function.
+        log.error({
+            title: 'OPPSYNC_TODAY_FALLBACK',
+            details: 'Could not work out today\'s date in Europe/London (' + failure + '). ' +
+                'Formatted: "' + text + '", date part: "' + datePart + '". Falling back to the ' +
+                'UTC date, which lags the UK by up to an hour after midnight in summer. ' +
+                'Certificate expiry is judged against that date.'
+        });
+
+        return (now.getUTCFullYear() * 10000) + ((now.getUTCMonth() + 1) * 100) +
+            now.getUTCDate();
     }
 
     /**
