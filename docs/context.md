@@ -105,7 +105,7 @@ so it is where the sync belongs.
 | Shared config library | 1.10.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the nine script parameters — including the status mapping | Production — confirmed by the client 22 Sep 2026 |
 | Shared value library | 1.0.0 | `lib/opsync_lib_values.js` | The value-shape layer — one definition of what a select, a date or a presence flag *means*, whichever API returned it | Production — confirmed by the client 22 Sep 2026 |
 | Shared readiness library | 1.0.0 | `lib/opsync_lib_readiness.js` | **The one definition of delivery readiness.** Both user events call it; neither has a copy | Production — confirmed by the client 22 Sep 2026 |
-| Opportunity user event | 1.8.2 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Production — confirmed by the client 22 Sep 2026 |
+| Opportunity user event | 1.9.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | **1.9.0 not deployed.** Production carries 1.8.2 — confirmed by the client 22 Sep 2026 |
 | Sales order user event | 1.0.0 | `opsync_ue_salesorder.js` | `afterSubmit` on Sales Order — re-evaluates readiness for that one order. Writes the two readiness fields and **nothing else** | Production, deployment status **Testing** — confirmed by the client 22 Sep 2026 |
 | Design Instruction config library | 1.3.0 | `lib/dsi_lib_config.js` | Every script ID and parameter of the Design Instruction feature. **Separate from `opsync_lib_config.js`** — see section 11. Also loaded by the client script | Not deployed |
 | Design Instruction opportunity user event | 1.2.0 | `dsi_ue_opportunity.js` | `beforeLoad` on Opportunity — the two buttons; `afterSubmit` — creates a Design Instruction row when the sub-status moves to a creating value | Not deployed |
@@ -405,7 +405,7 @@ hence the per-order try/catch at step 7 rather than one try/catch around the loo
 | From (Opportunity) | To (Sales Order) | How |
 |---|---|---|
 | `custbody_opportunity_sub_status` | `custbody_finance_status` | Through the mapping |
-| `custbody_opp_del_date` | `custbody_defaultshipdate` | Direct — both dates, **unless the decided status suppresses it** (below) |
+| `custbody_opp_del_date` | `custbody_defaultshipdate` | Direct — both dates, **unless the decided status suppresses it** (below), and **never when the opportunity's date is empty** (1.9.0, below) |
 | *(derived — see below)* | `custbody_ready_for_delivery` | Two gates on the Quote Type record |
 | *(derived — see below)* | `custbody_delivery_hold_reason` | The failed gates, joined with `; ` |
 
@@ -601,6 +601,37 @@ last copy from the opportunity would land on top of a value somebody may already
 more sync" is also not a rule anyone can hold in their head — *"the opportunity stops writing the
 date once the order reaches this status"* is.
 
+### An empty delivery date never clears the order
+
+**An empty `custbody_opp_del_date` means "nothing to say", never "clear the order".** Added in
+1.9.0. It is the section 5 *what does empty mean* test applied to a record value instead of a
+parameter: empty must make the script do less.
+
+**The defect it fixes.** Before 1.9.0 an empty opportunity date compared unequal to an order's
+ship date and was written, wiping it. Creating a sales order marks the opportunity *Won*; that
+**system** save runs the sync, and on an opportunity with no delivery date yet it cleared the ship
+date of every linked order. The delivery date is not mandatory at *Won* and cannot sensibly be
+made so, because the save that triggers the sync is not a person's.
+
+**What it does.** In `syncSalesOrder()`, when the opportunity's delivery date is empty — tested
+with `isEmpty()` on the **raw** value, `deliveryDateRaw`, not on the derived key — the ship date is
+**not staged**. Everything else on that save is unchanged: the Record Status write, and the full
+readiness evaluation. **It is not an early return**, and must not become one.
+
+**Logging.** `OPPSYNC_SHIPDATE_EMPTY` at debug, once per order, **only when the order has a date
+to protect** — the same rule as `OPPSYNC_SHIPDATE_SUPPRESSED`: a log where nothing would have been
+written anyway is noise.
+
+**It is checked before the status suppression**, so when both apply — an empty date and a
+suppressed decided status — **`OPPSYNC_SHIPDATE_EMPTY` is the one that logs**. An empty date would
+not be written at any status, so suppression has nothing to suppress, and the suppression log's
+*"rather than being set to (empty)"* would misdescribe it.
+
+**The cost, accepted.** There is no longer any way to clear an order's ship date from the
+opportunity. Clearing the delivery date on the full form, which used to clear the orders' dates,
+now leaves them — see the section 5 note on XEDIT and the section 6 table. An order's date is
+cleared on the order.
+
 ### The decided status
 
 One definition, used by the exclusion test, the design gate and the status write alike:
@@ -707,6 +738,10 @@ Agreed mapping, seven rows, **by name**:
   value across and clear a ship date nobody touched. On CREATE and EDIT `newRecord` is complete,
   so an empty value there is a real clear by a real user and is respected — falling back would
   resurrect a value the user had just removed. See the limitation in section 6.
+
+  **Since 1.9.0 that clear is read, but never written.** An empty delivery date — on any event
+  type — leaves the orders' ship dates as they are. See *An empty delivery date never clears the
+  order* in section 4. The read rule above is unchanged; only the write is.
 
 - **The opportunity drives the sales order's status through the design phase only.**
   Every mapped sub-status is design lifecycle. Sub-statuses before design (*In Negotiation*,
@@ -1004,7 +1039,7 @@ widening it is a field edit rather than a code change.
 |---|---|
 | **Design Cancelled is a deliberate one-way door** | *Design Cancelled* maps to *Cancelled*, and *Cancelled* is in the excluded list. So this sync can move an order **to** Cancelled, and can never move it away again — the exclusion tests the order's current status, so a cancelled order is skipped from then on. **That is intended.** Un-cancelling an order should require a person looking at that order, not a status change on an opportunity that happens to cascade. **Do not "fix" it by removing Cancelled from the excluded list.** If it ever needs reversing it is a script parameter edit, not a code change. |
 | **…and readiness freezes at that moment** | The save that writes an excluded status is the **last one that will ever touch that order**. Readiness is deliberately not evaluated on that save: the status and ship date are written, and `custbody_ready_for_delivery` and `custbody_delivery_hold_reason` are left exactly as they were — not set to `false`, not given a reason, not included in the write at all. An excluded status means the order is past the delivery gate or is dead, so readiness is not applicable, and "not ready" on a delivered order is not merely stale, it is wrong. **A stale `true` on a cancelled or delivered order is therefore expected behaviour, not a bug.** Nothing will clear it, because nothing should. |
-| **Clearing a date by inline edit does not propagate** | On XEDIT a field absent from `newRecord` is indistinguishable from a field cleared to empty. The script resolves the ambiguity in favour of *absent* and falls back to `oldRecord` — so inline-clearing the delivery date leaves the orders' ship dates as they were. The safe failure was chosen deliberately: the alternative silently wipes ship dates on every unrelated inline edit. Clearing the date on the **full form** works normally. |
+| **Clearing a date by inline edit does not propagate** | On XEDIT a field absent from `newRecord` is indistinguishable from a field cleared to empty. The script resolves the ambiguity in favour of *absent* and falls back to `oldRecord` — so inline-clearing the delivery date leaves the orders' ship dates as they were. The safe failure was chosen deliberately: the alternative silently wipes ship dates on every unrelated inline edit. **Since 1.9.0 clearing the date on the full form does not propagate either** — an empty delivery date never clears an order's date, by any route. Clear the date on the order itself. See section 4. |
 | **Governance stops are silent to the user** | If an opportunity has enough sales orders to exhaust the user event's governance, the loop stops cleanly and logs `OPPSYNC_GOVERNANCE_STOP` naming the orders it did not reach. The user who saved the opportunity sees nothing. Re-saving picks up the rest. Not expected in practice — an opportunity has a handful of orders, not hundreds. |
 | **Two script IDs are auto-assigned and must be confirmed per account** | `customrecord16` (the Quote Type record) and `custbody38` (the DNO status) are **script IDs**, not internal IDs — NetSuite names an object `customrecordN` / `custbodyN` when the developer does not choose an id, so they are committable. But unlike a hand-chosen id they carry no guarantee of being the same in another account: they are only stable if the object travelled between accounts rather than being built separately in each. **Confirm both in Sandbox and Production before go-live.** A wrong one fails silently — `custbody38` reads as blank, which the DNO check reports as *Awaiting DNO* on every order. |
 | **The sync does not run for anyone who bypasses user events** | CSV import with *Run Server SuiteScript and Trigger Workflows* unticked, and any integration that suppresses user events, write the opportunity without this script running. The orders are then out of step until the opportunity is saved again. This is a NetSuite setting on each import, not something the script can detect or force. |
@@ -1035,6 +1070,7 @@ drift between scripts.
 | `OPPSYNC_GOVERNANCE_STOP` | error | The loop stopped with governance running low, naming how many orders were done and which were not reached. | Re-save the opportunity to pick up the rest. If it recurs, the opportunity has more orders than this design anticipated — see section 6. |
 | `OPPSYNC_READINESS` | debug | One line per sales order: order, quote type, decided status, ready true/false, the reason, **which path satisfied each certificate condition** — `modern`, `legacy`, `no installer` or `fail` — **and the raw `custbody38` value, what it normalised to, and the acceptable set**. Normal operation. | Nothing. This is the first place to look when an order's readiness is not what was expected. **The paths are the only record of why an order with a blank installer is ready to ship** — when a legacy order surfaces in a year and nobody remembers these fields exist, this line is the explanation. The `dnoRaw=… -> … dnoOk=…` fragment exists because the DNO check once failed for a whole Sandbox cycle with no error and no clue; it shows the value, the normalised id and the parameter side by side. |
 | `OPPSYNC_SHIPDATE_SUPPRESSED` | debug | The ship date **would** have been written but was not, because the order's decided Record Status is in `custscript_opsync_no_shipdate_statuses`. Names the status, the value left in place and the value not written. The status and readiness were still evaluated and written as normal. Normal operation. | Nothing. **This log exists because the alternative is invisible** — a ship date silently not updating looks identical on the record to one that did not need updating. It is raised only when a write would otherwise have happened. |
+| `OPPSYNC_SHIPDATE_EMPTY` | debug | **1.9.0.** The opportunity has **no delivery date**, so the order's expected ship date was **left as it was** rather than cleared. Names the order, the date kept and the opportunity. Raised only when the order has a date to protect. Status and readiness were still evaluated and written as normal. Takes precedence over `OPPSYNC_SHIPDATE_SUPPRESSED` when both apply. Normal operation. | Nothing. It is the record of a clear that did **not** happen — before 1.9.0 this save wiped the order's date. |
 | `OPPSYNC_READINESS_NOT_APPLICABLE` | debug | The status this save wrote is in the excluded list, so readiness was **not evaluated** and both fields were left as they were. Normal operation. | Nothing. Note the readiness values shown are now frozen — see section 6. |
 | `OPPSYNC_QUOTE_TYPE_UNREADABLE` | error | A quote type record could not be read. Treated as **design-required, certificates not required** — the strictest reading of the design gate. | Check the quote type record exists and the executing role can read it. Until then those orders are gated on design. |
 | `OPPSYNC_INSTALLER_UNREADABLE` | error | The installer customer record could not be read for the two certificate fields. **Both certificates read as missing**, so the order is held. | Check the customer record and the two field ids in the parameters. The held order is the safe outcome, not the bug. |
@@ -1304,6 +1340,21 @@ match the opportunity script's. Grep for `OPPSYNC_SO_` after every one of these.
 | 102 | Reach `getMappedStatus()` from the **sales order** script | **Throws**, `OPPSYNC_PARAMETER_NOT_ON_SCRIPT` naming both the accessor and the script. It must **not** return empty — empty would look like an unset parameter and be "fixed" on a deployment where the field does not exist |
 | 103 | **Full opportunity regression** — every scenario 1 to 88 | **Unchanged.** Accessor names and return values did not change, so nothing on this side should move |
 | 104 | **Full sales order regression** — scenarios 89 to 98 | **Unchanged**, now reading the `sosync_` IDs |
+
+### Empty delivery date (1.9.0)
+
+The sync's own scenarios, numbered from 137 so they do not collide with the Design Instruction
+table below. Watch the order's **system notes**: 137 and 140 are "nothing written to the ship date"
+tests, and only the notes prove it.
+
+| # | Scenario | Expected |
+|---|---|---|
+| 137 | Won opportunity, delivery date **empty**, linked order with a ship date; save the opportunity | Order's ship date **unchanged**; `OPPSYNC_SHIPDATE_EMPTY` at debug; Record Status and readiness still evaluated and written if changed; **no system note on the ship date** |
+| 138 | The same opportunity, now **enter** a delivery date, save | Order's ship date set to it; `OPPSYNC_ORDER_UPDATED` |
+| 139 | Delivery date empty, order at a **suppressed** status (section 4) with a ship date | Ship date unchanged. **Only `OPPSYNC_SHIPDATE_EMPTY` fires** — it is checked first, and an empty date would not be written at any status, so there is nothing for suppression to suppress |
+| 140 | Create a sales order from a quote on an opportunity with **no delivery date** — the client's reproduction | The order **keeps the date it was created with** |
+| 141 | **Full regression** — every scenario from 1 to 106 | **Unchanged** apart from 137–140. No numbered scenario from 1 to 106 expects a date to be cleared. The one documented behaviour this changes is in section 6: clearing the delivery date on the **full form** no longer clears the orders' dates |
+| 142 | Opportunity **has** a delivery date; **clear it on the full form** and save | Orders' ship dates **unchanged** — the cost of the rule, accepted. `OPPSYNC_SHIPDATE_EMPTY` at debug for each order that has a date |
 
 ### Design Instruction
 
