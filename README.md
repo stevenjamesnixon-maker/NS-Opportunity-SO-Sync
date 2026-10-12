@@ -3,7 +3,8 @@
 SuiteScript 2.1 for the NetSuite feature that keeps a sales order's Record Status and expected
 ship date in step with the opportunity it belongs to. When a won opportunity is saved, its sales
 orders are brought into line — the design sub-status is translated through a mapping held in
-NetSuite, and the delivery date is copied across.
+NetSuite, and the delivery date is copied across. An empty delivery date is never copied: it
+means the opportunity has nothing to say, so the order keeps its own date.
 
 It replaces `acs_ue_update_so.js`, which drove the same updates from a CAD Worklist custom record
 that is being retired. The two must never run at the same time.
