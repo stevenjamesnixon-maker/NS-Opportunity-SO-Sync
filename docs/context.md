@@ -63,11 +63,17 @@ Five traps that will catch a new session before it touches anything.
    field applies to, and **a field that does not apply to the record you ask returns BLANK
    rather than erroring.**
 
-   Four fields in this project were assumed to be on the sales order from the prefix alone and
-   were all on the **opportunity**: `custbody38` and the three legacy evidence flags. Each one
-   failed the same way — a legitimate-looking "not satisfied" verdict, no error, nothing in the
+   Five fields in this project were assumed to be on the sales order from the prefix alone and
+   were all on the **opportunity**: `custbody38`, the three legacy evidence flags and — until
+   config 1.12.0 — `custbody_installer_subcontract_receive`. Each one failed the same way — a legitimate-looking "not satisfied" verdict, no error, nothing in the
    log. `custbody38` cost a full Sandbox cycle and an investigation that first chased the wrong
    cause entirely.
+
+   The subcontract date is the variant to remember: the field **also applies to the sales
+   order**, so reading it there did not even return a "wrong record" blank — it returned the
+   order's own copy, which nobody fills in. Every heat pump order was held with `Subcontract
+   agreement not received` while the opportunity showed the date (QR266843, 12 Oct 2026).
+   Applies To naming a record is not the same as the data living there.
 
    > **A field ID in a brief is not usable until its record has been confirmed from the field
    > definition's *Applies To*. A brief that names a field without naming its record should be
@@ -102,13 +108,13 @@ so it is where the sync belongs.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.11.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the nine script parameters — including the status mapping. 1.11.0 adds the Map/Reduce's row of six | **1.11.0 not deployed.** Production carries 1.10.0 — confirmed by the client 22 Sep 2026 |
+| Shared config library | 1.12.0 | `lib/opsync_lib_config.js` | Every script ID in the project, and the nine script parameters — including the status mapping. 1.11.0 adds the Map/Reduce's row of six. 1.12.0 moves `SUBCONTRACT_RECEIVED` from `SALES_ORDER_FIELDS` to `OPPORTUNITY_FIELDS` | **1.11.0 not deployed.** Production carries 1.10.0 — confirmed by the client 22 Sep 2026 |
 | Shared value library | 1.1.0 | `lib/opsync_lib_values.js` | The value-shape layer — one definition of what a select, a date or a presence flag *means*, whichever API returned it. 1.1.0: *today* is the UK's today — section 5 | **1.1.0 not deployed.** Production carries 1.0.0 — confirmed by the client 22 Sep 2026 |
-| Shared readiness library | 1.0.0 | `lib/opsync_lib_readiness.js` | **The one definition of delivery readiness.** All three callers use it; none has a copy | Production — confirmed by the client 22 Sep 2026 |
-| Shared single-order readiness library | 1.0.0 | `lib/opsync_lib_so_readiness.js` | `evaluateOrder()` — reads one sales order's facts, evaluates, writes the two readiness fields **only if the verdict changed**. Moved out of the sales order user event; the Map/Reduce calls it too | Not deployed |
-| Opportunity user event | 1.9.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders | Production — confirmed by the client 22 Sep 2026 |
-| Sales order user event | 1.1.0 | `opsync_ue_salesorder.js` | `afterSubmit` on Sales Order — re-evaluates readiness for that one order, through `lib/opsync_lib_so_readiness.js` since 1.1.0. Writes the two readiness fields and **nothing else** | **1.1.0 not deployed.** Production carries 1.0.0, deployment status **Testing** — confirmed by the client 22 Sep 2026. It stays at Testing until the Map/Reduce's first run has backfilled the open orders — section 8 |
-| Readiness Map/Reduce | 1.0.0 | `opsync_mr_readiness.js` | Nightly. Re-evaluates readiness for **every open sales order** and writes the two readiness fields where they changed, so a certificate that expires overnight is picked up without anyone saving anything. Its first run is the backfill | Not deployed |
+| Shared readiness library | 1.1.0 | `lib/opsync_lib_readiness.js` | **The one definition of delivery readiness.** All three callers use it; none has a copy. 1.1.0: the subcontract date is an **opportunity** fact (`oppContext.subcontractReceived`), not an order fact; the rule is unchanged | **1.1.0 not deployed.** Production carries 1.0.0 — confirmed by the client 22 Sep 2026 |
+| Shared single-order readiness library | 1.1.0 | `lib/opsync_lib_so_readiness.js` | `evaluateOrder()` — reads one sales order's facts, evaluates, writes the two readiness fields **only if the verdict changed**. Moved out of the sales order user event; the Map/Reduce calls it too. 1.1.0: reads the subcontract date in the existing opportunity `lookupFields`, beside the legacy flag | Not deployed |
+| Opportunity user event | 1.10.0 | `opsync_ue_opportunity.js` | `afterSubmit` on Opportunity — syncs Record Status, ship date and delivery readiness to the sales orders. 1.10.0: the subcontract date is read off the opportunity being saved, not off each order | **1.10.0 not deployed.** |
+| Sales order user event | 1.2.0 | `opsync_ue_salesorder.js` | `afterSubmit` on Sales Order — re-evaluates readiness for that one order, through `lib/opsync_lib_so_readiness.js` since 1.1.0. Writes the two readiness fields and **nothing else**. 1.2.0: no longer passes the order's subcontract field | **1.2.0 not deployed.** Production carries 1.0.0, deployment status **Testing** — confirmed by the client 22 Sep 2026. It stays at Testing until the Map/Reduce's first run has backfilled the open orders — section 8 |
+| Readiness Map/Reduce | 1.1.0 | `opsync_mr_readiness.js` | Nightly. Re-evaluates readiness for **every open sales order** and writes the two readiness fields where they changed, so a certificate that expires overnight is picked up without anyone saving anything. Its first run is the backfill. 1.1.0: the search no longer returns the order's subcontract column; input criteria unchanged | Not deployed |
 | Design Instruction config library | 1.3.0 | `lib/dsi_lib_config.js` | Every script ID and parameter of the Design Instruction feature. **Separate from `opsync_lib_config.js`** — see section 11. Also loaded by the client script | Not deployed |
 | Design Instruction opportunity user event | 1.2.0 | `dsi_ue_opportunity.js` | `beforeLoad` on Opportunity — the two buttons; `afterSubmit` — creates a Design Instruction row when the sub-status moves to a creating value | Not deployed |
 | Design Instruction opportunity client script | 1.1.0 | `dsi_cs_opportunity.js` | Request Design / Request Redraw — confirm, write the sub-status, land on the redraw row. **Attached by `beforeLoad`; no script record, no deployment** | Not deployed |
@@ -227,7 +233,7 @@ evaluated **independently**:
 
 | # | Condition | Satisfied by | Failure reason |
 |---|---|---|---|
-| 1 | Subcontract | `custbody_installer_subcontract_receive` **or** `custbodysubcontract_received_legacy` — **both** through the presence test | `Subcontract agreement not received` |
+| 1 | Subcontract | **Presence** of `custbody_installer_subcontract_receive` **on the opportunity** (path `modern`), **or** the legacy flag `custbodysubcontract_received_legacy` (path `legacy`) — **both** through the presence test, **never** compared with today: a sub-contract agreement doesn't expire, and the date records when it was received. The sales order's copy of the field is **not read at all** (since config 1.12.0) | `Subcontract agreement not received` |
 | 2 | Installer qualification | `custbody_installer_qual_logged_legacy`, **else** the customer's qualification expiry | `Installer not set on opportunity` / `Installer qualification certificate missing` / `… expired` |
 | 3 | Public Liability | `custbody_installer_pl_logged_legacy`, **else** the customer's PL expiry | `Installer not set on opportunity` / `Public Liability certificate missing` / `… expired` |
 | 4 | DNO | `custbody38` **on the opportunity** in `getDnoOkValues()` — blank or absent fails. **No legacy path exists** | `Awaiting DNO` |
@@ -415,7 +421,7 @@ hence the per-order try/catch at step 7 rather than one try/catch around the loo
 
 Until 1.8.0 readiness was evaluated only in the opportunity's `afterSubmit`, so it only
 refreshed when somebody saved the **opportunity**. Once design is complete people work on the
-**sales order** — the subcontract date, the quote type, the finance status — and nothing saves
+**sales order** — the quote type, the finance status — and nothing saves
 the opportunity, so nothing re-evaluated. The two readiness fields went stale exactly when the
 order was in active use, and a stale *ready* ships goods.
 
@@ -1182,7 +1188,7 @@ drift between scripts.
 | `OPPSYNC_MAP_PARSED` | debug | The mapping as actually parsed, one line of `key -> value` pairs. Normal operation. | Nothing. With Log Level on Debug this is how a typo is spotted by eye rather than inferred from an order that did not sync. |
 | `OPPSYNC_ORDER_FAILED` | error | One sales order threw while being read or written. **The remaining orders were still processed.** | Read the logged error against the named order. Usually a locked or deleted order, or a permission problem on the executing role. |
 | `OPPSYNC_GOVERNANCE_STOP` | error | The loop stopped with governance running low, naming how many orders were done and which were not reached. | Re-save the opportunity to pick up the rest. If it recurs, the opportunity has more orders than this design anticipated — see section 6. |
-| `OPPSYNC_READINESS` | debug | One line per sales order: order, quote type, decided status, ready true/false, the reason, **which path satisfied each certificate condition** — `modern`, `legacy`, `no installer` or `fail` — **and the raw `custbody38` value, what it normalised to, and the acceptable set**. Normal operation. | Nothing. This is the first place to look when an order's readiness is not what was expected. **The paths are the only record of why an order with a blank installer is ready to ship** — when a legacy order surfaces in a year and nobody remembers these fields exist, this line is the explanation. The `dnoRaw=… -> … dnoOk=…` fragment exists because the DNO check once failed for a whole Sandbox cycle with no error and no clue; it shows the value, the normalised id and the parameter side by side. |
+| `OPPSYNC_READINESS` | debug | One line per sales order: order, quote type, decided status, ready true/false, the reason, **which path satisfied each certificate condition** — `modern`, `legacy`, `no installer` or `fail` — **and the raw `custbody38` value, what it normalised to, and the acceptable set**, and (1.10.0) `subcontractRaw=… (from opportunity …)` — the raw subcontract value as read off the opportunity. Normal operation. | Nothing. This is the first place to look when an order's readiness is not what was expected. **The paths are the only record of why an order with a blank installer is ready to ship** — when a legacy order surfaces in a year and nobody remembers these fields exist, this line is the explanation. The `dnoRaw=… -> … dnoOk=…` fragment exists because the DNO check once failed for a whole Sandbox cycle with no error and no clue; it shows the value, the normalised id and the parameter side by side. |
 | `OPPSYNC_SHIPDATE_SUPPRESSED` | debug | The ship date **would** have been written but was not, because the order's decided Record Status is in `custscript_opsync_no_shipdate_statuses`. Names the status, the value left in place and the value not written. The status and readiness were still evaluated and written as normal. Normal operation. | Nothing. **This log exists because the alternative is invisible** — a ship date silently not updating looks identical on the record to one that did not need updating. It is raised only when a write would otherwise have happened. |
 | `OPPSYNC_SHIPDATE_EMPTY` | debug | **1.9.0.** The opportunity has **no delivery date**, so the order's expected ship date was **left as it was** rather than cleared. Names the order, the date kept and the opportunity. Raised only when the order has a date to protect. Status and readiness were still evaluated and written as normal. Takes precedence over `OPPSYNC_SHIPDATE_SUPPRESSED` when both apply. Normal operation. | Nothing. It is the record of a clear that did **not** happen — before 1.9.0 this save wiped the order's date. |
 | `OPPSYNC_READINESS_NOT_APPLICABLE` | debug | The status this save wrote is in the excluded list, so readiness was **not evaluated** and both fields were left as they were. Normal operation. | Nothing. Note the readiness values shown are now frozen — see section 6. |
@@ -1190,7 +1196,7 @@ drift between scripts.
 | `OPPSYNC_INSTALLER_UNREADABLE` | error | The installer customer record could not be read for the two certificate fields. **Both certificates read as missing**, so the order is held. | Check the customer record and the two field ids in the parameters. The held order is the safe outcome, not the bug. |
 | `OPPSYNC_SYNC_SUMMARY` | audit | One line per opportunity: how many orders were updated, unchanged and skipped, and the status written. Normal operation. | Nothing. Use it to read the log at the level of "what did this save do". |
 | `OPPSYNC_PARAMETER_MISSING` | error | A script parameter is unset, unreadable, or held nothing usable. Names the parameter. For the **qualifying** list and the **mapping** it is logged only and the script exits harmlessly. For the other six — **excluded statuses**, the four readiness parameters and the **no-ship-date statuses** — it is also **thrown**, so the save is abandoned before any sales order is written. See the table in section 5 for why the two behaviours differ. | Populate the parameter on the deployment **in this account**; the values differ by environment. See section 8. |
-| `OPPSYNC_SO_READINESS` | debug | **Sales order script.** One line per save of a sales order, written **whether or not anything changed**: order, opportunity, quote type, status, ready, reason, the certificate paths, and `written=true/false`. Normal operation. | Nothing. It exists because **a readiness value that did not change looks identical on the record to one that was never evaluated** — this line is the difference. |
+| `OPPSYNC_SO_READINESS` | debug | **Sales order script.** One line per save of a sales order, written **whether or not anything changed**: order, opportunity, quote type, status, ready, reason, the certificate paths, `subcontractRaw=… (from opportunity …)` (so_readiness 1.1.0), and `written=true/false`. Normal operation. **Not raised by the Map/Reduce**, which runs `evaluateOrder()` quiet. | Nothing. It exists because **a readiness value that did not change looks identical on the record to one that was never evaluated** — this line is the difference. **A blank `subcontractRaw` while the opportunity form shows a date** means the field does not store its value (*Store Value* off) — the script cannot read what is not stored. |
 | `OPPSYNC_SO_READINESS_UPDATED` | audit | **Sales order script.** Readiness changed on the order's own save and was written. Names the before/after. Normal operation. | Nothing. This is the feature working — readiness refreshing without anyone touching the opportunity. |
 | `OPPSYNC_SO_SKIPPED` | debug | **Sales order script.** The order's Record Status is in the excluded list, so readiness is not applicable and nothing was evaluated or written. | Nothing. Same meaning as `OPPSYNC_ORDER_SKIPPED` on the opportunity side, and the **same** parameter — there is deliberately not a second definition of "done". |
 | `OPPSYNC_SO_NO_OPPORTUNITY` | debug | **Sales order script.** The order has no linked opportunity, so there is no context to evaluate readiness from. | Nothing. An order raised outside this process is not this script's business. If an order that *should* be linked shows this, check the native `opportunity` field — **not** `createdfrom`. |
@@ -1406,7 +1412,7 @@ screen and a failure in the notes.
 | 50 | Installer blank, **only the PL legacy** field populated | Not ready. `Installer not set on opportunity` **exactly once**, not twice |
 | 51 | Installer set with valid certificates, legacy fields **also** populated | **Ready.** Legacy is redundant here, not conflicting |
 | 52 | Installer set, qualification **expired**, qual legacy field populated | **Ready** — legacy wins. It is an OR, not an AND |
-| 53 | Legacy subcontract populated, modern subcontract blank, all else ok | **Ready** |
+| 53 | Legacy subcontract populated, **opportunity's** `custbody_installer_subcontract_receive` blank, all else ok | **Ready**, `paths=subcontract=legacy`. The sales order's copy of the field plays no part, whatever it holds |
 | 54 | All legacy fields populated but `custbody38` blank | Not ready, `Awaiting DNO`. **There is no legacy path for DNO** |
 | 55 | Won opportunity at an **unmapped** sub-status, installer added, order at a non-excluded, non-design-ok status | Readiness **evaluated and written**. `custbody_finance_status` **not written** |
 | 56 | Won opportunity at an unmapped sub-status, order at an **excluded** status | **Skipped entirely**, nothing written — the entry exclusion catches it |
@@ -1470,8 +1476,8 @@ match the opportunity script's. Grep for `OPPSYNC_SO_` after every one of these.
 |---|---|---|
 | 89 | Order at an **excluded** status, saved | **Skipped, no write.** `OPPSYNC_SO_SKIPPED` naming the status. Uses the *same* excluded list as the opportunity script — there is deliberately no second definition |
 | 90 | Order with **no linked opportunity**, saved | **Skipped, no write.** `OPPSYNC_SO_NO_OPPORTUNITY`. Check the native `opportunity` field, not `createdfrom` |
-| 91 | Order at a design-ok status, **subcontract date added**, all else valid | **Becomes ready**, hold reason cleared. `OPPSYNC_SO_READINESS_UPDATED`. This is the whole point of the feature — nobody touched the opportunity |
-| 92 | The same order, **subcontract date cleared** | **Becomes not ready**, `Subcontract agreement not received` |
+| 91 | Order at a design-ok status, held only for the subcontract; **add the subcontract date on the OPPORTUNITY** and save it | **Becomes ready**, hold reason cleared, from the opportunity script (`OPPSYNC_ORDER_UPDATED`); the sales order script then fires and writes nothing. *Since config 1.12.0 the date lives on the opportunity, so this is no longer a sales-order-save scenario — adding it on the order changes nothing* |
+| 92 | The same order; **clear the subcontract date on the opportunity** (full form, not inline) and save it | **Becomes not ready**, `Subcontract agreement not received`. Then save the order itself: **same answer**, `written=false` |
 | 93 | Quote type changed from **UFH to heat pump** | The certificate gate now applies — readiness re-evaluated against all five conditions, not just design |
 | 94 | Order saved with **nothing relevant changed** | **Evaluated, no write.** `OPPSYNC_SO_READINESS` with `written=false`; no `submitFields`, no system note. Check the system notes, not just the fields |
 | 95 | **Save the opportunity**, which writes to the order | The sales order script fires, finds nothing to change, **writes nothing, no loop.** `OPPSYNC_SO_READINESS` with `written=false` immediately after `OPPSYNC_ORDER_UPDATED`. **This is the recursion test — run it deliberately**, and confirm the execution log does not repeat |
@@ -1572,6 +1578,23 @@ Requires `customscript_opsync_mr_readiness` with its six `opsyncmr_` parameters 
 | 158 | **Partially Fulfilled** order, Record Status not excluded; run | **Read and evaluated** — it can still ship |
 | 159 | **Pending Billing** order (fully fulfilled, not yet billed), Record Status blank; run | **Not read** — it has shipped. `OPPSYNC_MR_SUMMARY` names the native-status filter in force |
 
+### The subcontract date is read from the opportunity (config 1.12.0, readiness 1.1.0, so_readiness 1.1.0, opportunity UE 1.10.0, SO UE 1.2.0, MR 1.1.0)
+
+Numbered from 160, the next free number after the Map/Reduce block. Grep for `subcontractRaw` in
+`OPPSYNC_READINESS` / `OPPSYNC_SO_READINESS` on each of these.
+
+| # | Scenario | Expected |
+|---|---|---|
+| 160 | Heat pump order; opportunity *Installer Subcontract Received* = **a past date**; the **sales order's copy empty**; everything else valid | **No subcontract reason**, `paths=subcontract=modern`, `subcontractRaw` shows the date `(from opportunity …)` |
+| 161 | The opportunity date **cleared**, legacy flag empty | `Subcontract agreement not received`, `paths=subcontract=fail` |
+| 162 | Opportunity date **empty**, legacy flag **set** | **No subcontract reason**, `paths=subcontract=legacy` |
+| 163 | The Map/Reduce over the order from **HP232775** (opportunity **QR266843**, date 28/9/2026) | `Subcontract agreement not received` **gone** from its hold reason; any other reasons stay or go on their own facts. `OPPSYNC_MR_CHANGED` naming it |
+| 164 | **Inline-edit some other field** on a Won opportunity that has the date | Subcontract still **received** — `subcontractRaw` shows the date. The sparse XEDIT `newRecord` falls back to `oldRecord`, exactly as for the legacy flag |
+| 165 | The **sales order script**: save that same order | **Same verdict as the Map/Reduce**; `OPPSYNC_SO_READINESS` with `written=false` and `subcontractRaw` showing the opportunity's date |
+| 166 | Run the Map/Reduce a **second time** | **≈0 changed** in `OPPSYNC_MR_SUMMARY` |
+| 167 | The order's own copy of `custbody_installer_subcontract_receive` **set**, opportunity's **empty**, legacy empty | **Not ready**, `Subcontract agreement not received`. The order's copy is not read at all — one source of truth |
+| 168 | Opportunity form shows the date, but `subcontractRaw` logs **blank** | The field does not store its value (*Store Value* off). Fix the field definition, not the script |
+
 Extend this table as scenarios are found. **Revert any configuration changed for a test.**
 
 ---
@@ -1582,7 +1605,7 @@ Extend this table as scenarios are found. **Revert any configuration changed for
 
 Script IDs only — **no internal IDs**, here or anywhere else in this document. See section 3.
 
-**The record column is the point of this table.** Four fields in this project were assumed onto
+**The record column is the point of this table.** Five fields in this project were assumed onto
 the wrong record from the `custbody_` prefix alone. See section 0, trap 6.
 
 #### Read from the OPPORTUNITY — `record.getValue()` on the record being saved
@@ -1597,6 +1620,7 @@ back to `oldRecord` instead of reading a populated field as blank.
 | Delivery date | `custbody_opp_del_date` | Date | `asDateKey()` / `asDateForWrite()` |
 | Installer | `custbody_installer_ns` | List/Record → Customer | `asSelectId()` |
 | **DNO status** | `custbody38` | List → `customlist_dnonotreclist`. **Auto-assigned script ID** | `asSelectId()` |
+| **Subcontract received** | `custbody_installer_subcontract_receive` | **Date** — *Installer Subcontract Received*, per Steve 12 Oct 2026. **On the opportunity since config 1.12.0**; it was read off the sales order before, whose copy is empty | `isPresent()` — presence only, never compared with today |
 | Legacy subcontract | `custbodysubcontract_received_legacy` | **Unconfirmed** — no underscore after `custbody` | `isPresent()` |
 | Legacy qualification | `custbody_installer_qual_logged_legacy` | **Unconfirmed** | `isPresent()` |
 | Legacy PL | `custbody_installer_pl_logged_legacy` | **Unconfirmed** | `isPresent()` |
@@ -1613,10 +1637,17 @@ back to `oldRecord` instead of reading a populated field as blank.
 | Ready for delivery | `custbody_ready_for_delivery` | Checkbox | boolean | `isTicked()` |
 | Delivery hold reason | `custbody_delivery_hold_reason` | Long text | string | `lookupValue()` |
 | Quote type | `custbody_quote_type` | List/Record → Quote Type | **array** | `lookupValue()` |
-| Subcontract received | `custbody_installer_subcontract_receive` | **Unconfirmed**, and no longer load-bearing — see below | string | `lookupValue()` + `isPresent()` |
 
-> ✅ **`custbody_installer_subcontract_receive`'s type is still not confirmed, and it no longer
-> matters.** It was tested with `!isEmpty()`, which would have read an **unticked checkbox as
+> ⛔ **`custbody_installer_subcontract_receive` is NOT read from the sales order**, not even as
+> a fallback, since config 1.12.0. The field applies to the order too, but the order's copy is
+> empty — reading it there held every heat pump order. It is read from the **opportunity**:
+> `record.getValue()` through `effectiveValue()` in the opportunity script, and in the
+> opportunity `lookupFields` (string shape, through `lookupValue()`) on the sales order and
+> Map/Reduce paths. Its raw value and source are logged as `subcontractRaw=… (from opportunity
+> …)` in `OPPSYNC_READINESS` and `OPPSYNC_SO_READINESS`.
+>
+> History, kept because the reasoning still applies to the presence test:
+> **its type was not confirmed then, and it did not matter.** It was tested with `!isEmpty()`, which would have read an **unticked checkbox as
 > satisfying the subcontract condition**: `lookupFields` returns boolean `false` for unticked,
 > `lookupValue()` stringifies it to `"false"`, and `isEmpty("false")` is `false`. It failed open,
 > in the ship-the-goods direction, and logged nothing. **Closed in 1.5.2** — it goes through the
@@ -1666,7 +1697,7 @@ because the equivalent opportunity fields are unstored sourced fields and cannot
 | 6 | Should the mapping be a field on `customrecord_fin_stat`? | **No, and the field will not be created.** It is the script parameter `custscript_opsync_status_map`. The record approach was specified, written, and abandoned after Sandbox testing — a single pair of IDs does not justify a custom record. See section 5. | 2026-09-14 |
 | — | Should the status internal IDs stay in this document as human reference? | **No.** Every one removed, and the rule now has no exceptions. See section 3. | 2026-09-14 |
 | 7 | Is `custbody_application_date` **on the Opportunity**? *(was open question 3 — renumbered on closing, because this table already had a 3)* | **Yes — Opportunity, Date**, read from the field definition's Applies To. It was implemented opportunity-level in 1.6.0 on the specification alone, because that session had no NetSuite access; the assumption markers cleared in 1.6.1. §9 scenario 70 stays as the **regression test** rather than being retired with the question: it is the only thing that would notice if the field were ever moved, and a moved field fails silently. | 2026-09-15 |
-| 0b | What TYPE is `custbody_installer_subcontract_receive`? | **The code no longer needs the answer**, which is the only durable way to close it. It was the last presence-gates-shipping test on `!isEmpty()`; in 1.5.2 it moved to the project presence test, which is correct for checkbox, date and text alike and rejects the stringified `"false"` that a `lookupFields` result would deliver. Still worth confirming for its own sake. | 2026-09-15 |
+| 0b | What TYPE is `custbody_installer_subcontract_receive`? | **The code no longer needs the answer**, which is the only durable way to close it. It was the last presence-gates-shipping test on `!isEmpty()`; in 1.5.2 it moved to the project presence test, which is correct for checkbox, date and text alike and rejects the stringified `"false"` that a `lookupFields` result would deliver. Still worth confirming for its own sake. **Answered 12 Oct 2026: a Date, on the opportunity** — see section 0, trap 6. | 2026-09-15 |
 
 ### Open questions
 

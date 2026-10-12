@@ -24,7 +24,7 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.9.0
+ * @version 1.10.0
  */
 define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
     './lib/opsync_lib_values', './lib/opsync_lib_readiness'],
@@ -32,7 +32,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
 
     'use strict';
 
-    var VERSION = '1.9.0';
+    var VERSION = '1.10.0';
 
     /**
      * Governance units that must remain before another sales order is processed.
@@ -188,8 +188,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
                 opsyncConfig.SALES_ORDER_FIELDS.SHIP_DATE,
                 opsyncConfig.SALES_ORDER_FIELDS.READY_FOR_DELIVERY,
                 opsyncConfig.SALES_ORDER_FIELDS.DELIVERY_HOLD_REASON,
-                opsyncConfig.SALES_ORDER_FIELDS.QUOTE_TYPE,
-                opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED
+                opsyncConfig.SALES_ORDER_FIELDS.QUOTE_TYPE
             ]
         });
 
@@ -339,9 +338,7 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
                 quoteTypeId: quoteTypeId,
                 noDesignRequired: gates.noDesignRequired,
                 requiresCerts: gates.requiresCerts,
-                decidedStatus: decidedStatus,
-                subcontractReceived: opsyncConfig.lookupValue(
-                    lookup, opsyncConfig.SALES_ORDER_FIELDS.SUBCONTRACT_RECEIVED)
+                decidedStatus: decidedStatus
             });
 
             // The paths matter as much as the verdict. When a legacy order comes up in a year
@@ -355,6 +352,8 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
                     ', ready=' +
                     verdict.ready + ', reason=' + (verdict.reason || '(none)') +
                     ', paths=' + readiness.describePaths(verdict.paths) +
+                    ', subcontractRaw=' + JSON.stringify(ctx.subcontractReceived) +
+                    ' (from opportunity ' + opportunityId + ')' +
                     ', dnoRaw=' + JSON.stringify(ctx.dnoStatusRaw) +
                     ' -> ' + (ctx.dnoStatus || '(blank)') +
                     ', dnoOk=' + ctx.dnoOkValues.join('/') +
@@ -416,8 +415,8 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
      *    leave some orders updated and the rest not, which is the "no partial writes" the brief
      *    asks for. See the note on requiredParameter() in opsync_lib_config.js.
      *
-     * 2. The DNO status, the BUS voucher pair and the three LEGACY evidence flags, straight off
-     *    the opportunity — no lookup at all.
+     * 2. The DNO status, the BUS voucher pair, the subcontract date and the three LEGACY
+     *    evidence flags, straight off the opportunity — no lookup at all.
      *    Because they are opportunity-level, they satisfy the certificate gate for EVERY linked
      *    sales order, including any order added later. That is intended: the flags record that
      *    the work was verified under the old process, and the opportunity is the unit that
@@ -452,6 +451,15 @@ define(['N/search', 'N/record', 'N/runtime', 'N/log', './lib/opsync_lib_config',
             // check once failed for a whole Sandbox cycle with no error and no clue as to why.
             dnoStatusRaw: values.effectiveValue(
                 newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.DNO_STATUS, sparse),
+
+            // The subcontract date is on the OPPORTUNITY (from 1.10.0 — it was read off each
+            // sales order before, whose copy is empty). Read exactly as subcontractLegacy below:
+            // once, through effectiveValue, so a sparse XEDIT newRecord falls back to oldRecord
+            // rather than reading a populated date as cleared. Presence only; never compared
+            // with today.
+            subcontractReceived: values.effectiveValue(
+                newRecord, oldRecord, opsyncConfig.OPPORTUNITY_FIELDS.SUBCONTRACT_RECEIVED,
+                sparse),
 
             // Legacy evidence also lives on the OPPORTUNITY, so it too is read once here from
             // the record being saved — no lookupFields, and not per order. All of these go

@@ -5,7 +5,7 @@
  *
  * WHY IT EXISTS. Until 1.8.0 readiness was only ever evaluated in the opportunity's
  * afterSubmit, so it only refreshed when somebody saved the OPPORTUNITY. Once design is complete
- * people work on the SALES ORDER — the subcontract date, the quote type, the finance status —
+ * people work on the SALES ORDER — the quote type, the finance status —
  * and nothing saved the opportunity, so nothing re-evaluated. The two readiness fields went
  * stale exactly when the order was in active use, and a stale "ready" ships goods.
  *
@@ -47,7 +47,7 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.1.0
+ * @version 1.2.0
  */
 define(['N/log', './lib/opsync_lib_config', './lib/opsync_lib_values',
     './lib/opsync_lib_so_readiness'],
@@ -55,7 +55,7 @@ define(['N/log', './lib/opsync_lib_config', './lib/opsync_lib_values',
 
     'use strict';
 
-    var VERSION = '1.1.0';
+    var VERSION = '1.2.0';
 
     /**
      * Entry point. See docs/context.md section 4.
@@ -94,6 +94,9 @@ define(['N/log', './lib/opsync_lib_config', './lib/opsync_lib_values',
             //    point this script has always read it, so an order with no linked opportunity
             //    still exits before any parameter is touched. See the file header of
             //    lib/opsync_lib_so_readiness.js.
+            //
+            //    The subcontract date is NOT an order fact (since 1.2.0). It is on the
+            //    OPPORTUNITY and the library reads it there, alongside the legacy flag.
             result = soReadiness.evaluateOrder({}, orderId, {
                 opportunityId: values.effectiveValue(
                     newRecord, oldRecord, fields.OPPORTUNITY_LINK, sparse),
@@ -101,8 +104,6 @@ define(['N/log', './lib/opsync_lib_config', './lib/opsync_lib_values',
                     newRecord, oldRecord, fields.RECORD_STATUS, sparse),
                 quoteTypeId: values.effectiveValue(
                     newRecord, oldRecord, fields.QUOTE_TYPE, sparse),
-                subcontractReceived: values.effectiveValue(
-                    newRecord, oldRecord, fields.SUBCONTRACT_RECEIVED, sparse),
                 currentReady: values.effectiveValue(
                     newRecord, oldRecord, fields.READY_FOR_DELIVERY, sparse),
                 currentReason: values.effectiveValue(

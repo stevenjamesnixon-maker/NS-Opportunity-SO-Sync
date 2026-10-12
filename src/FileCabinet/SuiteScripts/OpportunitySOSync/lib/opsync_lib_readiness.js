@@ -33,13 +33,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
 define(['./opsync_lib_values'], function (values) {
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
 
     /**
      * Raised by the qualification condition and by the public liability condition independently.
@@ -144,11 +144,11 @@ define(['./opsync_lib_values'], function (values) {
      * writes its own verdict over the other's. One copy of this logic is the only defence.
      *
      * @param {Object} oppContext - everything that comes from the OPPORTUNITY and the
-     *        parameters: installerId, qualExpiry, plExpiry, dnoStatus, subcontractLegacy,
-     *        qualLegacy, plLegacy, busRhiIntended, voucherApprovalDate, applicationDate,
-     *        busNoValue, designOkStatuses, dnoOkValues, today
+     *        parameters: installerId, qualExpiry, plExpiry, dnoStatus, subcontractReceived,
+     *        subcontractLegacy, qualLegacy, plLegacy, busRhiIntended, voucherApprovalDate,
+     *        applicationDate, busNoValue, designOkStatuses, dnoOkValues, today
      * @param {Object} orderFacts - everything that comes from the ORDER: quoteTypeId,
-     *        noDesignRequired, requiresCerts, decidedStatus, subcontractReceived
+     *        noDesignRequired, requiresCerts, decidedStatus
      * @returns {Object} { ready: boolean, reason: string, paths: Object }
      */
     function evaluate(oppContext, orderFacts) {
@@ -172,15 +172,22 @@ define(['./opsync_lib_values'], function (values) {
         //     legacy path, plus DNO which has none.
         if (gates.requiresCerts) {
 
-            // 1. Subcontract. Either field satisfies it.
+            // 1. Subcontract. Either field satisfies it, and BOTH are on the OPPORTUNITY.
             //
-            //    BOTH sides go through the presence test. The modern field's type is still
-            //    unconfirmed, and it was the last !isEmpty() presence test in this project — the
+            //    A sub-contract agreement doesn't expire: any value means received.
+            //
+            //    The modern field was read off the SALES ORDER until 1.1.0. The order's copy is
+            //    empty, so every heat pump order was held while the opportunity showed the date.
+            //    It now arrives on oppContext exactly as the legacy flag does, and the order's
+            //    copy is not read anywhere — not even as a fallback.
+            //
+            //    BOTH sides go through the presence test. The modern field is a Date (Steve,
+            //    12 Oct 2026), but it was the last !isEmpty() presence test in this project — the
             //    one place a type change in the UI could still flip a condition to fail OPEN,
             //    in the ship-the-goods direction, with nothing logged.
             //
-            //    IT ARRIVES FROM A lookupFields RESULT, NOT FROM THE RECORD, AND THAT IS WHY
-            //    THE TEST WORKS. lookupValue() stringifies, so an unticked checkbox reaches
+            //    IT CAN ARRIVE FROM A lookupFields RESULT AS WELL AS FROM THE RECORD, AND THE
+            //    TEST WORKS FOR BOTH. lookupValue() stringifies, so an unticked checkbox reaches
             //    here as the five-character string "false" rather than as boolean false — which
             //    is exactly the shape !isEmpty() reads as PRESENT. The presence test rejects
             //    'false' and 'F' by name for that case, so the lookup shape is covered as well
@@ -188,7 +195,7 @@ define(['./opsync_lib_values'], function (values) {
             //
             //    It is a date today, so this changes no behaviour. The point is that the class
             //    is closed rather than documented.
-            if (values.isPresent(orderFacts.subcontractReceived)) {
+            if (values.isPresent(oppContext.subcontractReceived)) {
                 paths.subcontract = 'modern';
             } else if (values.isPresent(oppContext.subcontractLegacy)) {
                 paths.subcontract = 'legacy';

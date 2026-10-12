@@ -33,7 +33,7 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
 define(['N/search', 'N/record', 'N/log', './opsync_lib_config', './opsync_lib_values',
     './opsync_lib_readiness'],
@@ -41,7 +41,7 @@ define(['N/search', 'N/record', 'N/log', './opsync_lib_config', './opsync_lib_va
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
 
     /**
      * Skip reasons returned by evaluateOrder(). The Map/Reduce counts on them, so they are
@@ -164,6 +164,7 @@ define(['N/search', 'N/record', 'N/log', './opsync_lib_config', './opsync_lib_va
             columns: [
                 fields.INSTALLER,
                 fields.DNO_STATUS,
+                fields.SUBCONTRACT_RECEIVED,
                 fields.SUBCONTRACT_LEGACY,
                 fields.QUAL_LOGGED_LEGACY,
                 fields.PL_LOGGED_LEGACY,
@@ -186,8 +187,13 @@ define(['N/search', 'N/record', 'N/log', './opsync_lib_config', './opsync_lib_va
 
         // Presence-only values. lookupValue() checks length before indexing — lookupFields
         // returns an EMPTY ARRAY for an empty field and the predecessor script threw on exactly
-        // that. The legacy flags and the two BUS dates are then tested with isPresent(), never
-        // isEmpty(), inside readiness.evaluate().
+        // that. The subcontract date, the legacy flags and the two BUS dates are then tested with
+        // isPresent(), never isEmpty(), inside readiness.evaluate().
+        //
+        // The subcontract date comes from HERE, the opportunity, since 1.1.0 — in the same
+        // lookup as the legacy flag, so it costs nothing extra. The sales order's own copy of
+        // the field is empty and is no longer read by either caller.
+        ctx.subcontractReceived = opsyncConfig.lookupValue(lookup, fields.SUBCONTRACT_RECEIVED);
         ctx.subcontractLegacy = opsyncConfig.lookupValue(lookup, fields.SUBCONTRACT_LEGACY);
         ctx.qualLegacy = opsyncConfig.lookupValue(lookup, fields.QUAL_LOGGED_LEGACY);
         ctx.plLegacy = opsyncConfig.lookupValue(lookup, fields.PL_LOGGED_LEGACY);
@@ -242,7 +248,6 @@ define(['N/search', 'N/record', 'N/log', './opsync_lib_config', './opsync_lib_va
                 so.OPPORTUNITY_LINK,
                 so.RECORD_STATUS,
                 so.QUOTE_TYPE,
-                so.SUBCONTRACT_RECEIVED,
                 so.READY_FOR_DELIVERY,
                 so.DELIVERY_HOLD_REASON
             ]
@@ -252,7 +257,6 @@ define(['N/search', 'N/record', 'N/log', './opsync_lib_config', './opsync_lib_va
             opportunityId: lookup[so.OPPORTUNITY_LINK],
             financeStatus: lookup[so.RECORD_STATUS],
             quoteTypeId: lookup[so.QUOTE_TYPE],
-            subcontractReceived: opsyncConfig.lookupValue(lookup, so.SUBCONTRACT_RECEIVED),
             currentReady: lookup[so.READY_FOR_DELIVERY],
             currentReason: opsyncConfig.lookupValue(lookup, so.DELIVERY_HOLD_REASON)
         };
@@ -266,11 +270,14 @@ define(['N/search', 'N/record', 'N/log', './opsync_lib_config', './opsync_lib_va
      * the same helpers whichever shape arrives:
      *
      *   opportunityId, financeStatus, quoteTypeId   selects, through asSelectId()
-     *   subcontractReceived                         passed through; readiness uses isPresent()
      *   currentReady                                checkbox, through isTicked()
      *   currentReason                               '' when empty, else String()
      *
      * When soFacts is absent they are read with one lookupFields — see readOrderFacts().
+     *
+     * The subcontract date is NOT an order fact, since 1.1.0. It is read off the OPPORTUNITY in
+     * buildOpportunityContext(), alongside the legacy flag, and a subcontractReceived property
+     * on soFacts is ignored.
      *
      * THE SKIPS, in the order the sales order script has always applied them:
      *
@@ -386,8 +393,7 @@ define(['N/search', 'N/record', 'N/log', './opsync_lib_config', './opsync_lib_va
             quoteTypeId: quoteTypeId,
             noDesignRequired: gates.noDesignRequired,
             requiresCerts: gates.requiresCerts,
-            decidedStatus: currentStatus,
-            subcontractReceived: facts.subcontractReceived
+            decidedStatus: currentStatus
         });
 
         result.ready = verdict.ready;
@@ -407,6 +413,8 @@ define(['N/search', 'N/record', 'N/log', './opsync_lib_config', './opsync_lib_va
                     ', ready=' + verdict.ready +
                     ', reason=' + (verdict.reason || '(none)') +
                     ', paths=' + readiness.describePaths(verdict.paths) +
+                    ', subcontractRaw=' + JSON.stringify(oppContext.subcontractReceived) +
+                    ' (from opportunity ' + result.opportunityId + ')' +
                     ', written=' + result.changed
             });
         }
