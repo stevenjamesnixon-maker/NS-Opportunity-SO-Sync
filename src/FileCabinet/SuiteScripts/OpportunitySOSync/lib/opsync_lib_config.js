@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.11.0
+ * @version 1.12.0
  */
 define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
 
     'use strict';
 
-    var VERSION = '1.11.0';
+    var VERSION = '1.12.0';
 
     /* ------------------------------------------------------------------------------------------
      * NETSUITE IDS — THE SINGLE SOURCE
@@ -118,6 +118,22 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          * DNO notification is a property of the installation, not of an individual order.
          */
         DNO_STATUS: 'custbody38',
+
+        /**
+         * Date ("Installer Subcontract Received"). Any value means the installer sub-contract
+         * agreement has been received. A PRESENCE test, never an expiry: the date records when
+         * it arrived, so a date in the past is the normal case.
+         *
+         * ON THE OPPORTUNITY, from 1.12.0 — confirmed by Steve on 12 Oct 2026. Until then it was
+         * read off the SALES ORDER, whose copy of the field is empty, so every heat pump order
+         * was held with 'Subcontract agreement not received' while the opportunity showed the
+         * date. The sales order copy is not read at all any more, not even as a fallback: one
+         * source of truth. See docs/context.md section 0, trap 6.
+         *
+         * Read exactly as SUBCONTRACT_LEGACY is, on every path: effectiveValue() off the record
+         * in the opportunity script, the opportunity lookupFields in opsync_lib_so_readiness.js.
+         */
+        SUBCONTRACT_RECEIVED: 'custbody_installer_subcontract_receive',
 
         /* --------------------------------------------------------------------------------------
          * LEGACY EVIDENCE FIELDS — ON THE OPPORTUNITY
@@ -236,18 +252,18 @@ define(['N/runtime', 'N/error', 'N/log'], function (runtime, error, log) {
          */
         DELIVERY_HOLD_REASON: 'custbody_delivery_hold_reason',
         /** List/Record -> the Quote Type record. Decides which readiness gates apply. */
-        QUOTE_TYPE: 'custbody_quote_type',
-        /** Must not be blank before an order needing installer certificates is ready. */
-        SUBCONTRACT_RECEIVED: 'custbody_installer_subcontract_receive'
+        QUOTE_TYPE: 'custbody_quote_type'
         /*
          * NOT HERE, and each was assumed to be here once:
          *
+         *   custbody_installer_subcontract_receive the subcontract date (read here until 1.12.0;
+         *                                          the order's copy is empty)
          *   custbody38                             the DNO status
          *   custbodysubcontract_received_legacy    legacy subcontract evidence
          *   custbody_installer_qual_logged_legacy  legacy qualification evidence
          *   custbody_installer_pl_logged_legacy    legacy PL evidence
          *
-         * All four are on the OPPORTUNITY — see OPPORTUNITY_FIELDS. The custbody_ prefix means
+         * All five are on the OPPORTUNITY — see OPPORTUNITY_FIELDS. The custbody_ prefix means
          * "transaction body field" and says NOTHING about which transaction types the field
          * applies to. Asking a sales order for a field that applies only to opportunities
          * returns BLANK rather than erroring, so the mistake is silent. See docs/context.md

@@ -56,7 +56,7 @@
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
 define(['N/search', 'N/runtime', 'N/log', './lib/opsync_lib_config',
     './lib/opsync_lib_so_readiness'],
@@ -64,7 +64,7 @@ define(['N/search', 'N/runtime', 'N/log', './lib/opsync_lib_config',
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
 
     /**
      * The native sales order statuses that can still ship — the input search's pre-filter. See the
@@ -171,7 +171,6 @@ define(['N/search', 'N/runtime', 'N/log', './lib/opsync_lib_config',
                 so.OPPORTUNITY_LINK,
                 so.RECORD_STATUS,
                 so.QUOTE_TYPE,
-                so.SUBCONTRACT_RECEIVED,
                 so.READY_FOR_DELIVERY,
                 so.DELIVERY_HOLD_REASON
             ]
@@ -208,7 +207,6 @@ define(['N/search', 'N/runtime', 'N/log', './lib/opsync_lib_config',
             opportunityId: columns[so.OPPORTUNITY_LINK],
             financeStatus: columns[so.RECORD_STATUS],
             quoteTypeId: columns[so.QUOTE_TYPE],
-            subcontractReceived: columns[so.SUBCONTRACT_RECEIVED],
             currentReady: columns[so.READY_FOR_DELIVERY],
             currentReason: columns[so.DELIVERY_HOLD_REASON]
         });
